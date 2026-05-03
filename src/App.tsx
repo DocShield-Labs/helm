@@ -15,7 +15,12 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { commands } from '@lib/ipc'
-import { useStore, type HostSessions, type TmuxWorkspace } from '@lib/store'
+import {
+  useStore,
+  workspaceForWindow,
+  type HostSessions,
+  type TmuxWorkspace,
+} from '@lib/store'
 import { connectHost, selectWorkspace, subscribeHostEvents } from '@lib/host'
 import { TmuxPane } from '@features/shell/TmuxPane'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
@@ -180,6 +185,17 @@ export function App() {
       if (!activeHostId) return
 
       switch (e.key.toLowerCase()) {
+        case 'i':
+          if (!e.shiftKey) return
+          // Cmd+Shift+I → focus oldest inbox notification.
+          // Cross-host: if the oldest notification belongs to a
+          // different host than the active one, switch hosts before
+          // selecting the window. The notification stays in the inbox
+          // (peek doesn't dismiss); typing in the pane will dismiss
+          // via the keystroke handler in TmuxPane.
+          e.preventDefault()
+          jumpToOldestNotification()
+          return
         case 't':
           e.preventDefault()
           if (e.shiftKey) {
@@ -235,6 +251,36 @@ export function App() {
     document.addEventListener('keydown', handler, true)
     return () => document.removeEventListener('keydown', handler, true)
   }, [windowList, activeWindow, activeWorkspace, activeHostId, toggleSidebar])
+
+  // ---------- active-window focus reporting ----------
+  // Tell the backend which (host, window) the user is looking at, so
+  // its notifications post-processor can suppress inbox rows for that
+  // window. Updates whenever the active host or active window changes,
+  // and clears when the helm window itself loses OS focus or is
+  // minimized — backgrounded windows then start collecting inbox rows
+  // normally.
+  useEffect(() => {
+    const push = () => {
+      // Treat a hidden helm as "no focus" so notifications resume for
+      // every window while the user is in another app. visibilitychange
+      // covers the macOS Cmd+H / minimize / different-desktop cases.
+      if (document.hidden || !activeHostId || !activeWindow) {
+        void commands.setFocus(null, null)
+        return
+      }
+      void commands.setFocus(activeHostId, activeWindow.id)
+    }
+    push()
+    const onVis = () => push()
+    document.addEventListener('visibilitychange', onVis)
+    window.addEventListener('blur', onVis)
+    window.addEventListener('focus', onVis)
+    return () => {
+      document.removeEventListener('visibilitychange', onVis)
+      window.removeEventListener('blur', onVis)
+      window.removeEventListener('focus', onVis)
+    }
+  }, [activeHostId, activeWindow])
 
   // ---------- latency probe ----------
   // Time a cheap tmux command (list-sessions with the smallest possible
@@ -409,6 +455,26 @@ export function App() {
       <ToastHost />
     </div>
   )
+}
+
+/** Cmd+Shift+I handler — jumps to the oldest inbox notification. */
+function jumpToOldestNotification(): void {
+  const state = useStore.getState()
+  let oldest: { hostId: string; windowId: string; createdAt: number } | null = null
+  for (const n of state.notifications.values()) {
+    if (oldest === null || n.created_at < oldest.createdAt) {
+      oldest = { hostId: n.host_id, windowId: n.window_id, createdAt: n.created_at }
+    }
+  }
+  if (!oldest) return
+  state.setActiveHost(oldest.hostId)
+  const hs = state.sessions.get(oldest.hostId)
+  const ws = workspaceForWindow(hs, oldest.windowId)
+  if (ws) {
+    state.setActiveWindow(oldest.hostId, ws.id, oldest.windowId)
+    void selectWorkspace(oldest.hostId, ws.id)
+  }
+  void commands.tmuxSelectWindow(oldest.hostId, oldest.windowId)
 }
 
 /** Pick a free `workspace N` name and create it on the host. */

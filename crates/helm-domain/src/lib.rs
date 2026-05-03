@@ -32,15 +32,53 @@ newtype_id!(HostId);
 newtype_id!(WorkspaceId);
 newtype_id!(WindowId);
 newtype_id!(PaneId);
+newtype_id!(NotificationId);
 
 // ---------- tmux notifications (cross the IPC boundary) ----------
+
+/// In-band markers extracted from a pane's `%output` byte stream before
+/// the bytes are forwarded to xterm. Used to drive notifications
+/// (bell, command-completion) and — once the blocks UI lands — to record
+/// prompt/output spans against the xterm buffer.
+///
+/// Bell is a single 0x07 byte; the rest are OSC 133 sequences emitted by
+/// shells with helm's integration script sourced. We strip both from the
+/// forwarded bytes so xterm doesn't actually beep or render the escape
+/// sequences as glyphs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputMarker {
+    /// BEL (0x07) seen in pane output. Most CLI tools (Claude Code,
+    /// finished long-running commands, IRC pings) emit this when they
+    /// want the user's attention.
+    Bell,
+    /// `OSC 133;A` — the shell is about to print a new prompt.
+    PromptStart,
+    /// `OSC 133;B` — the prompt has finished printing; what follows is
+    /// the user's typed command.
+    CommandStart,
+    /// `OSC 133;C` — the user pressed Enter; what follows is command
+    /// output.
+    OutputStart,
+    /// `OSC 133;D[;<exit_code>]` — the previous command finished with the
+    /// given exit code. None when the shell didn't include a code (older
+    /// integration scripts, partial sequences).
+    CommandDone { exit_code: Option<i32> },
+}
 
 /// Wire format for tmux state deltas. Mirrors `helm-tmux::parse::Notification`
 /// — kept here so the type lives next to the rest of the IPC vocabulary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TmuxNotification {
-    Output { pane_id: String, bytes: Vec<u8> },
+    /// `bytes` is the cleaned output stream — bells and OSC 133 markers
+    /// have been stripped (and surfaced separately in `markers`) so xterm
+    /// doesn't beep on every notification or render the escape sequences.
+    Output {
+        pane_id: String,
+        bytes: Vec<u8>,
+        markers: Vec<OutputMarker>,
+    },
     WindowAdded { window_id: String },
     WindowClosed { window_id: String },
     WindowRenamed { window_id: String, name: String },
@@ -112,6 +150,83 @@ pub enum HostEvent {
         /// (`SHA256:base64(no-padding)`).
         fingerprint: String,
         prompt: HostKeyPromptKind,
+    },
+    /// A pane wants the user's attention. Sent when a new notification is
+    /// created AND when an existing one coalesces (count/updated_at bump,
+    /// possibly upgraded kind — e.g., a Bell entry replaced by a newer
+    /// CommandDone for the same window). Frontend treats receipt as
+    /// upsert keyed by `notification.id`.
+    Notification {
+        host_id: HostId,
+        notification: Notification,
+    },
+    /// A previously-emitted notification was dismissed — by the user
+    /// (× button), by typing into the pane (auto-dismiss-on-keystroke),
+    /// or by the host (window killed, host disconnected). Frontend
+    /// drops it from the inbox.
+    NotificationDismissed {
+        host_id: HostId,
+        notification_id: NotificationId,
+    },
+}
+
+// ---------- notifications ----------
+
+/// One row in the user's inbox. Coalesced per (host, window, kind-class):
+/// repeated bells in the same window bump `count` and `updated_at` rather
+/// than stacking, and a fresh CommandDone replaces an older Bell for the
+/// same window (commands finishing is more informative than a raw bell).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct Notification {
+    pub id: NotificationId,
+    pub host_id: HostId,
+    /// tmux session id (`$N`). Optional because the bell may arrive
+    /// before our workspace tree is hydrated; the frontend can fill in
+    /// the breadcrumb from the window id alone.
+    pub workspace_id: Option<String>,
+    /// tmux window id (`@N`).
+    pub window_id: String,
+    /// tmux pane id (`%N`) — the pane the marker came from. A window
+    /// can hold multiple panes; we surface the originating pane so the
+    /// inbox row can route the user to the exact one.
+    pub pane_id: String,
+    pub kind: NotificationKind,
+    /// Unix ms when this notification was first created.
+    pub created_at: u64,
+    /// Unix ms of the most recent coalesced event. Equal to created_at
+    /// for fresh notifications; advances on every coalesce.
+    pub updated_at: u64,
+    /// How many times this notification has coalesced (1 for fresh).
+    pub count: u32,
+    /// Short human-readable preview — up to ~120 chars of the most recent
+    /// pane output, ANSI-stripped. Drives the secondary line in the inbox
+    /// row so the user can decide "still spinning" vs "really done"
+    /// without switching to the pane.
+    pub preview: String,
+}
+
+/// What this notification represents. Drives the inbox dot color and
+/// rollup classification in the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NotificationKind {
+    /// BEL emitted by something running in the pane. The single most
+    /// reliable "pay attention" signal — Claude Code, finished builds,
+    /// IRC pings, etc.
+    Bell,
+    /// A command finished. `exit_code` is None when the shell's
+    /// integration script doesn't include one (older versions, partial
+    /// sequences); the frontend treats None as "succeeded probably."
+    CommandDone {
+        exit_code: Option<i32>,
+        /// The command that ran (captured between `OSC 133;B` and
+        /// `OSC 133;C` markers). Empty if we never saw a command-start
+        /// marker for this run (e.g., shell entered a TUI, integration
+        /// dropped a marker).
+        command: String,
+        /// Wall-clock duration in milliseconds, B → D. None when we
+        /// didn't observe the start marker.
+        duration_ms: Option<u64>,
     },
 }
 

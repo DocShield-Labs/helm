@@ -11,16 +11,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { commands } from '@lib/ipc'
 import {
+  notificationsForHost,
+  notificationsForWindow,
+  notificationsForWorkspace,
   useStore,
   type HostSessions,
   type TmuxWorkspace,
 } from '@lib/store'
+import type { Notification } from '@bindings'
 import { connectHost, selectWorkspace } from '@lib/host'
 import type { Host, HostId, HostStatus } from '@bindings'
 import { StatusDot, type StatusDotState } from './StatusDot'
 import { SidebarHostRow } from './SidebarHostRow'
 import { SidebarWorkspaceRow } from './SidebarWorkspaceRow'
 import { SidebarWindowRow } from './SidebarWindowRow'
+import { InboxSection } from '@features/activity-feed/InboxSection'
 
 export interface SidebarProps {
   /** Open the host editor for a brand-new host. */
@@ -88,10 +93,12 @@ function ExpandedSidebar({
   const setActiveHost = useStore((s) => s.setActiveHost)
   const sessions = useStore((s) => s.sessions)
   const statuses = useStore((s) => s.statuses)
+  const notifications = useStore((s) => s.notifications)
   const toggleWorkspaceCollapsed = useStore((s) => s.toggleWorkspaceCollapsed)
 
   return (
     <div className="flex flex-1 flex-col gap-1 overflow-y-auto p-3">
+      <InboxSection />
       <div className="flex items-center justify-between pb-1 pt-1 pl-2 pr-1">
         <span className="text-[10px] font-medium tracking-[0.08em] text-text-tertiary">
           HOSTS
@@ -119,6 +126,7 @@ function ExpandedSidebar({
         const hs = sessions.get(h.id)
         const status = statuses.get(h.id) ?? 'disconnected'
         const isActive = activeHostId === h.id
+        const hostNotifs = notificationsForHost(notifications, h.id)
         const workspaceList = hs
           ? [...hs.workspaces.values()].sort((a, b) => a.name.localeCompare(b.name))
           : []
@@ -129,6 +137,7 @@ function ExpandedSidebar({
               status={displayedHostStatus(h, status, hs?.detachedReason ?? null)}
               state={isActive ? 'active' : 'rest'}
               expanded
+              notificationCount={hostNotifs.length}
               onClick={() => {
                 setActiveHost(h.id)
                 // Click acts as manual reconnect whenever the host
@@ -150,11 +159,18 @@ function ExpandedSidebar({
                 const winsForWs = [...w.windows.values()].sort((a, b) =>
                   a.id.localeCompare(b.id),
                 )
+                const wsNotifs = notificationsForWorkspace(notifications, hs, h.id, w.id)
                 return (
                   <div key={w.id} className="flex flex-col gap-1">
                     <SidebarWorkspaceRow
                       name={w.name}
-                      activity={w.windows.size > 0 ? 'running' : 'idle'}
+                      activity={
+                        wsNotifs.length > 0
+                          ? rollupActivity(wsNotifs)
+                          : w.windows.size > 0
+                            ? 'running'
+                            : 'idle'
+                      }
                       state={isActiveWs ? 'active' : 'rest'}
                       expanded={expanded}
                       onClick={() => toggleWorkspaceCollapsed(h.id, w.id)}
@@ -183,12 +199,24 @@ function ExpandedSidebar({
                           winsForWs.map((win) => {
                             const isFocused =
                               activeHostId === h.id && isActiveWs && win.active
+                            const winNotifs = notificationsForWindow(
+                              notifications,
+                              hs,
+                              h.id,
+                              win.id,
+                            )
                             return (
                               <SidebarWindowRow
                                 key={win.id}
                                 name={win.name}
                                 command={paneCommandFor(win.id, w)}
-                                activity={win.active ? 'running' : 'idle'}
+                                activity={
+                                  winNotifs.length > 0
+                                    ? rollupActivity(winNotifs)
+                                    : win.active
+                                      ? 'running'
+                                      : 'idle'
+                                }
                                 state={isFocused ? 'focused' : 'rest'}
                                 onClick={() => {
                                   const store = useStore.getState()
@@ -556,6 +584,31 @@ function paneCommandFor(windowId: string, w: TmuxWorkspace): string {
   const inWindow = [...w.panes.values()].filter((p) => p.windowId === windowId)
   const active = inWindow.find((p) => p.active) ?? inWindow[0]
   return active?.command ?? ''
+}
+
+/** Highest-urgency notification kind across a list, mapped to an
+ * ActivityDot state. Failed (non-zero exit) outranks attention (bell)
+ * outranks running (success/done). Used for workspace + window dot
+ * rollups. */
+function rollupActivity(
+  notifs: Notification[],
+): 'failed' | 'attention' | 'running' {
+  let hasFailed = false
+  let hasBell = false
+  for (const n of notifs) {
+    if (
+      n.kind.kind === 'command_done' &&
+      n.kind.exit_code !== null &&
+      n.kind.exit_code !== undefined &&
+      n.kind.exit_code !== 0
+    ) {
+      hasFailed = true
+    }
+    if (n.kind.kind === 'bell') hasBell = true
+  }
+  if (hasFailed) return 'failed'
+  if (hasBell) return 'attention'
+  return 'running'
 }
 
 function displayedHostStatus(

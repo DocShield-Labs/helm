@@ -125,6 +125,14 @@ export async function subscribeHostEvents(): Promise<void> {
       })
       return
     }
+    if (evt.kind === 'notification') {
+      useStore.getState().upsertNotification(evt.notification)
+      return
+    }
+    if (evt.kind === 'notification_dismissed') {
+      useStore.getState().removeNotification(evt.notification_id)
+      return
+    }
     // evt.kind === 'tmux'
     const { host_id, notification: n } = evt
     const store = useStore.getState()
@@ -213,6 +221,20 @@ export async function subscribeHostEvents(): Promise<void> {
   const res = await commands.hostSubscribe(channel)
   if (res.status !== 'ok') throw new Error(res.error)
   subscribed = true
+
+  // Replay current notifications so a webview reload (Cmd+R) finds the
+  // inbox the way it left it. New events keep flowing through the
+  // channel handler above. Best-effort — a failure here just means the
+  // user starts with an empty inbox until the next event arrives.
+  try {
+    const list = await commands.notificationsList()
+    if (list.status === 'ok') {
+      const upsert = useStore.getState().upsertNotification
+      for (const n of list.data) upsert(n)
+    }
+  } catch {
+    /* no-op */
+  }
 }
 
 /**
@@ -236,20 +258,15 @@ export async function connectHost(
 }
 
 /**
- * Make `workspaceId` the active workspace for `hostId`. Updates local UI
- * state immediately for responsiveness, then asks tmux to switch its
- * control client to that session — without the switch, sessions created
- * via `new-session -d` stay at tmux's default 80×24 and render with
- * cursor offsets / invisible typing in our larger xterm.
+ * Make `workspaceId` the active workspace for `hostId`. Pure local-
+ * state flip in the multi-client model — every session has its own
+ * permanently-attached control client at the user's viewport size, so
+ * there's no tmux-side switch to perform. Pre-multi-client we called
+ * `tmux_switch_client` here to keep the single client attached to the
+ * right session for sizing; that command is now a backend no-op.
  */
 export async function selectWorkspace(hostId: HostId, workspaceId: string): Promise<void> {
   useStore.getState().setActiveWorkspace(hostId, workspaceId)
-  const res = await commands.tmuxSwitchClient(hostId, workspaceId)
-  if (res.status !== 'ok') {
-    // Best-effort. The local active flip already happened; the worst
-    // case is a slightly mis-sized pane until the next interaction.
-    console.warn('switch-client failed:', res.error)
-  }
 }
 
 /**

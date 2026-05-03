@@ -19,7 +19,8 @@ nothing internal-ships until phase 2.
 | 2C    | Persistence + Keychain + host editor | **done**     |
 | 2D    | Reconnect, host-key TOFU, raw PTY    | **done**     |
 | 3     | Command palette + keyboard map       | later        |
-| 4     | Activity feed, status bar, settings  | later        |
+| 4     | Inbox notifications + shell integ.   | **mostly done** |
+| 4F    | Warp-style blocks UI from OSC 133    | later        |
 | 5     | Performance + IPC optimisation       | later        |
 
 ---
@@ -858,63 +859,256 @@ Make every action reachable in two keystrokes.
 
 ---
 
-## Phase 4 — Activity, status, settings, theming · later
+## Phase 4 — Inbox notifications + shell integration · **mostly done**
 
-The polish.
+Surface "things that want your attention" across every connected host
+in a single sidebar inbox section. Two signal layers feed it: BEL
+(0x07) bytes detected directly in pane output, and OSC 133 prompt
+markers emitted by an auto-installed shell integration. The same OSC
+133 capture is the data foundation for Warp-style blocks later (4F).
+
+We deliberately skipped tmux's `monitor-activity` / `monitor-silence`
+"layer 2" — heuristic, lossy, and superseded by OSC 133's exact
+exit-code semantics.
+
+### Done
+
+**Domain (`helm-domain`):**
+- New `OutputMarker` enum — `Bell`, `PromptStart`, `CommandStart`,
+  `OutputStart`, `CommandDone { exit_code }`. Carried alongside the
+  cleaned bytes in every `TmuxNotification::Output`.
+- New `Notification` struct + `NotificationKind` (`Bell` /
+  `CommandDone { exit_code, command, duration_ms }`), `NotificationId`
+  newtype, `HostEvent::Notification` and `::NotificationDismissed`
+  variants.
+
+**Parser (`helm-tmux::parse`):**
+- `extract_markers_and_strip(bytes) → (cleaned, markers)` — single-pass
+  scan over decoded `%output` data. Recognises envelope-style escapes
+  (`ESC ] / P / X / ^ / _`) so the BEL terminating an OSC 0 / OSC 1337
+  sequence isn't misclassified as a standalone bell. Stripped from
+  forwarded bytes so xterm doesn't beep or render the OSC params.
+- 7 new tests cover bell, prompt/command/output markers, exit codes,
+  ST vs BEL terminators, and OSC passthrough for non-133 sequences.
+
+**Coalesce + post-processing (`helm-app::notifications`):**
+- One inbox slot per `(host_id, pane_id)`. Repeats bump `count` and
+  `updated_at`; new events of higher priority replace the kind.
+- Priority order: `CommandDone(failed)` > `Bell` > `CommandDone(ok)`.
+  This is the rule that fixed `printf '\a'` showing as a blue exit-0
+  dot — the explicit bell now wins over the trailing successful exit.
+- Per-pane runtime tracks command timing (B → D), an output preview
+  ring (~512 bytes), and the resolved window/session id for breadcrumbs.
+- `refresh_pane_index` runs on connect, reconnect, and after
+  `%window-add` / `%window-close` / `%layout-changed` /
+  `%sessions-changed`. Resolves pane → window/session ids and dismisses
+  notifications for panes that have disappeared.
+- `dismiss_for_host` on voluntary disconnect / delete keeps the inbox
+  honest. Reconnect-style EOF deliberately preserves notifications so
+  the user doesn't lose pending events when the transport bounces.
+
+**Active-window suppression:**
+- Frontend pushes `(activeHostId, activeWindow.id)` to backend on every
+  active-window change via `set_focus`, and clears focus on
+  `visibilitychange` / `blur` (helm minimised, on a different macOS
+  desktop, etc.). Notifications post-processor skips creating a new
+  inbox row when the pane's window matches focus — the user is staring
+  at the output, an inbox entry would be noise. Backgrounded windows
+  still notify normally.
+
+**Shell integration (`helm-app::integration`):**
+- Three scripts embedded via `include_str!`: `zsh.zshrc`, `bash.sh`,
+  `fish.fish`. Each emits OSC 133 A/B/C/D markers via the shell's
+  native hooks (`precmd_functions`/`preexec_functions`,
+  `PROMPT_COMMAND` + `DEBUG` trap, `fish_prompt`/`fish_preexec`).
+- `install_local()` writes to `~/.helm/integration/{zsh/.zshrc, bash, fish}`
+  on app boot. Idempotent overwrite — bytes shipped in the binary are
+  always what's on disk.
+- Remote hosts: `remote_install_command()` builds a base64-encoded
+  heredoc that recreates the directory + scripts on the far end at the
+  start of every connect command. Same idempotent overwrite. base64 is
+  in coreutils on every platform we target.
+- **zsh auto-injection via ZDOTDIR.** Helm's process env exports
+  `ZDOTDIR=~/.helm/integration/zsh`, `HELM_USER_ZDOTDIR=$ZDOTDIR-or-$HOME`,
+  and `HELM_INTEGRATION=1` at app boot — so the *first* tmux server we
+  spawn inherits them. `configure_tmux_env` then sets the same vars in
+  tmux server-globally + per-session so new windows in pre-existing
+  sessions also pick them up. Our wrapper `.zshrc` restores
+  `ZDOTDIR=$HELM_USER_ZDOTDIR` before sourcing the user's real
+  `.zshrc`, then registers the OSC 133 hooks.
+- bash + fish have no equivalent of ZDOTDIR — they require the user to
+  add a one-line source to their rc file. For now bell detection works
+  out of the box; the setup-needed toast (4E) lands separately.
+
+**Frontend store (`src/lib/store.ts`):**
+- `notifications: Map<NotificationId, Notification>` slice with
+  `upsertNotification` / `removeNotification` /
+  `dismissNotificationsForHost`.
+- Selector helpers `notificationsForHost` / `notificationsForWorkspace`
+  / `notificationsForWindow` with a fallback that resolves missing
+  `window_id` via the local workspace tree (handles the brief race
+  where pane index hasn't refreshed yet).
+- `subscribeHostEvents` calls `notifications_list` after subscribe so a
+  `Cmd+R` webview reload finds the inbox the way it left it.
+
+**INBOX section (`src/features/activity-feed/InboxSection.tsx`):**
+- Renders above HOSTS in the expanded sidebar; hidden when empty.
+  Cross-host by design — one global inbox.
+- Each row: urgency dot (yellow=bell, blue=ok, red=failed) ·
+  `workspace · window` · time-ago + ×count · hover-reveal × button.
+  Secondary line shows `host · kind-label · preview-text`.
+- Click a row → switches active host/workspace/window and fires
+  `tmuxSelectWindow`. Notification stays — peek doesn't dismiss.
+- Header has hover-reveal `clear` button that dismisses every entry.
+
+**Roll-up dots:**
+- `SidebarHostRow` shows a coral count badge next to the status dot
+  when host has notifications.
+- `SidebarWorkspaceRow.activity` upgrades to `attention` (bell) or
+  `failed` (any non-zero exit) based on rolled-up notifications inside.
+- Same logic for `SidebarWindowRow.activity`.
+
+**Dismiss-on-keystroke:**
+- `TmuxPane.onData` now resolves the pane's `window_id` from the
+  store, checks if any notifications match, and fires
+  `notification_dismiss_for_window` before sending bytes. Pure
+  modifier presses naturally don't fire `onData`, so they're excluded.
+
+**Cmd+Shift+I shortcut:**
+- Jumps to the oldest inbox entry, switching active host if needed.
+
+**Tauri commands:** `notifications_list`, `notification_dismiss`,
+`notification_dismiss_for_window`, `set_focus`. Bindings regenerated;
+specta config updated to emit `u64` as `number` (timestamps fit
+comfortably under `Number.MAX_SAFE_INTEGER`).
+
+### Sharp edges (revisit later)
+
+- **Coalesce key is per-pane, not per-window.** Fine for single-pane
+  windows (which is everything we render today). When split-pane
+  rendering lands, two panes in the same window can produce two
+  separate inbox rows. Either upgrade the coalesce key to
+  `(host_id, window_id)` or render them as one row with two
+  origin-pane affordances.
+- **Command text is empty in `CommandDone`.** Integration script
+  doesn't pass `cmdline`. Fine for the inbox preview (the output snippet
+  in `preview` is more informative anyway), but the future blocks UI
+  will want it. Plumb through `OSC 133;C;cmdline=…` extension when 4F
+  starts.
+- **bash + fish need manual rc edit.** Setup-needed toast is the 4E
+  story — detect missing OSC 133 within ~3s of first prompt for non-zsh
+  shells and surface a copy-pastable one-liner.
+- **Existing tmux server.** When the user already had a tmux server
+  running with sessions before this build first connected, those
+  sessions' panes were started with the OLD env (no ZDOTDIR). They
+  need to be restarted (Cmd+T new window) to get integration. New
+  windows in *new* workspaces always get it.
+
+### Lessons learned
+
+- **OSC envelopes use BEL as a terminator.** First version of the
+  marker scanner stripped every `\x07` byte and counted them as bells.
+  This misclassified the BEL ending an OSC 0 (set window title) as a
+  standalone application bell — every `oh-my-zsh` prompt would create
+  a phantom inbox entry. Fix: recognise `ESC ] / P / X / ^ / _`
+  envelopes as units, scan to their ST (BEL or `ESC \`), pass through
+  intact unless it's our OSC 133. Then standalone BELs are by
+  elimination "not part of any envelope" → real bells.
+
+- **The user expects `printf '\a'` to ring the bell.** First coalesce
+  rule had CommandDone always beating Bell on the theory that "more
+  information is better." But `printf '\a'` produces both a Bell and a
+  CommandDone(0) within a few hundred ms; the user typed it
+  specifically to test the bell and only saw a blue dot. Revised
+  priority: Failure > Bell > Success. Bell is an explicit attention
+  request; success is just informational.
+
+- **specta forbids u64 in TS bindings by default.** `Number` in JS is
+  f64, so naively serializing an arbitrary u64 risks precision loss.
+  Hit this immediately when adding `created_at: u64` to `Notification`.
+  Fix: configure the exporter with
+  `BigIntExportBehavior::Number` — timestamps in ms sit comfortably
+  under `Number.MAX_SAFE_INTEGER` (2^53), no BigInt overhead at the
+  call site.
+
+- **tmux server captures env at startup.** `set-environment -g` after
+  the server is already running only affects sessions/windows created
+  *afterward*. The bootstrap session's first pane (created as part of
+  `tmux new-session -A`) misses the update. Fix: also export the
+  integration vars in helm's process env at boot, *before* the very
+  first connect — so the server inherits them at startup. Then
+  `configure_tmux_env`'s server-global + per-session updates handle
+  changes for later connects.
+
+- **ZDOTDIR-only auto-injection.** zsh has ZDOTDIR; bash and fish
+  don't. The temptation is to write our line into `~/.bashrc` /
+  `~/.config/fish/config.fish` automatically — same approach iTerm2's
+  installer takes — but that's hostile (chezmoi/yadm/managed dotfiles
+  break, line ends up in version control, surprising). Better: write
+  the file, surface a one-time setup toast, let the user paste the
+  one-liner if they want command tracking. Bell still works without it.
+
+- **Active-window suppression belongs in the backend.** First instinct
+  was to filter in the frontend (let the notification arrive, store
+  upsert it, then immediately dismiss if it's the active window). That
+  works but produces a flash and leaves dismissed entries in the
+  backend registry until cleared. Pushing focus state down to the
+  backend (one Tauri command per active-window change) means the
+  notification is never created — cleaner state, no flash, no
+  registry leak across `Cmd+R` reloads.
+
+- **`watch::Receiver`-style reactivity vs. command pushes.** Looked at
+  using a Tauri channel for the focus state, but the rate is right
+  (a few pushes per second at most under heavy switching) and the
+  command form is simpler — no need for the frontend to manage a
+  long-lived channel just for focus updates.
+
+### Outstanding (in scope, not yet shipped)
+
+- [ ] **4E: bash/fish setup-needed toast.** Detect missing OSC 133 by
+      sampling `markers` from the first ~3s of pane output after a new
+      pane is created on a non-zsh shell. If none arrive, surface a
+      sticky toast with the copy-pastable source line. Use `$SHELL` env
+      reported on connect to gate the detection.
+- [ ] Drop the unused git-branch placeholder code from `App.tsx` /
+      `store.ts` / `host.ts` (commented-out segment + `branch: string`
+      field). Status-bar work is parked indefinitely, dead code is
+      noise.
+
+### Out of scope for phase 4 (deferred to dedicated future phases)
+
+These were originally folded into "phase 4" in the early progress doc
+but are now their own phases:
+
+- **Settings window** — separate Tauri window, General / Keyboard /
+  Shells / Tmux / Hosts / Advanced tabs. Defer until there's a real
+  setting that needs surfacing (font, theme, integration toggle).
+- **Theming** — three shipped themes + JSON theme directory. Same
+  reasoning as settings.
+- **Status bar polish** — click handlers, tmux uptime, git branch
+  segment (latter blocked on `host_run_shell` IPC — see the parked
+  notes elsewhere).
+
+---
+
+## Phase 4F — Warp-style blocks UI · later
+
+Layer command-block decorations on top of the OSC 133 markers we're
+already capturing in phase 4. Each `B → D` span is a block; we can
+render block boundaries / collapse / re-run / search without changing
+how xterm itself renders.
 
 ### Outstanding work
 
-**Activity tracker (`helm-app`):**
-- [ ] Per-pane: `last_output_at`, `current_command`, `is_idle`,
-      `bell_count`, `last_exit_code`, `started_at`
-- [ ] Window-level rollup: `has_running_process`, `has_unread_output`,
-      `wants_attention`
-- [ ] Push activity events to frontend; sidebar dots react
-
-**Status bar:**
-- [ ] Click handlers wired (cwd → copy, branch → palette scoped to git, etc.)
-- [x] Latency probe per remote host — `App.tsx` runs a 4s `tmux list-sessions`
-      ping while the active host is `connected`/`idle`; result EWMA-smoothed
-      (α=0.3) into `useStore.hostLatencies`; footer shows `⇄ local` for
-      port-0 hosts and `⇄ <ms>` otherwise. Hidden during connecting/disconnect
-      since the host dot already conveys that.
-- [ ] tmux uptime from `display-message -p '#{session_attached}'` or process start
-
-**Git branch segment (partially built — needs Rust IPC):**
-- [x] `TmuxPane.branch: string` field plumbed through `store.ts` and the
-      `refetchTree` parse path in `host.ts`.
-- [x] Footer renders `⎇ <branch>` between cwd and the connection segment,
-      gated on `activePane.branch` truthy → segment stays hidden until a
-      real fetch populates the field.
-- [ ] **Blocker:** tmux's `#(shell-cmd)` format substitution is async-cached
-      against `status-right` and only repopulates on the `status-interval`
-      timer when tmux is actively rendering its own status bar. Ad-hoc
-      `list-panes -F "...#(...)..."` and `display-message -p -F "...#(...)"`
-      hit an empty cache and **never** trigger a refresh — confirmed
-      empirically with tmux 3.6a (even `#(date)` returns "" on demand).
-      The format-string trick is therefore unsuitable for our pattern.
-- [ ] **Path forward:** add a Rust IPC `host_run_shell(hostId, cwd, cmd) →
-      Result<String>` that local-spawns `tokio::process::Command` for
-      port-0 hosts and opens a one-shot exec channel via `helm-ssh` for
-      remote hosts (the existing transport already does `request_pty +
-      exec` for tmux startup; we need a thinner no-PTY exec helper).
-      Estimated ~100-170 lines of Rust + small frontend caller. Cache by
-      `(hostId, cwd)`; refresh on cwd change + 3-5s interval while the
-      active pane is focused + a debounced post-output refetch so
-      `git switch` shows up within ~1s.
-- [ ] Optional polish: OSC sequence integration for shells with
-      configured prompt integration → instant branch updates instead of
-      polling. Defer until base path is shipping.
-
-**Settings window:**
-- [ ] Open in a separate Tauri window
-- [ ] General / Keyboard / Shells / Tmux / Hosts / Advanced tabs (designs in Figma)
-- [ ] Live-apply: changing font / theme reflows immediately
-
-**Theming:**
-- [ ] Three shipped themes: dark, light, high-contrast
-- [ ] JSON theme files picked up from `~/.config/helm/themes/*.json`
-- [ ] Settings dropdown lists installed themes
+- [ ] Per-pane span tracker — record buffer offsets at each
+      OSC 133 marker against xterm's serialized buffer
+- [ ] Marginal block boundary decorations in xterm (xterm.js
+      `registerDecoration`) with hover affordances
+- [ ] Collapsible blocks (folded view shows command + status only)
+- [ ] Per-block actions: copy command, copy output, re-run, share
+- [ ] Filter / search across blocks in the active pane
+- [ ] Plumb `cmdline=…` through the integration scripts so `command`
+      on `CommandDone` is non-empty (currently empty until 4F)
 
 ---
 

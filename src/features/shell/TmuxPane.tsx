@@ -112,6 +112,46 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
       if (aborted()) return
       // Hidden panes ignore input — keystrokes belong to the visible pane.
       if (!visibleRef.current) return
+
+      // Dismiss-on-keystroke: any printable / control byte the user
+      // typed into THIS pane is a signal they're acting on whatever
+      // notifications were sitting for this window. Fire-and-forget
+      // dismiss so the inbox row disappears without round-tripping
+      // through React.
+      //
+      // Note: pure modifier presses (Cmd, Shift alone) don't fire
+      // onData, so they're naturally excluded — only keys that
+      // produce bytes count, which matches the user's intuition for
+      // "actually typing."
+      const store = useStore.getState()
+      const hs = store.sessions.get(hostId)
+      let windowId: string | null = null
+      if (hs) {
+        for (const ws of hs.workspaces.values()) {
+          const pane = ws.panes.get(paneId)
+          if (pane) {
+            windowId = pane.windowId
+            break
+          }
+        }
+      }
+      if (windowId) {
+        let hasNotif = false
+        for (const n of store.notifications.values()) {
+          if (n.host_id === hostId && n.window_id === windowId) {
+            hasNotif = true
+            break
+          }
+          if (n.host_id === hostId && n.pane_id === paneId) {
+            hasNotif = true
+            break
+          }
+        }
+        if (hasNotif) {
+          void commands.notificationDismissForWindow(hostId, windowId)
+        }
+      }
+
       // Log send failures instead of swallowing. Most common case is
       // "host not connected" when tmux died and the supervisor is
       // mid-respawn — the ReconnectingOverlay surfaces that to the

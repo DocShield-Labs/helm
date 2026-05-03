@@ -151,9 +151,18 @@ impl TmuxClient {
     /// Local startup measures consistently in the 10-50ms range; the 1s
     /// ready-gate is generous headroom without making startup feel sluggish
     /// if something goes catastrophically wrong.
-    pub async fn spawn_local(
-        default_workspace: &str,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Notification>), TmuxError> {
+    /// One-shot bootstrap of the local tmux server: find binary, probe +
+    /// reap orphans, ensure at least one session exists, return every
+    /// session id on the server.
+    ///
+    /// Synchronous (no async) — uses one-shot subprocess invocations,
+    /// no control-mode client. Caller wraps in `tokio::task::spawn_blocking`
+    /// when running from async context.
+    ///
+    /// Returns a Vec of `#{session_id}` strings (e.g. `["$0", "$3"]`).
+    /// First entry is the most recently active session — caller can use
+    /// it as the "primary" for command routing.
+    pub fn bootstrap_local(default_workspace: &str) -> Result<Vec<String>, TmuxError> {
         let tmux = find_tmux().ok_or_else(|| {
             TmuxError::Response(
                 "tmux not found. Install it with `brew install tmux`.".to_string(),
@@ -162,23 +171,13 @@ impl TmuxClient {
 
         // Hygiene pass: reap any leaked `tmux -CC` client process from
         // a prior helm (or other control-mode app) that died without
-        // cleanup. The leaked client's PTY master fd is owned by a
-        // process that no longer exists, so its slave fd stays open
-        // with a kernel buffer that never drains. Tmux's main loop
-        // eventually blocks broadcasting output to that dead reader,
-        // wedging every command for every attached client.
-        //
-        // Identifying orphans safely is the subtle part. A `tmux -CC`
-        // command line with PPID=1 can be (a) an orphaned client we
-        // want to kill, OR (b) the tmux server itself, which is a
-        // daemon by design (fork+detach → PPID=1). Killing the server
-        // would destroy every tmux session on the machine. So instead
-        // of guessing, we ask tmux directly: server's pid via
-        // `display-message`, attached clients via `list-clients`.
-        // Anything matching `tmux -CC` in ps that *isn't* in that set
-        // is a process tmux has lost track of — by definition, an
-        // orphan.
-        match probe_tmux(&tmux).await {
+        // cleanup. See the docstring in the prior single-client version
+        // (commit history) for the full reasoning — short version: a
+        // leaked `-CC` client's PTY can wedge the entire tmux server's
+        // command queue, and we identify orphans by asking tmux which
+        // pids it considers attached, NOT by guessing from process
+        // attributes (which would risk killing the server itself).
+        match probe_tmux_sync(&tmux) {
             TmuxProbe::Healthy(known) => {
                 let reaped = kill_orphan_cc_clients(&known);
                 if !reaped.is_empty() {
@@ -187,24 +186,66 @@ impl TmuxClient {
                         reaped.len(),
                         reaped
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    std::thread::sleep(std::time::Duration::from_millis(150));
                 }
             }
-            // No server running yet — nothing to reap against. The
-            // attach-or-create script below will spin a fresh server.
             TmuxProbe::NoServer => {}
-            // Server is wedged (unresponsive within the timeout).
-            // Surface to the UI rather than risk killing the server
-            // by reaping with stale data.
-            TmuxProbe::Wedged => {
-                return Err(TmuxError::Response(
-                    "tmux server is unresponsive. Run `tmux kill-server` \
-                     manually if you don't have other tmux sessions you \
-                     care about."
-                        .into(),
-                ));
-            }
         }
+
+        // Enumerate sessions ordered by most-recent activity. tmux
+        // sorts list-sessions by `#{session_activity}` descending by
+        // default; we keep that order so the caller's "primary" pick
+        // matches the user's intuition (the session they were last in).
+        let sessions = list_local_sessions(&tmux)?;
+        if !sessions.is_empty() {
+            return Ok(sessions);
+        }
+
+        // Empty server — create the bootstrap session detached. Capture
+        // its session id with `-P -F '#{session_id}'`.
+        let out = std::process::Command::new(&tmux)
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                default_workspace,
+                "-P",
+                "-F",
+                "#{session_id}",
+            ])
+            .output()
+            .map_err(|e| TmuxError::Response(format!("new-session: {e}")))?;
+        if !out.status.success() {
+            return Err(TmuxError::Response(format!(
+                "new-session failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if id.is_empty() {
+            return Err(TmuxError::Response(
+                "new-session printed no session id".into(),
+            ));
+        }
+        Ok(vec![id])
+    }
+
+    /// Spawn a control-mode client attached to a specific local session.
+    /// Each call opens a fresh PTY pair and runs `tmux -CC attach -t
+    /// $session_id`, wrapping the streams in a TmuxClient.
+    ///
+    /// One client per session is the basis of helm's multi-client
+    /// architecture: tmux only forwards `%output` for the session a
+    /// control client is attached to, so we maintain N clients for N
+    /// sessions and they all stream output in real time.
+    pub async fn spawn_attach_local(
+        session_id: &str,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Notification>), TmuxError> {
+        let tmux = find_tmux().ok_or_else(|| {
+            TmuxError::Response(
+                "tmux not found. Install it with `brew install tmux`.".to_string(),
+            )
+        })?;
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -216,34 +257,8 @@ impl TmuxClient {
             })
             .map_err(|e| TmuxError::Response(format!("openpty: {e}")))?;
 
-        // Probe for existing sessions with a one-shot `list-sessions`
-        // *before* we open the control client. This avoids a real race:
-        // when the previous tmux server is mid-shutdown (e.g. user just
-        // killed the last session), `tmux -CC attach` can briefly
-        // "succeed" against the dying server, see EOF, then exit
-        // cleanly — leaving the `||` fallback to never run and our
-        // reader thread on the way to seeing EOF a heartbeat later. The
-        // forwarder then posts `Disconnected` and clears `entry.tmux`,
-        // so the next `tmux_*` call fails with "host not connected".
-        //
-        // `list-sessions` is a single round-trip request/response and
-        // can't race a dying server the same way: either it gets data
-        // back (server is alive with sessions), or it fails (server is
-        // gone or empty). We branch deterministically off that.
-        let tmux_path = quote_arg(tmux.to_string_lossy().as_ref());
-        let ws = quote_arg(default_workspace);
-        let script = format!(
-            "if [ -n \"$({tmux_path} list-sessions -F '#{{session_id}}' 2>/dev/null)\" ]; then \
-                exec {tmux_path} -CC attach; \
-             else \
-                exec {tmux_path} -CC new-session -A -s {ws}; \
-             fi"
-        );
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.args(["-c", &script]);
-        // CommandBuilder starts with an empty environment by default; inherit
-        // ours so subprocesses tmux launches (the shell, its tools) find what
-        // they need.
+        let mut cmd = CommandBuilder::new(tmux);
+        cmd.args(["-CC", "attach", "-t", session_id]);
         for (k, v) in std::env::vars() {
             cmd.env(k, v);
         }
@@ -252,7 +267,6 @@ impl TmuxClient {
             .slave
             .spawn_command(cmd)
             .map_err(|e| TmuxError::Response(format!("spawn tmux: {e}")))?;
-        // Drop the slave so the master sees EOF when tmux exits.
         drop(pair.slave);
 
         let reader = pair
@@ -265,10 +279,10 @@ impl TmuxClient {
             .map_err(|e| TmuxError::Response(format!("writer: {e}")))?;
         let mut killer = child.clone_killer();
 
-        // Wait thread — purely informational.
+        let session_id_owned = session_id.to_string();
         thread::spawn(move || {
             let _ = child.wait();
-            debug!("tmux process exited");
+            debug!("tmux -CC attach process exited (session {session_id_owned:?})");
         });
 
         let cleanup: Cleanup = Box::new(move || {
@@ -276,6 +290,25 @@ impl TmuxClient {
         });
 
         Self::spawn_with_io(reader, writer, cleanup, std::time::Duration::from_secs(1)).await
+    }
+
+    /// Legacy single-client connect for tests + the main helm-app path
+    /// pre-multi-client. Bootstraps the server (creating
+    /// `default_workspace` if no sessions exist) and attaches a single
+    /// control client to the first session returned. New helm-app code
+    /// should call `bootstrap_local` + `spawn_attach_local` directly.
+    pub async fn spawn_local(
+        default_workspace: &str,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Notification>), TmuxError> {
+        let dw = default_workspace.to_string();
+        let sessions = tokio::task::spawn_blocking(move || Self::bootstrap_local(&dw))
+            .await
+            .map_err(|e| TmuxError::Response(format!("bootstrap join: {e}")))??;
+        let primary = sessions
+            .into_iter()
+            .next()
+            .ok_or_else(|| TmuxError::Response("bootstrap returned no sessions".into()))?;
+        Self::spawn_attach_local(&primary).await
     }
 
     /// Send a tmux command and await its full response (joined with newlines).
@@ -705,7 +738,13 @@ fn find_tmux() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Three-state classification of the local tmux server's reachability.
+/// Two-state classification of the local tmux server's reachability.
+/// The pre-multi-client async probe also distinguished a `Wedged`
+/// state (server exists but unresponsive within a timeout); the sync
+/// probe used by the bootstrap path doesn't currently have timeout
+/// machinery, so a wedged server appears as `NoServer` until the
+/// underlying `tmux` invocation eventually returns. Re-add a Wedged
+/// variant + sync timeout if that becomes a real failure mode.
 enum TmuxProbe {
     /// Server is responsive. Carries the set of PIDs tmux considers
     /// live: the server itself plus every attached client. These are
@@ -714,39 +753,30 @@ enum TmuxProbe {
     /// No tmux server is running. Nothing to reap against; the next
     /// `tmux -CC new-session` will start one cleanly.
     NoServer,
-    /// Server exists but doesn't respond within the timeout — the
-    /// classic "broadcast queue blocked on a dead reader" signature.
-    /// We can't ask it which PIDs are legitimate, so we refuse to
-    /// reap and surface the failure to the UI.
-    Wedged,
 }
 
-/// Probe the local tmux server with a short timeout, returning
-/// healthy/no-server/wedged. Spawns one or two short-lived `tmux`
-/// commands; never opens a persistent control client.
-async fn probe_tmux(tmux: &std::path::Path) -> TmuxProbe {
+/// Probe the local tmux server. The bootstrap path runs from a
+/// `spawn_blocking` context that doesn't have a tokio reactor handy
+/// for `tokio::process::Command`. Same logic — short-timed
+/// `display-message` + `list-clients` — using std::process and a
+/// thread-based timeout via `wait_timeout` not available in std, so
+/// we approximate with a quick blocking call (tmux returns these in
+/// microseconds when healthy).
+fn probe_tmux_sync(tmux: &std::path::Path) -> TmuxProbe {
     use std::collections::HashSet;
     use std::process::Stdio;
 
-    // Server PID — also serves as our healthy-vs-wedged probe. A
-    // missing server exits non-zero quickly; a healthy server
-    // returns its pid quickly; a wedged server returns nothing
-    // before the timeout fires.
-    let server_query = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        tokio::process::Command::new(tmux)
-            .args(["display-message", "-p", "#{pid}"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await;
+    let server_query = std::process::Command::new(tmux)
+        .args(["display-message", "-p", "#{pid}"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
     let server_pid = match server_query {
-        Ok(Ok(out)) if out.status.success() => {
+        Ok(out) if out.status.success() => {
             String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().ok()
         }
         Ok(_) => return TmuxProbe::NoServer,
-        Err(_) => return TmuxProbe::Wedged,
+        Err(_) => return TmuxProbe::NoServer,
     };
     let Some(server_pid) = server_pid else {
         return TmuxProbe::NoServer;
@@ -755,17 +785,11 @@ async fn probe_tmux(tmux: &std::path::Path) -> TmuxProbe {
     let mut known = HashSet::new();
     known.insert(server_pid);
 
-    // Attached clients. Best-effort: if list-clients hangs or fails
-    // we still have the server pid, which is the critical exclusion.
-    if let Ok(Ok(out)) = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        tokio::process::Command::new(tmux)
-            .args(["list-clients", "-F", "#{client_pid}"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await
+    if let Ok(out) = std::process::Command::new(tmux)
+        .args(["list-clients", "-F", "#{client_pid}"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
     {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             if let Ok(pid) = line.trim().parse::<u32>() {
@@ -775,6 +799,32 @@ async fn probe_tmux(tmux: &std::path::Path) -> TmuxProbe {
     }
 
     TmuxProbe::Healthy(known)
+}
+
+/// Enumerate session ids on the local server, ordered most-recent
+/// first (tmux's default for `list-sessions`). Empty vec when the
+/// server has no sessions; error when tmux itself is unreachable.
+fn list_local_sessions(tmux: &std::path::Path) -> Result<Vec<String>, TmuxError> {
+    let out = std::process::Command::new(tmux)
+        .args(["list-sessions", "-F", "#{session_id}"])
+        .output()
+        .map_err(|e| TmuxError::Response(format!("list-sessions: {e}")))?;
+    if !out.status.success() {
+        // Common case: "no server running" → empty list, not an error.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("no server running") || stderr.contains("error connecting") {
+            return Ok(vec![]);
+        }
+        return Err(TmuxError::Response(format!(
+            "list-sessions failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect())
 }
 
 /// Find and SIGTERM any `tmux -CC` client process that tmux doesn't

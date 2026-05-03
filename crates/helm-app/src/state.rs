@@ -10,10 +10,11 @@
 //!   - the live `TmuxClient` per connected host
 //!   - the single event channel that delivers everything to the frontend
 
-use helm_domain::{Host, HostEvent, HostId, HostKeyDecision, HostStatus};
+use helm_domain::{Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification, NotificationId};
 use helm_ssh::SshSession;
 use helm_tmux::TmuxClient;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::AbortHandle;
@@ -21,25 +22,70 @@ use tokio::task::AbortHandle;
 /// One host's runtime presence. Wrapped in an `Arc<Mutex<…>>` per entry so
 /// connect/disconnect can serialize on a single host without blocking work
 /// against any other host.
+///
+/// Multi-client model: each tmux *session* on the host has its own
+/// permanently-attached control client (so `%output` flows for every
+/// session in real time). `clients` maps tmux session id → SessionClient.
+/// The `primary_session_id` picks one for routing global commands
+/// (send-keys, kill-window, capture-pane — all of which use server-wide
+/// pane/window ids and work through any client).
 pub struct HostEntry {
     pub host: Host,
     pub status: HostStatus,
-    pub tmux: Option<Arc<TmuxClient>>,
+    pub clients: HashMap<String /* session_id */, Arc<SessionClient>>,
+    /// First session we successfully attached at connect time. Used as
+    /// the routing target for commands that don't care which session
+    /// they go through. None when disconnected.
+    pub primary_session_id: Option<String>,
     /// SSH backing for remote hosts. `None` for localhost or when
-    /// disconnected. Kept alive alongside `tmux` because dropping the
-    /// session terminates the underlying connection.
+    /// disconnected. Kept alive alongside `clients` because dropping
+    /// the session terminates every channel — i.e., every tmux client.
     pub ssh: Option<Arc<SshSession>>,
     /// True when the user explicitly disconnects, saves, or deletes the
     /// host. The reconnect supervisor checks this on each transport
     /// drop to decide between retrying and exiting cleanly. Reset to
     /// false on every fresh `host_connect`.
     pub voluntary_disconnect: bool,
-    /// Abort handle for the live supervisor task (forwarder + reconnect
-    /// ladder). Dropping or aborting this stops the reconnect loop —
-    /// used by `host_disconnect`, `host_save`, and `host_delete` to
-    /// guarantee no background reconnect attempts outlive a user
-    /// action.
+    /// Abort handle for the live supervisor task. Dropping or aborting
+    /// this stops the reconnect loop — used by `host_disconnect`,
+    /// `host_save`, and `host_delete` to guarantee no background
+    /// reconnect attempts outlive a user action.
     pub supervisor: Option<AbortHandle>,
+    /// Sender into the live supervisor's signal mpsc. Cloned by per-
+    /// client forwarders (so they can report deaths / sessions-changed)
+    /// and by `spawn_missing_clients` when wiring up newly-spawned
+    /// forwarders. Replaced on every reconnect so signals from a stale
+    /// forwarder can't leak into a fresh supervisor's stream.
+    pub supervisor_tx: Option<mpsc::UnboundedSender<SupervisorSignal>>,
+}
+
+/// One control client (one `tmux -CC attach -t $session_id`) for a
+/// single tmux session. Owns the TmuxClient + a per-client forwarder
+/// task that drains its notifications onto the host's event channel.
+/// The session id lives on the `clients` HashMap key, not duplicated
+/// here.
+pub struct SessionClient {
+    pub tmux: Arc<TmuxClient>,
+    /// Aborted by the host supervisor on disconnect or full reconnect.
+    /// The forwarder also self-aborts when its notification channel
+    /// closes (transport drop / `%exit` for this session).
+    pub forwarder: AbortHandle,
+}
+
+/// Signal from a per-client forwarder back to the host supervisor.
+/// Lives in state.rs so `HostEntry` can hold an mpsc sender of these
+/// without commands.rs having to publicly expose the type.
+pub enum SupervisorSignal {
+    /// One control client's transport closed (`%exit`, EOF, channel
+    /// drop). The forwarder has already exited; the supervisor decides
+    /// whether to keep the host alive (other clients still attached),
+    /// promote a new primary, or fall through to the reconnect ladder.
+    ClientDied(String /* session_id */),
+    /// `%sessions-changed` arrived — supervisor re-lists sessions on
+    /// the server and spawns control clients for any that are now
+    /// present without one. Coalesced if multiple clients fire it
+    /// in quick succession.
+    SessionsChanged,
 }
 
 impl HostEntry {
@@ -47,11 +93,41 @@ impl HostEntry {
         Self {
             host,
             status: HostStatus::Disconnected,
-            tmux: None,
+            clients: HashMap::new(),
+            primary_session_id: None,
             ssh: None,
             voluntary_disconnect: false,
             supervisor: None,
+            supervisor_tx: None,
         }
+    }
+
+    /// Cheap accessor for the primary client's TmuxClient. Returns None
+    /// when disconnected or when the primary session was killed and we
+    /// haven't yet picked a new one.
+    pub fn primary_client(&self) -> Option<Arc<TmuxClient>> {
+        let id = self.primary_session_id.as_ref()?;
+        self.clients.get(id).map(|c| c.tmux.clone())
+    }
+
+    /// Drop every per-session tmux control client + the underlying SSH
+    /// session (if any). Aborts each client's forwarder so its task
+    /// stops draining notifications. Used by every disconnect path
+    /// (voluntary, host_save replace, host_delete, supervisor reconnect).
+    pub fn shutdown_clients(&mut self) {
+        for (_, c) in self.clients.drain() {
+            c.forwarder.abort();
+            // Each TmuxClient::Drop kills its `-CC` process / closes
+            // its SSH channel naturally as the Arc count hits zero.
+            // We don't need to do anything explicit here.
+            drop(c);
+        }
+        self.primary_session_id = None;
+        self.ssh = None;
+        // Drop the supervisor sender so any straggler forwarder that
+        // still holds a clone can't leak signals into a future
+        // supervisor instance.
+        self.supervisor_tx = None;
     }
 }
 
@@ -85,6 +161,96 @@ pub struct AppState {
     /// during its backoff sleep: a `false → true` transition wakes
     /// the sleep early and resets the backoff index.
     pub network_online: watch::Receiver<bool>,
+
+    /// All live inbox notifications, keyed by id. Coalesce semantics
+    /// (one per pane, latest event wins, repeated same-kind bumps a
+    /// counter) live in `crate::notifications` — this map is just the
+    /// flat registry the `notifications_list` command and dismiss
+    /// handlers walk.
+    pub notifications: Arc<DashMap<NotificationId, Notification>>,
+
+    /// Coalesce index: the existing notification id (if any) for a
+    /// given (host, pane). Lets the marker post-processor look up
+    /// "is there already a row for this pane?" in O(1) instead of
+    /// scanning `notifications`.
+    pub notification_by_pane: Arc<DashMap<(HostId, String), NotificationId>>,
+
+    /// Per-pane runtime — output preview ring, in-flight command timing,
+    /// last-known window mapping. Populated by the marker post-processor;
+    /// cleared when the host disconnects or the pane disappears.
+    pub pane_runtime: Arc<DashMap<(HostId, String), PaneRuntime>>,
+
+    /// The (host, window) the user is actively looking at in the helm
+    /// UI, surfaced from the frontend via `set_focus`. The notifications
+    /// post-processor checks this before creating a new inbox row —
+    /// when a pane's window matches the focus, we suppress the
+    /// notification entirely (the user is already watching the output;
+    /// an inbox row would be noise). Cleared (set to None) when the
+    /// helm window loses OS focus or is minimized.
+    pub focus: Arc<parking_lot::Mutex<Option<(HostId, String)>>>,
+
+    /// Per-host serialization lock for `refresh_pane_index`. See
+    /// `NotificationsCtx::refresh_locks` for rationale.
+    pub refresh_locks: Arc<DashMap<HostId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// Mutable per-pane state the notifications layer accumulates between
+/// marker events. Cheap to clone; held briefly under the `pane_runtime`
+/// DashMap entry guard during a marker update.
+#[derive(Debug, Clone, Default)]
+pub struct PaneRuntime {
+    /// Most recent ANSI-stripped pane output, capped at `PREVIEW_BYTES`.
+    /// Snapshotted (last ~120 chars) into `Notification.preview` whenever
+    /// we create or coalesce a notification.
+    pub output_ring: Vec<u8>,
+    /// Unix-ms timestamp of the most recent `OutputMarker::CommandStart`
+    /// (`OSC 133;B`). Lets us compute `duration_ms` on the matching
+    /// `CommandDone`. None when we haven't observed a CommandStart since
+    /// the last CommandDone — happens for the very first prompt and for
+    /// shells without integration installed.
+    pub command_started_at: Option<u64>,
+    /// Best-known window id for this pane, refreshed by the periodic
+    /// pane-index sweep (see `notifications::refresh_pane_index`). Empty
+    /// while we're still bootstrapping or if the lookup hasn't run yet —
+    /// the frontend can also resolve this from its own tree.
+    pub window_id: String,
+    /// Best-known session (workspace) id for this pane, same caveats.
+    pub session_id: String,
+}
+
+/// Maximum bytes retained in the per-pane output ring. ~512 bytes is
+/// enough for ~5-10 lines of typical command output, which is plenty
+/// for a single-line preview after we strip ANSI and tail to ~120 chars.
+pub const PREVIEW_BYTES: usize = 512;
+
+/// Cheap-to-clone bundle of notification storage handles. Passed to the
+/// supervisor task so it can call into the marker post-processor without
+/// needing the full `AppState` (which is wrapped in Tauri's `State<'_>`
+/// and inconvenient to thread through long-running futures).
+#[derive(Clone)]
+pub struct NotificationsCtx {
+    pub notifications: Arc<DashMap<NotificationId, Notification>>,
+    pub notification_by_pane: Arc<DashMap<(HostId, String), NotificationId>>,
+    pub pane_runtime: Arc<DashMap<(HostId, String), PaneRuntime>>,
+    pub focus: Arc<parking_lot::Mutex<Option<(HostId, String)>>>,
+    /// Per-host mutex serializing `refresh_pane_index` so concurrent
+    /// triggers (every forwarder sees `%window-added` /
+    /// `%sessions-changed` and wants to refresh) don't race their
+    /// stale-cleanup steps and wipe valid entries.
+    pub refresh_locks: Arc<DashMap<HostId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AppState {
+    /// Cheap snapshot of the notification handles. Clones five `Arc`s.
+    pub fn notifications_ctx(&self) -> NotificationsCtx {
+        NotificationsCtx {
+            notifications: self.notifications.clone(),
+            notification_by_pane: self.notification_by_pane.clone(),
+            pane_runtime: self.pane_runtime.clone(),
+            focus: self.focus.clone(),
+            refresh_locks: self.refresh_locks.clone(),
+        }
+    }
 }
 
 impl AppState {
@@ -120,6 +286,11 @@ impl Default for AppState {
             event_tx: Mutex::new(None),
             pending_host_key_prompts: Arc::new(DashMap::new()),
             network_online: crate::reachability::spawn(),
+            notifications: Arc::new(DashMap::new()),
+            notification_by_pane: Arc::new(DashMap::new()),
+            pane_runtime: Arc::new(DashMap::new()),
+            focus: Arc::new(parking_lot::Mutex::new(None)),
+            refresh_locks: Arc::new(DashMap::new()),
         }
     }
 }

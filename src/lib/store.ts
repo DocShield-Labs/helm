@@ -11,7 +11,14 @@
  */
 
 import { create } from 'zustand'
-import type { Host, HostId, HostKeyPromptKind, HostStatus } from '@bindings'
+import type {
+  Host,
+  HostId,
+  HostKeyPromptKind,
+  HostStatus,
+  Notification,
+  NotificationId,
+} from '@bindings'
 
 export interface Bootstrap {
   ready: boolean
@@ -190,6 +197,23 @@ interface HelmState {
   hostKeyPrompts: Map<HostId, HostKeyPrompt>
   setHostKeyPrompt: (prompt: HostKeyPrompt) => void
   clearHostKeyPrompt: (hostId: HostId) => void
+
+  // ---------- inbox notifications ----------
+  /** Live inbox, keyed by notification id. The backend (helm-app) is
+   * the source of truth — it emits one HostEvent::Notification per
+   * upsert and one HostEvent::NotificationDismissed per dismiss. The
+   * frontend never mutates the registry locally; UI actions (× button,
+   * dismiss-on-keystroke) call into the Tauri command, which then
+   * round-trips back as a Dismissed event. */
+  notifications: Map<NotificationId, Notification>
+  upsertNotification: (n: Notification) => void
+  removeNotification: (id: NotificationId) => void
+  /** Drop every notification belonging to `hostId`. Called when a host
+   * is removed from the registry — keeps stale rows from outliving
+   * their host. The backend already emits per-row Dismissed events on
+   * disconnect/delete; this is belt-and-braces for the host_removed
+   * event path. */
+  dismissNotificationsForHost: (hostId: HostId) => void
 }
 
 function withHostSessions(
@@ -277,11 +301,16 @@ export const useStore = create<HelmState>((set) => ({
       nextSessions.delete(id)
       const nextErrors = new Map(s.hostErrors)
       nextErrors.delete(id)
+      const nextNotifications = new Map<NotificationId, Notification>()
+      for (const [nid, n] of s.notifications) {
+        if (n.host_id !== id) nextNotifications.set(nid, n)
+      }
       return {
         hosts: nextHosts,
         statuses: nextStatuses,
         sessions: nextSessions,
         hostErrors: nextErrors,
+        notifications: nextNotifications,
         activeHostId: s.activeHostId === id ? null : s.activeHostId,
       }
     }),
@@ -456,6 +485,34 @@ export const useStore = create<HelmState>((set) => ({
       next.delete(hostId)
       return { hostKeyPrompts: next }
     }),
+
+  notifications: new Map(),
+  upsertNotification: (n) =>
+    set((s) => {
+      const next = new Map(s.notifications)
+      next.set(n.id, n)
+      return { notifications: next }
+    }),
+  removeNotification: (id) =>
+    set((s) => {
+      if (!s.notifications.has(id)) return {}
+      const next = new Map(s.notifications)
+      next.delete(id)
+      return { notifications: next }
+    }),
+  dismissNotificationsForHost: (hostId) =>
+    set((s) => {
+      let changed = false
+      const next = new Map<NotificationId, Notification>()
+      for (const [id, n] of s.notifications) {
+        if (n.host_id === hostId) {
+          changed = true
+          continue
+        }
+        next.set(id, n)
+      }
+      return changed ? { notifications: next } : {}
+    }),
 }))
 
 // ---------- selector helpers ----------
@@ -473,3 +530,77 @@ export function workspaceForWindow(
 }
 
 export { emptyWorkspace }
+
+// ---------- notification selectors ----------
+
+/** All notifications for a host, ordered oldest-first by created_at. */
+export function notificationsForHost(
+  notifications: Map<NotificationId, Notification>,
+  hostId: HostId,
+): Notification[] {
+  const out: Notification[] = []
+  for (const n of notifications.values()) {
+    if (n.host_id === hostId) out.push(n)
+  }
+  out.sort((a, b) => a.created_at - b.created_at)
+  return out
+}
+
+/** All notifications whose pane sits inside the given window. The
+ * window_id field on a Notification is best-effort (populated by the
+ * backend's pane_runtime cache); when empty we fall back to looking
+ * the pane up via the live workspace tree so the rollup still works
+ * for notifications created before the index refreshed. */
+export function notificationsForWindow(
+  notifications: Map<NotificationId, Notification>,
+  hostSessions: HostSessions | undefined,
+  hostId: HostId,
+  windowId: string,
+): Notification[] {
+  const out: Notification[] = []
+  for (const n of notifications.values()) {
+    if (n.host_id !== hostId) continue
+    if (n.window_id === windowId) {
+      out.push(n)
+      continue
+    }
+    // Backend hadn't resolved the window yet — try the local tree.
+    if (n.window_id === '' && hostSessions) {
+      for (const ws of hostSessions.workspaces.values()) {
+        const pane = ws.panes.get(n.pane_id)
+        if (pane && pane.windowId === windowId) {
+          out.push(n)
+          break
+        }
+      }
+    }
+  }
+  out.sort((a, b) => a.created_at - b.created_at)
+  return out
+}
+
+/** All notifications for a workspace (any window). Same window_id
+ * fallback as notificationsForWindow. */
+export function notificationsForWorkspace(
+  notifications: Map<NotificationId, Notification>,
+  hostSessions: HostSessions | undefined,
+  hostId: HostId,
+  workspaceId: string,
+): Notification[] {
+  const ws = hostSessions?.workspaces.get(workspaceId)
+  if (!ws) return []
+  const windowIds = new Set([...ws.windows.keys()])
+  const out: Notification[] = []
+  for (const n of notifications.values()) {
+    if (n.host_id !== hostId) continue
+    if (n.workspace_id === workspaceId || windowIds.has(n.window_id)) {
+      out.push(n)
+      continue
+    }
+    if (n.window_id === '' && ws.panes.has(n.pane_id)) {
+      out.push(n)
+    }
+  }
+  out.sort((a, b) => a.created_at - b.created_at)
+  return out
+}

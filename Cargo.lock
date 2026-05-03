@@ -1640,6 +1640,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "core-foundation 0.9.4",
  "dashmap",
  "dirs 5.0.1",

@@ -4,12 +4,14 @@
 //! global app state, and exposes commands + channels to the frontend.
 
 mod commands;
+mod integration;
 mod keychain;
+mod notifications;
 mod persistence;
 mod reachability;
 mod state;
 
-use specta_typescript::Typescript;
+use specta_typescript::{BigIntExportBehavior, Typescript};
 use tauri::Manager;
 use tauri_specta::{collect_commands, Builder};
 
@@ -46,6 +48,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::tmux_switch_client,
         commands::tmux_capture_pane,
         commands::tmux_resize_client,
+        commands::notifications_list,
+        commands::notification_dismiss,
+        commands::notification_dismiss_for_window,
+        commands::set_focus,
     ])
 }
 
@@ -53,7 +59,13 @@ fn specta_builder() -> Builder<tauri::Wry> {
 pub fn export_bindings() {
     specta_builder()
         .export(
-            Typescript::default().header("// @ts-nocheck\n"),
+            Typescript::default()
+                .header("// @ts-nocheck\n")
+                // u64 timestamps (unix ms) sit comfortably under JS's
+                // Number.MAX_SAFE_INTEGER (2^53). Emitting as `number`
+                // avoids wrapping every timestamp in a BigInt at the
+                // call site.
+                .bigint(BigIntExportBehavior::Number),
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/types/bindings.ts"),
         )
         .expect("failed to export specta bindings");
@@ -67,6 +79,40 @@ pub fn run() {
         )
         .init();
 
+    // Refresh the on-disk integration scripts to whatever this build
+    // shipped. Idempotent overwrite — cheap, and keeps the user's
+    // ~/.helm/integration tree in lockstep with the binary they just
+    // launched. Soft failure: if HOME is missing or the directory
+    // can't be created, we just log and continue without integration
+    // (bell detection still works).
+    if let Err(e) = integration::install_local() {
+        tracing::warn!("shell integration install failed: {e}");
+    }
+
+    // Set the integration env vars in helm's own process env so the
+    // *very first* tmux server we spawn inherits them at server start.
+    // Without this, the bootstrap session's first pane (which gets
+    // launched as part of tmux server startup, before we can
+    // `set-environment` anything) wouldn't have ZDOTDIR set and would
+    // miss zsh integration. configure_tmux_env still runs on every
+    // connect to keep tmux's server-global env in sync for later
+    // panes, but this is the only way to reach the bootstrap pane.
+    //
+    // Safety: std::env::set_var mutates only this process's env block
+    // — not the user's shell. tmux + spawn_local inherit our env, so
+    // the value flows through.
+    if let Some(home) = dirs::home_dir() {
+        let zsh_dir = home.join(".helm").join("integration").join("zsh");
+        let user_zdotdir = std::env::var("ZDOTDIR")
+            .unwrap_or_else(|_| home.to_string_lossy().into_owned());
+        // SAFETY: single-threaded boot, no env iteration in flight.
+        unsafe {
+            std::env::set_var("HELM_INTEGRATION", "1");
+            std::env::set_var("HELM_USER_ZDOTDIR", &user_zdotdir);
+            std::env::set_var("ZDOTDIR", &zsh_dir);
+        }
+    }
+
     let specta = specta_builder();
 
     // In debug, regenerate the TS bindings on every cold start so they
@@ -74,7 +120,13 @@ pub fn run() {
     #[cfg(debug_assertions)]
     specta
         .export(
-            Typescript::default().header("// @ts-nocheck\n"),
+            Typescript::default()
+                .header("// @ts-nocheck\n")
+                // u64 timestamps (unix ms) sit comfortably under JS's
+                // Number.MAX_SAFE_INTEGER (2^53). Emitting as `number`
+                // avoids wrapping every timestamp in a BigInt at the
+                // call site.
+                .bigint(BigIntExportBehavior::Number),
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/types/bindings.ts"),
         )
         .expect("failed to export specta bindings");
@@ -103,8 +155,7 @@ pub fn run() {
                     if let Some(handle) = guard.supervisor.take() {
                         handle.abort();
                     }
-                    guard.tmux = None;
-                    guard.ssh = None;
+                    guard.shutdown_clients();
                 }
             }
         }
