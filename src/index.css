@@ -1,0 +1,54 @@
+@import "tailwindcss";
+@import "./ui/tokens.css";
+
+/*
+ * Tailwind v4 reads CSS custom properties at build time. The token aliases
+ * below let us write `bg-canvas` instead of `bg-[var(--bg-canvas)]`, while
+ * keeping the runtime source-of-truth in tokens.css.
+ */
+@theme {
+  --color-canvas:        var(--bg-canvas);
+  --color-sidebar:       var(--bg-sidebar);
+  --color-elevated:      var(--bg-elevated);
+  --color-overlay:       var(--bg-overlay);
+  --color-hover:         var(--bg-hover);
+  --color-active:        var(--bg-active);
+
+  --color-text-primary:   var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-tertiary:  var(--text-tertiary);
+  --color-text-disabled:  var(--text-disabled);
+  --color-text-inverse:   var(--text-inverse);
+
+  --color-accent:         var(--accent-default);
+  --color-accent-hover:   var(--accent-hover);
+  --color-accent-muted:   var(--accent-muted);
+  --color-accent-border:  var(--accent-border);
+  --color-accent-text:    var(--accent-text);
+
+  --color-status-connected:    var(--status-connected);
+  --color-status-connecting:   var(--status-connecting);
+  --color-status-disconnected: var(--status-disconnected);
+  --color-status-idle:         var(--status-idle);
+  --color-status-error:        var(--status-error);
+
+  --color-activity-running:   var(--activity-running);
+  --color-activity-attention: var(--activity-attention);
+  --color-activity-failed:    var(--activity-failed);
+  --color-activity-idle:      var(--activity-idle);
+
+  --font-chrome: var(--font-chrome);
+  --font-mono:   var(--font-mono);
+}
+
+/*
+ * Browsers (since Chrome 80) ship buttons with cursor:default. In an
+ * app like this every button is interactive, so restore the pointer
+ * cursor globally rather than threading cursor-pointer through every
+ * component. Disabled buttons keep the default cursor so the affordance
+ * is still right.
+ */
+button:not(:disabled),
+[role='button']:not([aria-disabled='true']) {
+  cursor: pointer;
+}

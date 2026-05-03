@@ -1,0 +1,19 @@
+[package]
+name = "helm-tmux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helm-domain.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+portable-pty.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+uuid.workspace = true
+tracing-subscriber.workspace = true

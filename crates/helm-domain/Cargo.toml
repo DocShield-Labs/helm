@@ -1,0 +1,11 @@
+[package]
+name = "helm-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+specta.workspace = true
+uuid.workspace = true
+thiserror.workspace = true

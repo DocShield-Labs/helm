@@ -1,0 +1,50 @@
+[package]
+name = "helm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Helm — a modern terminal that happens to use tmux"
+default-run = "helm"
+
+[lib]
+name = "helm_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "helm"
+path = "src/main.rs"
+
+[[bin]]
+name = "export-bindings"
+path = "src/bin/export_bindings.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+helm-domain.workspace = true
+helm-tmux.workspace = true
+helm-ssh.workspace = true
+
+tauri.workspace = true
+tauri-specta.workspace = true
+specta.workspace = true
+specta-typescript.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+dirs.workspace = true
+ssh2-config.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+security-framework.workspace = true
+system-configuration = "0.7.0"

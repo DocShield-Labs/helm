@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/helm-app",
+  "crates/helm-domain",
+  "crates/helm-tmux",
+  "crates/helm-ssh",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+authors = ["Azhar Hussain <azhar@docshield.com>"]
+
+[workspace.dependencies]
+# internal
+helm-domain = { path = "crates/helm-domain" }
+helm-tmux   = { path = "crates/helm-tmux" }
+helm-ssh    = { path = "crates/helm-ssh" }
+
+# async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# serialization + types
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+specta = { version = "2.0.0-rc.22", features = ["derive", "uuid"] }
+specta-typescript = "0.0.9"
+
+# tauri
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
+
+# transports
+portable-pty = "0.8"
+russh = "0.46"
+russh-keys = "0.46"
+
+# bytes / streaming
+bytes = "1"
+
+# errors / logs
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# misc
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+dashmap = "6"
+dirs = "5"
+security-framework = "2"
+ssh2-config = "0.7"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

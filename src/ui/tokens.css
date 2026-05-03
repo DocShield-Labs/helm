@@ -1,0 +1,127 @@
+/*
+ * Helm — design tokens.
+ *
+ * 1:1 with the Figma variables in /📐 Foundations.
+ * Re-skin the entire system by changing values here; no component file
+ * should ever hardcode a color or spacing value.
+ */
+
+:root {
+  /* ---------- Surfaces ---------- */
+  --bg-canvas: #0B0C0E;
+  --bg-sidebar: #0E1013;
+  --bg-elevated: #14171B;
+  --bg-overlay: #1A1E23;
+  --bg-hover: #1F2329;
+  --bg-active: #252A31;
+
+  /* ---------- Strokes ---------- */
+  --stroke-subtle:  rgba(255, 255, 255, 0.04);
+  --stroke-default: rgba(255, 255, 255, 0.08);
+  --stroke-strong:  rgba(255, 255, 255, 0.14);
+  --stroke-inverse: rgba(0, 0, 0, 0.40);
+
+  /* ---------- Text ---------- */
+  --text-primary:   #ECEDEE;
+  --text-secondary: #9DA4AD;
+  --text-tertiary:  #6B7280;
+  --text-disabled:  #404853;
+  --text-inverse:   #0B0C0E;
+
+  /* ---------- Accent (warm coral) ---------- */
+  --accent-default: #F4856B;
+  --accent-hover:   #FF9A82;
+  --accent-muted:   rgba(244, 133, 107, 0.12);
+  --accent-border:  rgba(244, 133, 107, 0.30);
+  --accent-text:    #FFB39E;
+
+  /* ---------- Status (semantic — never decorative) ---------- */
+  --status-connected:    #3FCF8E;
+  --status-connecting:   #E8B339;
+  --status-disconnected: #E5484D;
+  --status-idle:         #6B7280;
+  --status-error:        #F2555A;
+
+  /* ---------- Activity ---------- */
+  --activity-running:   #5B8DEF;
+  --activity-attention: #E8B339;
+  --activity-failed:    #E5484D;
+  --activity-idle:      #6B7280;
+
+  /* ---------- Spacing scale ---------- */
+  --space-0:  0px;
+  --space-1:  2px;
+  --space-2:  4px;
+  --space-3:  6px;
+  --space-4:  8px;
+  --space-5:  12px;
+  --space-6:  16px;
+  --space-7:  20px;
+  --space-8:  24px;
+  --space-9:  32px;
+  --space-10: 40px;
+  --space-11: 48px;
+  --space-12: 64px;
+
+  /* ---------- Radius ---------- */
+  --radius-sm:   4px;
+  --radius-md:   6px;
+  --radius-lg:   8px;
+  --radius-xl:   12px;
+  --radius-pill: 999px;
+
+  /* ---------- Type families ----------
+   * Chrome: SF Pro on device, Inter as the universal fallback.
+   * Mono:   Berkeley Mono on device, JetBrains Mono fallback.
+   */
+  --font-chrome: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro",
+                  Inter, system-ui, sans-serif;
+  --font-mono:   "Berkeley Mono", "JetBrains Mono", "SF Mono", ui-monospace,
+                  Menlo, Consolas, monospace;
+
+  /* ---------- Type ramp (size / line-height / weight / tracking) ---------- */
+  --type-display-lg-size: 40px; --type-display-lg-line: 48px; --type-display-lg-weight: 600; --type-display-lg-track: -0.03em;
+  --type-title-lg-size:   22px; --type-title-lg-line:   30px; --type-title-lg-weight:   600; --type-title-lg-track:   -0.02em;
+  --type-title-md-size:   15px; --type-title-md-line:   22px; --type-title-md-weight:   600; --type-title-md-track:   -0.01em;
+  --type-body-lg-size:    15px; --type-body-lg-line:    24px; --type-body-lg-weight:    400;
+  --type-body-md-size:    13px; --type-body-md-line:    20px; --type-body-md-weight:    400;
+  --type-body-sm-size:    12px; --type-body-sm-line:    18px; --type-body-sm-weight:    400;
+  --type-label-sm-size:   11px; --type-label-sm-line:   14px; --type-label-sm-weight:   500; --type-label-sm-track: 0.08em;
+  --type-mono-md-size:    13px; --type-mono-md-line:    20px;
+  --type-mono-sm-size:    12px; --type-mono-sm-line:    18px;
+
+  /* ---------- Motion ---------- */
+  --duration-fast:   120ms;
+  --duration-medium: 200ms;
+  --duration-slow:   320ms;
+  --easing-standard: cubic-bezier(0.2, 0, 0, 1);
+  --easing-spring:   cubic-bezier(0.5, 1.6, 0.5, 1);
+
+  /* ---------- Elevation ---------- */
+  --elevation-1: 0 1px 2px rgba(0, 0, 0, 0.20);
+  --elevation-2: 0 16px 48px rgba(0, 0, 0, 0.50), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --elevation-3: 0 24px 64px rgba(0, 0, 0, 0.60), 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* ---------- Globals ---------- */
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-chrome);
+  font-size: var(--type-body-md-size);
+  line-height: var(--type-body-md-line);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+* { box-sizing: border-box; }
+
+::selection {
+  background: var(--accent-muted);
+  color: var(--text-primary);
+}
