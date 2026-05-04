@@ -55,6 +55,7 @@ dashmap = "6"
 dirs = "5"
 security-framework = "2"
 ssh2-config = "0.7"
+base64 = "0.22"
 
 [profile.release]
 codegen-units = 1

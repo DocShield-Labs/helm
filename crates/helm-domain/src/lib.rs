@@ -64,6 +64,11 @@ impl HostId {
 /// shells with helm's integration script sourced. We strip both from the
 /// forwarded bytes so xterm doesn't actually beep or render the escape
 /// sequences as glyphs.
+///
+/// `PromptStart` and `CommandStart` carry optional metadata (cwd, branch,
+/// command line) shipped by helm's integration scripts as base64 params on
+/// the OSC 133 envelope. None when the shell's integration is older than
+/// 4F or running under `HELM_KEEP_PROMPT=1`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OutputMarker {
@@ -71,11 +76,24 @@ pub enum OutputMarker {
     /// finished long-running commands, IRC pings) emit this when they
     /// want the user's attention.
     Bell,
-    /// `OSC 133;A` — the shell is about to print a new prompt.
-    PromptStart,
-    /// `OSC 133;B` — the prompt has finished printing; what follows is
-    /// the user's typed command.
-    CommandStart,
+    /// `OSC 133;A[;cwd_b64=…;branch_b64=…]` — the shell is about to
+    /// print a new prompt.
+    PromptStart {
+        /// Working directory at prompt time, decoded from `cwd_b64`.
+        cwd: Option<String>,
+        /// Current git branch (if cwd is inside a repo), decoded from
+        /// `branch_b64`. None when not in a repo or the integration
+        /// script couldn't run `git`.
+        branch: Option<String>,
+    },
+    /// `OSC 133;B[;cmdline_b64=…]` — the prompt has finished printing;
+    /// what follows is the user's typed command.
+    CommandStart {
+        /// The command line the user is about to run, decoded from
+        /// `cmdline_b64`. None when emitted from an older integration
+        /// script.
+        command: Option<String>,
+    },
     /// `OSC 133;C` — the user pressed Enter; what follows is command
     /// output.
     OutputStart,
@@ -83,6 +101,26 @@ pub enum OutputMarker {
     /// given exit code. None when the shell didn't include a code (older
     /// integration scripts, partial sequences).
     CommandDone { exit_code: Option<i32> },
+}
+
+/// One marker, paired with the byte offset into the cleaned `%output`
+/// chunk where it was extracted.
+///
+/// Without offsets, multiple markers in a single chunk (e.g. `D` from
+/// the previous command + `A` for the new prompt + bytes between)
+/// can't be correlated to xterm rows on the frontend — the cursor
+/// would be sampled at the *end* of the whole chunk for every marker
+/// and block boundaries would land on the wrong line. The frontend
+/// uses these offsets to slice the byte stream and sample the cursor
+/// in xterm at each marker's position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct MarkerAt {
+    pub marker: OutputMarker,
+    /// Byte offset into the *cleaned* `bytes` field of
+    /// `TmuxNotification::Output`. The marker itself was stripped from
+    /// that buffer; this offset is the position where the marker would
+    /// have started.
+    pub offset: u32,
 }
 
 /// Wire format for tmux state deltas. Mirrors `helm-tmux::parse::Notification`
@@ -96,7 +134,7 @@ pub enum TmuxNotification {
     Output {
         pane_id: String,
         bytes: Vec<u8>,
-        markers: Vec<OutputMarker>,
+        markers: Vec<MarkerAt>,
     },
     WindowAdded { window_id: String },
     WindowClosed { window_id: String },

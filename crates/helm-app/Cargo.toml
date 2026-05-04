@@ -43,7 +43,7 @@ parking_lot.workspace = true
 dashmap.workspace = true
 dirs.workspace = true
 ssh2-config.workspace = true
-base64 = "0.22"
+base64.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"

@@ -33,6 +33,7 @@ import {
   type TmuxWorkspace,
 } from '@lib/store'
 import { connectHost, selectWorkspace } from '@lib/host'
+import { killWindow } from '@lib/actions/window'
 import type { Host, HostStatus, Notification } from '@bindings'
 import {
   ActivityDot,
@@ -155,14 +156,14 @@ function PinnedRow({
   const menuItems: Array<ContextMenuItem | 'separator'> = [
     { id: 'unpin', label: 'Unpin from sidebar', icon: '☆', onClick: onRemove },
   ]
-  if (phase === 'normal' && host && window) {
+  if (phase === 'normal' && host && workspace && window) {
     menuItems.push('separator')
     menuItems.push({
       id: 'kill',
       label: 'Kill window',
       icon: '×',
       destructive: true,
-      onClick: () => void commands.tmuxKillWindow(host.id, window.id),
+      onClick: () => killWindow(host.id, workspace.id, window),
     })
   }
 

@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use helm_domain::{
-    HostEvent, HostId, Notification, NotificationId, NotificationKind, OutputMarker,
+    HostEvent, HostId, MarkerAt, Notification, NotificationId, NotificationKind, OutputMarker,
 };
 use helm_tmux::TmuxClient;
 use tokio::sync::mpsc::UnboundedSender;
@@ -35,7 +35,7 @@ pub fn process_output(
     host_id: HostId,
     pane_id: &str,
     bytes: &[u8],
-    markers: &[OutputMarker],
+    markers: &[MarkerAt],
 ) {
     // Always update the per-pane preview ring, even when there are no
     // markers — we want a fresh preview ready the *next* time a marker
@@ -48,21 +48,27 @@ pub fn process_output(
     }
 
     let now = unix_ms();
-    for marker in markers {
-        match marker {
-            OutputMarker::PromptStart => {
+    for m in markers {
+        match &m.marker {
+            OutputMarker::PromptStart { .. } => {
                 // No notification triggered — but we use this to clear
                 // any in-flight command timer that might still be set
                 // from a previous command that didn't emit CommandDone
                 // (e.g., shell entered a TUI). The next CommandStart
-                // will restart the timer cleanly.
+                // will restart the timer cleanly. We don't store cwd /
+                // branch here because the inbox doesn't need them; the
+                // frontend's BlockTracker reads them straight off the
+                // marker via the wire event.
                 with_runtime(ctx, host_id, pane_id, |rt| {
                     rt.command_started_at = None;
+                    rt.command_text.clear();
                 });
             }
-            OutputMarker::CommandStart => {
+            OutputMarker::CommandStart { command } => {
+                let cmd = command.clone().unwrap_or_default();
                 with_runtime(ctx, host_id, pane_id, |rt| {
                     rt.command_started_at = Some(now);
+                    rt.command_text = cmd;
                 });
             }
             OutputMarker::OutputStart => {
@@ -86,10 +92,11 @@ pub fn process_output(
                 );
             }
             OutputMarker::CommandDone { exit_code } => {
-                let duration_ms = with_runtime(ctx, host_id, pane_id, |rt| {
+                let (duration_ms, command) = with_runtime(ctx, host_id, pane_id, |rt| {
                     let dur = rt.command_started_at.map(|t| now.saturating_sub(t));
+                    let cmd = std::mem::take(&mut rt.command_text);
                     rt.command_started_at = None;
-                    dur
+                    (dur, cmd)
                 });
                 upsert(
                     ctx,
@@ -98,12 +105,7 @@ pub fn process_output(
                     pane_id,
                     NotificationKind::CommandDone {
                         exit_code: *exit_code,
-                        // Command text plumbing comes with phase 4B's
-                        // shell integration script (which can pass the
-                        // command via the `OSC 133;C;cmdline=…` extension
-                        // or a sibling marker). Empty-string here means
-                        // "frontend, don't render a command line."
-                        command: String::new(),
+                        command,
                         duration_ms,
                     },
                     now,

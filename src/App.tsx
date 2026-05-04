@@ -16,19 +16,22 @@
 import { useEffect, useMemo, useState } from 'react'
 import { commands } from '@lib/ipc'
 import {
+  sortById,
   useStore,
-  workspaceForWindow,
   type HostSessions,
   type TmuxWorkspace,
 } from '@lib/store'
-import { connectHost, selectWorkspace, subscribeHostEvents } from '@lib/host'
+import { connectHost, subscribeHostEvents } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
+import { useGlobalKeymap } from '@lib/keymap-engine'
+import { createWorkspace, killWorkspace } from '@lib/actions/workspace'
 import { TmuxPane } from '@features/shell/TmuxPane'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
 import { HostKeyPromptModal } from '@features/host-key/HostKeyPromptModal'
 import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSuggestionHost'
 import { NotificationPeek } from '@features/activity-feed/NotificationPeek'
 import { ReconnectingOverlay } from '@features/workspace/ReconnectingOverlay'
+import { PaletteHost } from '@features/palette/PaletteHost'
 import {
   Sidebar,
   StatusBarHostSegment,
@@ -56,7 +59,6 @@ export function App() {
   const activeHostId = useStore((s) => s.activeHostId)
   const setHosts = useStore((s) => s.setHosts)
   const setActiveHost = useStore((s) => s.setActiveHost)
-  const toggleSidebar = useStore((s) => s.toggleSidebar)
   const sidebarCollapsed = useStore((s) => s.sidebarCollapsed)
   const hostLatencies = useStore((s) => s.hostLatencies)
   const hostErrors = useStore((s) => s.hostErrors)
@@ -125,10 +127,10 @@ export function App() {
   }, [activeHostSessions])
 
   // Stable order by tmux id within a workspace.
-  const windowList = useMemo(() => {
-    if (!activeWorkspace) return []
-    return [...activeWorkspace.windows.values()].sort((a, b) => a.id.localeCompare(b.id))
-  }, [activeWorkspace])
+  const windowList = useMemo(
+    () => (activeWorkspace ? sortById(activeWorkspace.windows.values()) : []),
+    [activeWorkspace],
+  )
 
   const activeWindow = useMemo(
     () => windowList.find((w) => w.active) ?? windowList[0],
@@ -186,100 +188,11 @@ export function App() {
   }, [sessions])
 
   // ---------- keyboard shortcuts ----------
-  // Captured at the document level so xterm doesn't swallow the keys first;
-  // TmuxPane filters Cmd+ from going to the shell anyway.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (!e.metaKey || e.altKey || e.ctrlKey) return
-
-      // Sidebar toggle is host-agnostic — fire even when no host is active.
-      if (e.key === '\\') {
-        e.preventDefault()
-        toggleSidebar()
-        return
-      }
-
-      if (!activeHostId) return
-
-      switch (e.key.toLowerCase()) {
-        case 'i':
-          if (!e.shiftKey) return
-          // Cmd+Shift+I → focus oldest inbox notification.
-          // Cross-host: if the oldest notification belongs to a
-          // different host than the active one, switch hosts before
-          // selecting the window. The notification stays in the inbox
-          // (peek doesn't dismiss); typing in the pane will dismiss
-          // via the keystroke handler in TmuxPane.
-          e.preventDefault()
-          jumpToOldestNotification()
-          return
-        case 't':
-          e.preventDefault()
-          if (e.shiftKey) {
-            // Cmd+Shift+T → new workspace on active host
-            void createWorkspace(activeHostId)
-          } else {
-            // Cmd+T → new window in active workspace
-            if (activeWorkspace) {
-              void commands.tmuxNewWindow(activeHostId, activeWorkspace.id, null)
-            }
-          }
-          return
-        case 'w': {
-          e.preventDefault()
-          if (e.shiftKey) {
-            // Cmd+Shift+W → kill active workspace (with confirm)
-            if (activeWorkspace) {
-              void killWorkspace(activeHostId, activeWorkspace)
-            }
-          } else if (activeWindow) {
-            void commands.tmuxKillWindow(activeHostId, activeWindow.id)
-          }
-          return
-        }
-        case ']':
-        case 'arrowright': {
-          e.preventDefault()
-          // In Pinned mode, cycle through the user's working set
-          // across hosts. Otherwise, cycle within the active workspace.
-          const state = useStore.getState()
-          if (state.sidebarTab === 'pinned' && state.pinnedWindows.length > 0) {
-            void cyclePinnedWindow(+1)
-          } else {
-            const next = neighbourWindowId(windowList, activeWindow?.id, +1)
-            if (next) {
-              void commands.tmuxSelectWindow(activeHostId, next).then((res) => {
-                if (res.status !== 'ok') {
-                  console.warn('tmux_select_window failed:', res.error)
-                }
-              })
-            }
-          }
-          return
-        }
-        case '[':
-        case 'arrowleft': {
-          e.preventDefault()
-          const state = useStore.getState()
-          if (state.sidebarTab === 'pinned' && state.pinnedWindows.length > 0) {
-            void cyclePinnedWindow(-1)
-          } else {
-            const prev = neighbourWindowId(windowList, activeWindow?.id, -1)
-            if (prev) {
-              void commands.tmuxSelectWindow(activeHostId, prev).then((res) => {
-                if (res.status !== 'ok') {
-                  console.warn('tmux_select_window failed:', res.error)
-                }
-              })
-            }
-          }
-          return
-        }
-      }
-    }
-    document.addEventListener('keydown', handler, true)
-    return () => document.removeEventListener('keydown', handler, true)
-  }, [windowList, activeWindow, activeWorkspace, activeHostId, toggleSidebar])
+  // The engine reads `STATIC_ACTIONS` from the registry, layers user
+  // overrides, and dispatches at document level. xterm vetoes Cmd+ at
+  // the terminal layer (terminal/index.ts:69-71) so global combos
+  // always reach us.
+  useGlobalKeymap()
 
   // ---------- active-window focus reporting ----------
   // Tell the backend which (host, window) the user is looking at, so
@@ -483,143 +396,10 @@ export function App() {
       <HostKeyPromptModal />
 
       <IntegrationSuggestionHost />
+      <PaletteHost />
       <ToastHost />
     </div>
   )
-}
-
-/** Cmd+Shift+I handler — jumps to the oldest inbox notification. */
-function jumpToOldestNotification(): void {
-  const state = useStore.getState()
-  let oldest: { hostId: string; windowId: string; createdAt: number } | null = null
-  for (const n of state.notifications.values()) {
-    if (oldest === null || n.created_at < oldest.createdAt) {
-      oldest = { hostId: n.host_id, windowId: n.window_id, createdAt: n.created_at }
-    }
-  }
-  if (!oldest) return
-  state.setActiveHost(oldest.hostId)
-  const hs = state.sessions.get(oldest.hostId)
-  const ws = workspaceForWindow(hs, oldest.windowId)
-  if (ws) {
-    state.setActiveWindow(oldest.hostId, ws.id, oldest.windowId)
-    void selectWorkspace(oldest.hostId, ws.id)
-  }
-  void commands.tmuxSelectWindow(oldest.hostId, oldest.windowId)
-}
-
-/** Cmd+] / Cmd+[ in Pinned mode — walk the user's pinned working set
- * across hosts. Skips stale/loading pins so the user can't get stuck on
- * a pin whose window doesn't exist anymore; if every pin is unreachable
- * (rare), we just leave the active selection alone. */
-async function cyclePinnedWindow(dir: 1 | -1): Promise<void> {
-  const state = useStore.getState()
-  const pins = state.pinnedWindows
-  if (pins.length === 0) return
-
-  // Resolve which pin (if any) is currently active so we can step from it.
-  const curIdx = pins.findIndex((p) => {
-    if (p.hostId !== state.activeHostId) return false
-    const hs = state.sessions.get(p.hostId)
-    if (!hs) return false
-    const ws = [...hs.workspaces.values()].find((w) => w.name === p.workspaceName)
-    if (!ws || hs.activeWorkspaceId !== ws.id) return false
-    const win = ws.windows.get(p.windowId)
-    return !!win && win.active
-  })
-
-  // Try every pin once starting from the next slot — skipping any that
-  // don't resolve so we don't land on a stale row.
-  const start = curIdx === -1 ? (dir > 0 ? 0 : pins.length - 1) : curIdx + dir
-  for (let i = 0; i < pins.length; i++) {
-    const idx = ((start + i * dir) % pins.length + pins.length) % pins.length
-    const target = pins[idx]
-    const hs = state.sessions.get(target.hostId)
-    const ws = hs ? [...hs.workspaces.values()].find((w) => w.name === target.workspaceName) : undefined
-    const win = ws?.windows.get(target.windowId)
-    if (!ws || !win) continue // stale or loading; skip
-
-    state.setActiveHost(target.hostId)
-    state.setActiveWindow(target.hostId, ws.id, win.id)
-    await selectWorkspace(target.hostId, ws.id)
-    void commands.tmuxSelectWindow(target.hostId, win.id)
-    return
-  }
-}
-
-/** Pick a free `workspace N` name and create it on the host. */
-async function createWorkspace(hostId: string): Promise<void> {
-  const state = useStore.getState()
-  const hs = state.sessions.get(hostId)
-  const used = new Set<number>()
-  if (hs) {
-    for (const w of hs.workspaces.values()) {
-      const m = w.name.match(/^workspace (\d+)$/)
-      if (m) used.add(parseInt(m[1], 10))
-    }
-  }
-  let n = 1
-  while (used.has(n)) n++
-  const name = `workspace ${n}`
-
-  // If the host isn't connected, connect first — passing `name` as the
-  // bootstrap workspace so if no sessions exist on the server, we create
-  // exactly this one (instead of a stray `main` session). When other
-  // sessions DO exist, attach succeeds and `name` doesn't get created
-  // by the bootstrap; we'll create it via tmux_new_session below.
-  const status = state.statuses.get(hostId)
-  if (status !== 'connected' && status !== 'idle') {
-    try {
-      await connectHost(hostId, name)
-    } catch (e) {
-      console.error('connect failed:', e)
-      return
-    }
-  }
-
-  // After connect (or if we were already connected): see if our named
-  // workspace exists. The bootstrap may have created it; if not, we
-  // create it explicitly.
-  const post = useStore.getState().sessions.get(hostId)
-  let workspaceId: string | undefined
-  if (post) {
-    for (const w of post.workspaces.values()) {
-      if (w.name === name) {
-        workspaceId = w.id
-        break
-      }
-    }
-  }
-  if (!workspaceId) {
-    const res = await commands.tmuxNewSession(hostId, name)
-    if (res.status !== 'ok') {
-      console.error('new-session failed:', res.error)
-      return
-    }
-    workspaceId = res.data
-  }
-  await selectWorkspace(hostId, workspaceId)
-}
-
-/** Schedule a workspace kill with a 5s undo window. The toast carries the
- * actual kill as its deferred action; the Undo button dismisses the toast
- * and the kill never fires. The active-workspace fallback is handled in
- * setWorkspaces — when the killed one disappears from the incoming list,
- * we pick the first remaining workspace, or null. */
-async function killWorkspace(hostId: string, workspace: TmuxWorkspace): Promise<void> {
-  // Coalesce by `${hostId}::${workspace.id}` so re-clicking the same
-  // workspace just resets the timer rather than stacking toasts.
-  const toastId = `kill-workspace::${hostId}::${workspace.id}`
-  const { pushToast } = useStore.getState()
-  pushToast({
-    id: toastId,
-    message: `Killing workspace "${workspace.name}"…`,
-    durationMs: 5_000,
-    deferredAction: () => {
-      void commands.tmuxKillSession(hostId, workspace.id)
-    },
-    action: { label: 'Undo', onClick: () => {} },
-  })
 }
 
 /** Remove a remote host from the registry. Disconnects (if connected),
@@ -679,18 +459,5 @@ function emptyStatePaneText(
   if (bootError) return `error · ${bootError}`
   if (status === 'error' && hostError) return `error · ${hostError}`
   return emptyStateText(hs)
-}
-
-function neighbourWindowId(
-  windowList: { id: string }[],
-  currentId: string | undefined,
-  direction: 1 | -1,
-): string | undefined {
-  if (windowList.length < 2 || !currentId) return undefined
-  const stable = [...windowList].sort((a, b) => a.id.localeCompare(b.id))
-  const idx = stable.findIndex((w) => w.id === currentId)
-  if (idx < 0) return undefined
-  const next = (idx + direction + stable.length) % stable.length
-  return stable[next].id
 }
 

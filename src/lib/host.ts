@@ -16,9 +16,9 @@
 import { Channel } from '@tauri-apps/api/core'
 import { commands } from '@lib/ipc'
 import { useStore, type TmuxWorkspace, type TmuxWindow, type TmuxPane } from '@lib/store'
-import type { HostEvent, HostId } from '@bindings'
+import type { HostEvent, HostId, MarkerAt } from '@bindings'
 
-type OutputListener = (bytes: number[]) => void
+type OutputListener = (bytes: number[], markers: MarkerAt[]) => void
 
 const listeners = new Map<string, Set<OutputListener>>()
 let subscribed = false
@@ -148,7 +148,7 @@ export async function subscribeHostEvents(): Promise<void> {
     const store = useStore.getState()
     switch (n.kind) {
       case 'output':
-        deliverOutput(host_id, n.pane_id, n.bytes)
+        deliverOutput(host_id, n.pane_id, n.bytes, n.markers)
         return
 
       // Window-level changes — we don't know which session a window
@@ -477,10 +477,15 @@ function pickPaneNeedingUpgrade(
 
 // ---------- per-pane output pub/sub ----------
 
-function deliverOutput(hostId: HostId, paneId: string, bytes: number[]) {
+function deliverOutput(
+  hostId: HostId,
+  paneId: string,
+  bytes: number[],
+  markers: MarkerAt[],
+) {
   const subs = listeners.get(subKey(hostId, paneId))
   if (!subs) return
-  for (const fn of subs) fn(bytes)
+  for (const fn of subs) fn(bytes, markers)
 }
 
 /**

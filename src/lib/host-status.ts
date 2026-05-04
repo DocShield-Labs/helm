@@ -14,6 +14,26 @@ import type { Host, HostStatus } from '@bindings'
 
 export type HostDisplayStatus = 'connected' | 'connecting' | 'disconnected' | 'error'
 
+/** Sort order for buckets in the `$hosts` palette sub-mode: connected
+ * first (the user's working set), then in-flight, then ones they need
+ * to wake up. Lower number = earlier. */
+export const STATUS_RANK: Record<HostDisplayStatus, number> = {
+  connected: 0,
+  connecting: 1,
+  disconnected: 2,
+  error: 3,
+}
+
+/** Display label for a status bucket. `OFFLINE` reads better than
+ * `DISCONNECTED` in section headers; everything else is the literal
+ * status uppercased. */
+export const STATUS_LABEL: Record<HostDisplayStatus, string> = {
+  connected: 'CONNECTED',
+  connecting: 'CONNECTING',
+  disconnected: 'OFFLINE',
+  error: 'ERROR',
+}
+
 export function hostRowStatus(
   status: HostStatus,
   detached: string | null,

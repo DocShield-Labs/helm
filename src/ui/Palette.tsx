@@ -1,7 +1,10 @@
 /**
  * Palette — Cmd+K overlay shell.
- * Real fuzzy filtering, sub-modes (@workspaces / #windows / $hosts), and
- * keyboard navigation land in feature/palette.
+ *
+ * Pure presentational: owns the floating sheet, the leading ⌘ glyph,
+ * the optional sub-mode chip, the input, the trailing "esc" affordance,
+ * and the body + footer slots. State (open, query, results, selection,
+ * keyboard nav) lives in `features/palette/PaletteHost.tsx`.
  */
 
 import type { ReactNode } from 'react'
@@ -10,15 +13,35 @@ export interface PaletteProps {
   open: boolean
   query: string
   onQueryChange?: (q: string) => void
+  /** When set, a small chip is rendered between the ⌘ glyph and the input.
+   * Used by sub-modes (`@workspaces`, `#windows`, `$hosts`). */
   chip?: string
+  /** Body — rendered between the header and footer. Scrolls when long. */
   children?: ReactNode
+  /** Optional footer content (the `↑↓ navigate · ↵ run · esc close` row). */
+  footer?: ReactNode
   onClose?: () => void
+  /** Forwarded to the input so the host can intercept ↑↓/↵/Esc/Tab/etc.
+   * at the point where focus lives. */
+  onInputKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void
 }
 
-export function Palette({ open, query, onQueryChange, chip, children, onClose }: PaletteProps) {
+export function Palette({
+  open,
+  query,
+  onQueryChange,
+  chip,
+  children,
+  footer,
+  onClose,
+  onInputKeyDown,
+}: PaletteProps) {
   if (!open) return null
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/45 pt-[18vh]">
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center bg-black/45 pt-[18vh]"
+      onClick={onClose}
+    >
       <div
         role="dialog"
         aria-modal
@@ -40,6 +63,7 @@ export function Palette({ open, query, onQueryChange, chip, children, onClose }:
             autoFocus
             value={query}
             onChange={(e) => onQueryChange?.(e.target.value)}
+            onKeyDown={onInputKeyDown}
             placeholder="Type a command…"
             className="flex-1 bg-transparent text-[16px] text-text-primary placeholder:text-text-disabled focus:outline-none"
           />
@@ -53,6 +77,7 @@ export function Palette({ open, query, onQueryChange, chip, children, onClose }:
         </div>
         <div className="border-t border-white/[0.06]" />
         <div className="max-h-[60vh] overflow-y-auto p-2">{children}</div>
+        {footer}
       </div>
     </div>
   )

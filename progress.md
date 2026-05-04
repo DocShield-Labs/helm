@@ -22,7 +22,7 @@ nothing internal-ships until phase 2.
 | 4     | Inbox notifications + shell integ.   | **done**     |
 | 4G    | Multi-control-client tmux refactor   | **done**     |
 | 4H    | Tool integration framework           | **done**     |
-| 4F    | Warp-style blocks UI from OSC 133    | later        |
+| 4F    | Warp-style blocks UI from OSC 133    | **done**     |
 | 5     | Performance + IPC optimisation       | later        |
 
 ---
@@ -1395,24 +1395,203 @@ integrations (pgcli, mosh, anything) drop in as a single trait impl.
 
 ---
 
-## Phase 4F — Warp-style blocks UI · later
+## Phase 4F — Warp-style blocks UI · **done**
 
-Layer command-block decorations on top of the OSC 133 markers we're
-already capturing in phase 4. Each `B → D` span is a block; we can
-render block boundaries / collapse / re-run / search without changing
-how xterm itself renders.
+Each OSC 133 `A → D` span renders as a Warp-style block inside xterm.
+Native typing into the shell is preserved — this layer is purely
+chrome:
+- 2px left border (red = failed, blue = running, accent on hover/select)
+  drawn as React rectangles in the host's left-padding gutter, so
+  glyphs can never occlude them
+- shell-printed `cwd · branch` header line on the row above the prompt
+- inline status chip on the header row (`· 14.3s` accent-blue while
+  running; `· exit 1 · 0.4s` red on failure; `· 0.4s` dim on success)
+- subtle row tint on hover, hover-revealed action card (cmd / output /
+  re-run / jump-to)
+- pinned `StickyRunHeader` when a running block scrolls off the top
+- custom React scrollbar at z-30 (xterm's native scrollbar hidden) that
+  selections can't visually occlude
+- a smooth-scroll wheel handler that converts trackpad pixel-mode
+  deltas to fractional rows for a native macOS feel
 
-### Outstanding work
+### Done
 
-- [ ] Per-pane span tracker — record buffer offsets at each
-      OSC 133 marker against xterm's serialized buffer
-- [ ] Marginal block boundary decorations in xterm (xterm.js
-      `registerDecoration`) with hover affordances
-- [ ] Collapsible blocks (folded view shows command + status only)
-- [ ] Per-block actions: copy command, copy output, re-run, share
-- [ ] Filter / search across blocks in the active pane
-- [ ] Plumb `cmdline=…` through the integration scripts so `command`
-      on `CommandDone` is non-empty (currently empty until 4F)
+**OSC 133 protocol extension (Rust + integration scripts).**
+- `OutputMarker` extended with base64 params on `A` (`cwd_b64`,
+  `branch_b64`) and `B` (`cmdline_b64`). `try_parse_osc133` parses
+  `key_b64=value` pairs; unknown keys ignored, malformed b64 collapses
+  to `None`. New tests cover ok / unknown-key / malformed-b64.
+- `extract_markers_and_strip` returns `Vec<MarkerAt>`. Each
+  `MarkerAt { marker, offset }` carries the byte offset in the cleaned
+  buffer where the marker sat — without it, two markers in one chunk
+  would both pin to the chunk's end cursor on the frontend and block
+  boundaries would land on the wrong line.
+- All three integration scripts (`zsh.zshrc`, `bash.sh`, `fish.fish`)
+  base64-encode `$PWD`, `git symbolic-ref --short HEAD`, and the
+  preexec command line; emit them on the matching marker. The script
+  also wraps each command's output with `\x1b[38;5;245m` … `\x1b[0m`
+  so program output reads dim grey while typed commands stay in the
+  terminal's bright default fg (visual contrast of "input vs output"
+  without intercepting bytes). Print an extra `\n` after the `A`
+  marker so the marker's row is blank — this becomes the block's top
+  padding and gives a single visual gap between consecutive blocks.
+
+**`HELM_USER_ZDOTDIR` recursion fix.** `connection.rs` was reading
+`ZDOTDIR` from helm's process env to build tmux's server-global
+`HELM_USER_ZDOTDIR`. But `lib.rs` had already mutated `ZDOTDIR` at
+boot to point at our integration wrapper, so connection.rs was
+propagating the *wrapper path* — new shells would set `ZDOTDIR` back
+to that path and `source $ZDOTDIR/.zshrc` would recursively source
+our wrapper ("job table full or recursion limit exceeded"). Fix: read
+`HELM_USER_ZDOTDIR` (already correctly populated by lib.rs from the
+*original* ZDOTDIR) instead of re-reading ZDOTDIR. The remote/SSH
+path was already correct since it captures `${ZDOTDIR:-$HOME}`
+*before* setting `ZDOTDIR=…/integration/zsh`.
+
+**`MarkerAt` wire format.** New domain struct on
+`TmuxNotification::Output`. `host.ts` widens `OutputListener` to
+`(bytes, markers) => void` and forwards `n.markers` per-pane.
+
+**`notifications.rs`.** `process_output` adapted to `&[MarkerAt]`.
+The pane's `PaneRuntime` now stashes `command_text` from
+`CommandStart` so the resulting `CommandDone` notification carries
+the actual command (was always-empty before).
+
+**`BlockTracker` (`src/features/shell/blockTracker.ts`).**
+- One per-pane instance owns the `term.write` path. Slices each
+  output chunk at marker offsets, calls `term.write(slice, callback)`
+  per slice, samples cursor row in the callback. Each block holds an
+  `IMarker` (line anchor that follows scrollback eviction) for start
+  row + null-until-D for end row.
+- Block boundary anchors to `A` (PromptStart), not `B` (CommandStart)
+  — the cwd · branch header line, the prompt, the typed command, and
+  the output all sit *inside* the block's row range. Status flow:
+  `pending` (A fired) → `running` (B fired with cmdline) →
+  `ok` / `failed` / `unknown` (D fired).
+- D-marker offset compensation: when the cursor is on a blank row
+  (typical case after a command's trailing `\n`), register the
+  end-marker at `-1` so the block ends on the last *content* row.
+  Without this, the trailing blank would land in *both* the prev
+  block's range and the next block's top-pad, double-tinting one
+  shared row between failed blocks.
+- Exposes `clipBlockToViewport(startLine, endLine, term)` helper used
+  by both the overlay's render path and the hover-detection logic
+  in `TmuxPane`, so they agree on which blocks are interactive at
+  any given scroll position.
+
+**`BlockOverlay.tsx`.** React chrome anchored to row positions:
+- Subtle bg tint on hover/selected/failed.
+- Coloured 2px left border in the host's left-padding gutter (so
+  glyphs never occlude it). Width grows to 3px when selected.
+- Inline status chip on the header row, positioned by measuring xterm
+  cell width × header text length so it lands immediately after the
+  shell-printed `cwd · branch`.
+- Hover-revealed action card (`cmd`, `output`, `↻`, `↑`) at the right
+  edge with `pointer-events: auto` only on the chip itself; the rest
+  of the overlay is `pointer-events: none` so the scrollbar stays
+  grabbable and text selection still works in xterm underneath.
+- Renders the visible *intersection* of the block's range and the
+  current viewport — partially-scrolled blocks keep their border and
+  tint visible for the on-screen rows.
+
+**`StickyRunHeader.tsx`.** Pinned 24px bar at the top of the pane
+when a running block has scrolled out of view. `● <command> · <NNs>`
+with a 1Hz tick. Click jumps via `term.scrollLines(delta)`.
+
+**`TerminalScrollbar.tsx`.** Custom React scrollbar at z-30 that's
+never occluded by selection rectangles or full-width TUI output.
+Reads `term.buffer.active.viewportY / .length` for thumb position;
+ticks on `onScroll` + `onRender`. Mouse drag → `term.scrollLines`,
+track click → page-scroll, hidden when scrollback hasn't filled.
+xterm's native scrollbar is set to `width: 0` in `index.css` so the
+two don't fight for the gutter.
+
+**Smooth-scroll wheel handler.** Custom listener on the xterm host in
+capture phase (so xterm's built-in line-stepped wheel handler never
+fires). Pixel-mode trackpad deltas convert to row fractions via the
+measured cell height; integer crossings call `term.scrollLines`,
+fractions persist between events. Line-mode mouse-wheel deltas pass
+through directly. Cmd/Ctrl+wheel left alone for browser zoom.
+
+**Theme + CSS.** xterm cursor + selection moved off the legacy coral
+to the accent blue (`#7AA2F7`). xterm's native scrollbar hidden via
+`.xterm-viewport::-webkit-scrollbar { width: 0 }` in `index.css`.
+
+**Magic links.** `WebLinksAddon` loaded in `lib/terminal/index.ts`.
+Consumer passes an `onLinkClick` to route through Tauri's shell-open.
+File + ticket-ID matchers deferred.
+
+**Keymap.** `lib/keymap.ts` adds Cmd+Up/Down (select), Cmd+C (copy
+output), Cmd+Shift+C (copy command), Cmd+R (re-run, gated on
+atPrompt). Live dispatch in `TmuxPane`'s keydown listener; gated on
+`document.activeElement` not being a contenteditable / input /
+textarea so macOS text-editing chords stay native everywhere else.
+
+**Shared format helper.** `src/lib/format.ts` exports
+`formatDuration(ms)` — one-decimal under a minute, integer
+units above. Used by both BlockOverlay and StickyRunHeader.
+
+### Sharp edges (revisit later)
+
+- **Capture-pane on first mount has no markers.** `tmux capture-pane`
+  returns rendered cells; OSC 133 was already stripped by the parser
+  before xterm ever saw the bytes. Blocks only appear from the first
+  live `%output` after subscribe — anything that ran before the pane
+  attached has no chrome. Acceptable for v1 (typical case is a fresh
+  window). Future work: persist a block log Rust-side and rehydrate
+  by content-matching command lines in the captured buffer.
+- **bash + fish still need a manual rc edit** to source the
+  integration script. Same setup-needed-toast plan as phase 4.
+- **Same-row D/A overlap on commands without trailing `\n`.** Rare
+  (`printf 'x'`, etc.); the row has visible content so the
+  double-tint is invisible.
+- **No tab completion forwarding to xterm via React.** Native shell
+  typing means tab completion just works — this is no longer a
+  concern now that the React BottomInput is gone.
+
+### Lessons learned
+
+- **Per-marker byte offsets > snapshotting at chunk end.** First pass
+  sampled `cursorY` after the whole chunk wrote. Two markers in one
+  chunk (`D` from prev + `A` for next) pinned to the same row → the
+  next block started one row too low. Fix: serialize offsets in Rust,
+  slice writes in JS, sample after each slice's parse callback. xterm
+  `term.write(data, cb)` is synchronous-after-parse, which is exactly
+  what we need.
+- **Render block headers as terminal output, not React.** Tempting to
+  draw `cwd · main` as a floating React div, but xterm's grid is
+  fixed-height — any phantom row would either obscure output or
+  require pushing rows around. The integration script printing one
+  ANSI line via `print -P` / `printf` and letting xterm render it
+  like any other output is the path. React only handles affordances
+  (chips, borders, sticky header) where overlap is fine.
+- **`pointer-events: none` on a parent doesn't inherit to children.**
+  CSS default for `pointer-events` is `auto` per element, not
+  inherited. So a parent overlay with `pointer-events: none` plus a
+  child without an explicit value still has the child catching
+  events. Set `pointer-events: none` explicitly on every block div
+  inside `BlockOverlay` — otherwise the scrollbar stops being
+  grabbable, even though the overlay's outer container claims
+  pointer-events: none.
+- **Custom scrollbar > styling xterm's native one.** xterm's
+  `.xterm-viewport` sits *under* `.xterm-screen` in DOM order, so
+  selection rectangles drawn on the screen layer always cover the
+  scrollbar visually. Z-index hacks break click-to-select. Cleanest
+  fix: hide xterm's native scrollbar entirely, render our own React
+  scrollbar at z-30 that lives outside the screen layer.
+- **Custom wheel handler vs `smoothScrollDuration`.** Just bumping
+  xterm's `scrollSensitivity` and animating with `smoothScrollDuration`
+  feels nicer than line-snap, but on a high-DPI macOS trackpad the
+  result still steps. The trick: capture `WheelEvent` ourselves, read
+  `deltaMode` (pixel/line/page), divide pixel deltas by the measured
+  cell height, accumulate fractional rows across events, and only
+  call `scrollLines(int)` on integer crossings. Trackpad inertia
+  produces real native-feeling motion this way.
+- **`HELM_USER_ZDOTDIR` must be read, not derived.** Subtle bug: any
+  code path that re-derives "the user's original ZDOTDIR" by reading
+  `std::env::var("ZDOTDIR")` in Rust *after* `lib.rs` has mutated it
+  ends up propagating the wrapper path. Always read
+  `HELM_USER_ZDOTDIR` (the snapshot lib.rs took *before* mutating).
 
 ---
 

@@ -1693,6 +1693,7 @@ dependencies = [
 name = "helm-tmux"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "helm-domain",
  "parking_lot",

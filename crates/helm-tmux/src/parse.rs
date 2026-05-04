@@ -8,7 +8,9 @@
 //! - `%output %P data` is per-pane output. Backslash and bytes < 040 are
 //!   octal-escaped (`\xxx`), so we decode before yielding the bytes.
 
-pub use helm_domain::{OutputMarker, TmuxNotification as Notification};
+pub use helm_domain::{MarkerAt, OutputMarker, TmuxNotification as Notification};
+
+use base64::Engine as _;
 
 /// A single parsed line. Streams of these are folded into events by the
 /// state machine in `client.rs`.
@@ -212,7 +214,8 @@ pub fn parse_output_bytes(rest: &[u8]) -> Notification {
 }
 
 /// Single-pass scan over decoded pane output. Splits the byte stream into
-/// (cleaned bytes for xterm, ordered list of in-band markers).
+/// (cleaned bytes for xterm, ordered list of in-band markers paired with
+/// their byte offsets in the cleaned buffer).
 ///
 /// Markers handled:
 ///   - Standalone `0x07` (BEL) → `Bell`. Stripped so xterm doesn't beep.
@@ -234,7 +237,12 @@ pub fn parse_output_bytes(rest: &[u8]) -> Notification {
 /// Order is preserved: a Bell that arrives between a CommandStart and a
 /// CommandDone shows up between them in the returned vec, which lets the
 /// helm-app forwarder reason about overlapping events deterministically.
-pub fn extract_markers_and_strip(bytes: Vec<u8>) -> (Vec<u8>, Vec<OutputMarker>) {
+///
+/// Each marker carries its byte offset into the *cleaned* buffer so the
+/// frontend can correlate markers to xterm rows precisely (sample the
+/// cursor after writing bytes up to that offset). Without offsets, two
+/// markers in one chunk would both pin to the end of the chunk.
+pub fn extract_markers_and_strip(bytes: Vec<u8>) -> (Vec<u8>, Vec<MarkerAt>) {
     // Fast path: no escape sequences and no BEL means nothing to do.
     // Worth the scan because most output chunks are plain text.
     if !bytes.contains(&0x1b) && !bytes.contains(&0x07) {
@@ -271,7 +279,10 @@ pub fn extract_markers_and_strip(bytes: Vec<u8>) -> (Vec<u8>, Vec<OutputMarker>)
             if matches!(intro, b']' | b'P' | b'X' | b'^' | b'_') {
                 if intro == b']' {
                     if let Some((marker, end)) = try_parse_osc133(&bytes, i) {
-                        markers.push(marker);
+                        markers.push(MarkerAt {
+                            marker,
+                            offset: out.len() as u32,
+                        });
                         i = end;
                         continue;
                     }
@@ -295,7 +306,10 @@ pub fn extract_markers_and_strip(bytes: Vec<u8>) -> (Vec<u8>, Vec<OutputMarker>)
         // BEL — by elimination, this BEL is *not* part of any OSC/DCS/etc.
         // envelope, so it's a standalone application bell.
         if b == 0x07 {
-            markers.push(OutputMarker::Bell);
+            markers.push(MarkerAt {
+                marker: OutputMarker::Bell,
+                offset: out.len() as u32,
+            });
             i += 1;
             continue;
         }
@@ -329,6 +343,15 @@ fn find_st(bytes: &[u8], start: usize) -> Option<usize> {
 /// Returns the extracted marker plus the index *after* the terminator.
 /// Returns None if the prefix doesn't match `ESC ] 1 3 3 ;` or if no
 /// terminator is found in the remaining bytes.
+///
+/// Body grammar:
+///   `<kind>` | `<kind>;<param>` | `<kind>;<key>=<value>[;<key>=<value>]*`
+///
+/// Helm extends standard OSC 133 with base64 params on `A` and `B`:
+///   - `A;cwd_b64=<b64>;branch_b64=<b64>` — emitted in precmd
+///   - `B;cmdline_b64=<b64>` — emitted in preexec
+/// Decoding failures fall through to `None` for that field; the marker
+/// is still emitted with whichever fields parsed.
 fn try_parse_osc133(bytes: &[u8], i: usize) -> Option<(OutputMarker, usize)> {
     // Need at least: ESC ] 1 3 3 ; X (BEL) — 8 bytes minimum.
     if i + 7 > bytes.len() {
@@ -345,12 +368,21 @@ fn try_parse_osc133(bytes: &[u8], i: usize) -> Option<(OutputMarker, usize)> {
     let term_len = if bytes[end - 1] == 0x07 { 1 } else { 2 };
     let body = &bytes[body_start..end - term_len];
 
-    // body is `<kind>` or `<kind>;<params...>`. We only look at the first
-    // char as the kind, and parse params if present.
     let kind = body.first().copied()?;
     let marker = match kind {
-        b'A' => OutputMarker::PromptStart,
-        b'B' => OutputMarker::CommandStart,
+        b'A' => {
+            let params = parse_osc133_params(body);
+            OutputMarker::PromptStart {
+                cwd: decode_b64_param(&params, "cwd_b64"),
+                branch: decode_b64_param(&params, "branch_b64"),
+            }
+        }
+        b'B' => {
+            let params = parse_osc133_params(body);
+            OutputMarker::CommandStart {
+                command: decode_b64_param(&params, "cmdline_b64"),
+            }
+        }
         b'C' => OutputMarker::OutputStart,
         b'D' => {
             // `D` may be bare or `D;<exit_code>[;...]`. Extract the first
@@ -369,6 +401,39 @@ fn try_parse_osc133(bytes: &[u8], i: usize) -> Option<(OutputMarker, usize)> {
         _ => return None,
     };
     Some((marker, end))
+}
+
+/// Parse the body of an OSC 133 sequence past the leading kind char into
+/// a list of `(key, value)` pairs. Handles `<kind>` (no params), bare
+/// positional values (treated as keyless — caller can ignore), and
+/// `key=value` pairs separated by `;`.
+fn parse_osc133_params(body: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut out = Vec::new();
+    if body.len() < 2 || body[1] != b';' {
+        return out;
+    }
+    for chunk in body[2..].split(|&c| c == b';') {
+        if let Some(eq_pos) = chunk.iter().position(|&c| c == b'=') {
+            out.push((&chunk[..eq_pos], &chunk[eq_pos + 1..]));
+        }
+    }
+    out
+}
+
+fn decode_b64_param(params: &[(&[u8], &[u8])], key: &str) -> Option<String> {
+    let raw = params
+        .iter()
+        .find_map(|(k, v)| (*k == key.as_bytes()).then_some(*v))?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+    String::from_utf8(decoded).ok().and_then(|s| {
+        // Empty strings round-trip as Some("") which is rarely useful;
+        // collapse to None so consumers don't have to special-case.
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    })
 }
 
 /// Decode tmux's control-mode escaping:
@@ -571,6 +636,10 @@ mod tests {
         assert_eq!(bytes, b"plain\r\ntext");
     }
 
+    fn just_markers(markers: Vec<MarkerAt>) -> Vec<OutputMarker> {
+        markers.into_iter().map(|m| m.marker).collect()
+    }
+
     #[test]
     fn output_extracts_bell_and_strips_it() {
         // Plain BEL embedded in output. xterm should never see the 0x07.
@@ -581,7 +650,10 @@ mod tests {
             panic!("expected Output");
         };
         assert_eq!(bytes, b"done\r\n");
-        assert_eq!(markers, vec![OutputMarker::Bell]);
+        // Bell sits at offset 4 ("done" already written, then BEL stripped).
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].marker, OutputMarker::Bell);
+        assert_eq!(markers[0].offset, 4);
     }
 
     #[test]
@@ -595,9 +667,19 @@ mod tests {
         };
         assert_eq!(bytes, b"$ ls -la");
         assert_eq!(
-            markers,
-            vec![OutputMarker::PromptStart, OutputMarker::CommandStart]
+            just_markers(markers.clone()),
+            vec![
+                OutputMarker::PromptStart {
+                    cwd: None,
+                    branch: None
+                },
+                OutputMarker::CommandStart { command: None },
+            ]
         );
+        // PromptStart at offset 0 (nothing written yet),
+        // CommandStart at offset 2 ("$ " written, before "ls -la").
+        assert_eq!(markers[0].offset, 0);
+        assert_eq!(markers[1].offset, 2);
     }
 
     #[test]
@@ -611,7 +693,7 @@ mod tests {
         };
         assert_eq!(bytes, b"output\r\n");
         assert_eq!(
-            markers,
+            just_markers(markers),
             vec![
                 OutputMarker::OutputStart,
                 OutputMarker::CommandDone { exit_code: Some(0) },
@@ -629,7 +711,7 @@ mod tests {
         };
         assert!(bytes.is_empty());
         assert_eq!(
-            markers,
+            just_markers(markers),
             vec![OutputMarker::CommandDone { exit_code: Some(127) }]
         );
     }
@@ -646,7 +728,7 @@ mod tests {
         };
         assert!(bytes.is_empty());
         assert_eq!(
-            markers,
+            just_markers(markers),
             vec![OutputMarker::CommandDone { exit_code: None }]
         );
     }
@@ -662,7 +744,107 @@ mod tests {
             panic!("expected Output");
         };
         assert_eq!(bytes, b"prompt$ ");
-        assert_eq!(markers, vec![OutputMarker::PromptStart]);
+        assert_eq!(
+            just_markers(markers),
+            vec![OutputMarker::PromptStart {
+                cwd: None,
+                branch: None
+            }]
+        );
+    }
+
+    #[test]
+    fn output_extracts_osc133_prompt_start_with_cwd_and_branch() {
+        // OSC 133;A;cwd_b64=fi9jb2RlL2JlbnRv;branch_b64=bWFpbg==
+        // cwd_b64 decodes to "/code/bento", branch_b64 decodes to "main".
+        let cwd = base64::engine::general_purpose::STANDARD.encode("/code/bento");
+        let branch = base64::engine::general_purpose::STANDARD.encode("main");
+        let body = format!("\\033]133;A;cwd_b64={};branch_b64={}\\007", cwd, branch);
+        let line = format!("%output %1 {}", body);
+        let TmuxLine::Notification(Notification::Output { markers, .. }) = parse_line(&line)
+        else {
+            panic!("expected Output");
+        };
+        assert_eq!(
+            just_markers(markers),
+            vec![OutputMarker::PromptStart {
+                cwd: Some("/code/bento".into()),
+                branch: Some("main".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn output_extracts_osc133_command_start_with_cmdline() {
+        // cmdline_b64 of "git status" → "Z2l0IHN0YXR1cw=="
+        let cmdline = base64::engine::general_purpose::STANDARD.encode("git status");
+        let body = format!("\\033]133;B;cmdline_b64={}\\007", cmdline);
+        let line = format!("%output %1 {}", body);
+        let TmuxLine::Notification(Notification::Output { markers, .. }) = parse_line(&line)
+        else {
+            panic!("expected Output");
+        };
+        assert_eq!(
+            just_markers(markers),
+            vec![OutputMarker::CommandStart {
+                command: Some("git status".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn output_osc133_params_with_unknown_keys_dont_crash() {
+        // Unknown key should be ignored; cwd_b64 still extracted.
+        let cwd = base64::engine::general_purpose::STANDARD.encode("/x");
+        let body = format!("\\033]133;A;junk=foo;cwd_b64={};other=bar\\007", cwd);
+        let line = format!("%output %1 {}", body);
+        let TmuxLine::Notification(Notification::Output { markers, .. }) = parse_line(&line)
+        else {
+            panic!("expected Output");
+        };
+        assert_eq!(
+            just_markers(markers),
+            vec![OutputMarker::PromptStart {
+                cwd: Some("/x".into()),
+                branch: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn output_osc133_malformed_b64_falls_back_to_none() {
+        let body = "\\033]133;A;cwd_b64=!!!notbase64!!!\\007";
+        let line = format!("%output %1 {}", body);
+        let TmuxLine::Notification(Notification::Output { markers, .. }) = parse_line(&line)
+        else {
+            panic!("expected Output");
+        };
+        assert_eq!(
+            just_markers(markers),
+            vec![OutputMarker::PromptStart {
+                cwd: None,
+                branch: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn output_marker_offsets_match_intermixed_chunks() {
+        // Two markers separated by output bytes; offsets should reflect
+        // the position in the cleaned buffer where each marker sat.
+        // Sequence: ESC]133;A BEL "hi" ESC]133;B BEL "ls"
+        let line = "%output %1 \\033]133;A\\007hi\\033]133;B\\007ls";
+        let TmuxLine::Notification(Notification::Output { bytes, markers, .. }) =
+            parse_line(line)
+        else {
+            panic!("expected Output");
+        };
+        assert_eq!(bytes, b"hils");
+        assert_eq!(markers.len(), 2);
+        // PromptStart at offset 0 — nothing in cleaned buffer yet.
+        assert_eq!(markers[0].offset, 0);
+        // CommandStart at offset 2 — "hi" was written before the B marker.
+        assert_eq!(markers[1].offset, 2);
     }
 
     #[test]

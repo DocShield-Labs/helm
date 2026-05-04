@@ -21,6 +21,7 @@ import {
 } from '@lib/store'
 import { connectHost, selectWorkspace } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
+import { killWindow } from '@lib/actions/window'
 import type { Host, HostId } from '@bindings'
 import { StatusDot } from './StatusDot'
 import { SidebarHostRow } from './SidebarHostRow'
@@ -268,7 +269,7 @@ function ExpandedSidebar({
                                     void commands.tmuxRenameWindow(h.id, win.id, newName)
                                   }
                                 }}
-                                onKill={() => void commands.tmuxKillWindow(h.id, win.id)}
+                                onKill={() => killWindow(h.id, w.id, win)}
                               />
                             )
                           })

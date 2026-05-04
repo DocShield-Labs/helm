@@ -134,7 +134,17 @@ pub(crate) async fn do_connect(
                 if let (Some(home), Some(ref pc)) =
                     (dirs::home_dir(), primary_client.as_ref())
                 {
-                    let user_zdotdir = std::env::var("ZDOTDIR")
+                    // Read HELM_USER_ZDOTDIR (the user's ORIGINAL ZDOTDIR
+                    // captured at boot in `lib.rs`) — NOT $ZDOTDIR. The
+                    // latter has already been clobbered by lib.rs to
+                    // point at our integration wrapper, so re-reading it
+                    // here would propagate the wrapper path into tmux's
+                    // server-global HELM_USER_ZDOTDIR. New shells would
+                    // then set ZDOTDIR back to the wrapper path and
+                    // `source $ZDOTDIR/.zshrc` would recursively source
+                    // our wrapper itself ("job table full or recursion
+                    // limit exceeded").
+                    let user_zdotdir = std::env::var("HELM_USER_ZDOTDIR")
                         .unwrap_or_else(|_| home.to_string_lossy().into_owned());
                     if let Err(e) =
                         integration::configure_tmux_env(pc, &home, &user_zdotdir).await

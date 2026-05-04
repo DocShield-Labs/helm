@@ -217,6 +217,11 @@ pub struct PaneRuntime {
     /// the last CommandDone — happens for the very first prompt and for
     /// shells without integration installed.
     pub command_started_at: Option<u64>,
+    /// Command line captured from the most recent CommandStart marker
+    /// (`OSC 133;B;cmdline_b64=…`). Cleared on CommandDone. Empty when
+    /// the integration script didn't ship the cmdline param (older
+    /// installs or `HELM_KEEP_PROMPT=1`).
+    pub command_text: String,
     /// Best-known window id for this pane, refreshed by the periodic
     /// pane-index sweep (see `notifications::refresh_pane_index`). Empty
     /// while we're still bootstrapping or if the lookup hasn't run yet —

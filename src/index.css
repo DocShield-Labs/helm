@@ -54,3 +54,19 @@ button:not(:disabled),
 [role='button']:not([aria-disabled='true']) {
   cursor: pointer;
 }
+
+/*
+ * Hide xterm's native scrollbar entirely. We render our own React
+ * scrollbar (`TerminalScrollbar`) that lives outside xterm's screen
+ * layer and isn't visually overlapped by selections or block chrome.
+ * Keep `width: 0` so xterm-viewport's overflow:scroll still functions
+ * (xterm relies on the scrollable element internally) — just no
+ * visible affordance.
+ */
+.xterm-viewport::-webkit-scrollbar {
+  width: 0;
+  background: transparent;
+}
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: transparent;
+}
