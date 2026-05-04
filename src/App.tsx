@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { commands } from '@lib/ipc'
 import {
   sortById,
@@ -224,6 +225,60 @@ export function App() {
     }
   }, [activeHostId, activeWindow])
 
+  // ---------- file drag-and-drop → active pane ----------
+  // Tauri's WebView swallows native HTML5 drop events and re-emits them
+  // as `tauri://drag-drop` carrying real filesystem paths. Type each
+  // dropped path into the active pane via the same `tmux_send_keys`
+  // path as a keystroke, with iTerm2-style backslash escaping so a
+  // shell or a TUI like Claude Code both receive it as if typed.
+  //
+  // The focus check skips xterm's hidden helper textarea, which is the
+  // active element whenever the terminal has focus — exactly when we
+  // want a drop to land. Real text inputs (host editor, palette) still
+  // suppress the drop so it doesn't silently type into a hidden pane.
+  useEffect(() => {
+    if (!activeHostId || !activePane) return
+    const hostId = activeHostId
+    const paneId = activePane.id
+
+    let unlisten: (() => void) | undefined
+    let cancelled = false
+    void (async () => {
+      const fn = await getCurrentWebview().onDragDropEvent((event) => {
+        if (event.payload.type !== 'drop') return
+        const active = document.activeElement as HTMLElement | null
+        if (
+          active &&
+          !active.classList.contains('xterm-helper-textarea') &&
+          (active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            active.isContentEditable)
+        ) {
+          return
+        }
+        const paths = event.payload.paths
+        if (!paths || paths.length === 0) return
+        const text = paths.map(escapeShellPath).join(' ') + ' '
+        const bytes = Array.from(new TextEncoder().encode(text))
+        void commands.tmuxSendKeys(hostId, paneId, bytes).then((res) => {
+          if (res.status !== 'ok') {
+            console.warn('drag-drop tmux_send_keys failed:', res.error)
+          }
+        })
+      })
+      if (cancelled) {
+        fn()
+      } else {
+        unlisten = fn
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [activeHostId, activePane])
+
   // ---------- latency probe ----------
   // Time a cheap tmux command (list-sessions with the smallest possible
   // format) to gauge round-trip on the active host. Only run for remote
@@ -433,6 +488,15 @@ function formatLatency(ms: number | undefined): string {
   if (ms < 1) return '<1ms'
   if (ms < 1000) return `${Math.round(ms)}ms`
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+/** Backslash-escape characters in a filesystem path that would otherwise
+ * be interpreted by a POSIX shell — spaces, quotes, parens, glob metas,
+ * etc. Mirrors iTerm2's default drag-drop escaping. Non-shell receivers
+ * (Claude Code, REPLs) still parse this fine because they normalize
+ * backslash escapes when extracting paths from typed input. */
+function escapeShellPath(p: string): string {
+  return p.replace(/([ '"\\$`!*?(){}[\]<>;&|#~])/g, '\\$1')
 }
 
 /** Replace a `/Users/<user>` or `/home/<user>` prefix with `~`. We can't
