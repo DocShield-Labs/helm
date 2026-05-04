@@ -38,30 +38,25 @@ pub async fn tool_integrations_list(
     let entry = state
         .entry(host_id)
         .ok_or_else(|| "unknown host".to_string())?;
-    let (host, primary) = {
+    let (host, primary, ssh) = {
         let g = entry.lock().await;
-        (g.host.clone(), g.primary_client())
+        (g.host.clone(), g.primary_client(), g.ssh.clone())
     };
     let primary = primary.ok_or_else(|| "host not connected".to_string())?;
 
     let mut out = Vec::new();
     for integration in crate::tool_integrations::registry() {
-        let supported = host.port == 0; // v1: local-only
-        let installed = if supported {
-            integration
-                .is_installed(&host, &primary)
-                .await
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        let installed = integration
+            .is_installed(&host, &primary, ssh.as_ref())
+            .await
+            .unwrap_or(false);
         out.push(ToolIntegrationStatus {
             id: integration.id().to_string(),
             name: integration.name().to_string(),
             description: integration.description().to_string(),
             post_install_note: integration.post_install_note().to_string(),
             installed,
-            supported,
+            supported: true,
         });
     }
     Ok(out)
@@ -79,14 +74,14 @@ pub async fn tool_integration_install(
     let entry = state
         .entry(host_id)
         .ok_or_else(|| "unknown host".to_string())?;
-    let (host, primary) = {
+    let (host, primary, ssh) = {
         let g = entry.lock().await;
-        (g.host.clone(), g.primary_client())
+        (g.host.clone(), g.primary_client(), g.ssh.clone())
     };
     let primary = primary.ok_or_else(|| "host not connected".to_string())?;
     let integration = crate::tool_integrations::find(&integration_id)
         .ok_or_else(|| format!("unknown integration: {integration_id}"))?;
-    integration.install(&host, &primary).await?;
+    integration.install(&host, &primary, ssh.as_ref()).await?;
     // Mark as seen so we don't re-prompt mid-session for the same
     // tool — install satisfies the "we've nagged the user" contract.
     state
@@ -106,14 +101,14 @@ pub async fn tool_integration_uninstall(
     let entry = state
         .entry(host_id)
         .ok_or_else(|| "unknown host".to_string())?;
-    let (host, primary) = {
+    let (host, primary, ssh) = {
         let g = entry.lock().await;
-        (g.host.clone(), g.primary_client())
+        (g.host.clone(), g.primary_client(), g.ssh.clone())
     };
     let primary = primary.ok_or_else(|| "host not connected".to_string())?;
     let integration = crate::tool_integrations::find(&integration_id)
         .ok_or_else(|| format!("unknown integration: {integration_id}"))?;
-    integration.uninstall(&host, &primary).await
+    integration.uninstall(&host, &primary, ssh.as_ref()).await
 }
 
 /// Suppress further suggestion toasts for `(host_id, integration_id)`

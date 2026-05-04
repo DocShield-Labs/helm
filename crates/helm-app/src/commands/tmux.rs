@@ -49,15 +49,16 @@ pub async fn tmux_send_keys(
                 let event_tx = state.event_tx.lock().await.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(400)).await;
-                    let (client, host) = {
+                    let (client, ssh, host) = {
                         let g = entry.lock().await;
-                        (g.primary_client(), g.host.clone())
+                        (g.primary_client(), g.ssh.clone(), g.host.clone())
                     };
                     if let Some(client) = client {
                         crate::tool_integrations::detect_and_suggest(
                             &notif_ctx.tool_integration_seen,
                             &event_tx,
                             &client,
+                            ssh.as_ref(),
                             &host,
                             host_id,
                         )

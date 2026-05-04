@@ -77,6 +77,7 @@ pub(crate) async fn do_connect(
     match connect_host_multi(host.clone(), Some(prompter.clone())).await {
         Ok(connected) => {
             let ssh = connected.ssh.clone();
+            let ssh_for_detect = ssh.clone();
             let primary_id = connected.primary_session_id.clone();
 
             // Channel for per-client forwarders to signal back to the
@@ -160,6 +161,7 @@ pub(crate) async fn do_connect(
                     &notif_ctx.tool_integration_seen,
                     &event_tx,
                     pc,
+                    ssh_for_detect.as_ref(),
                     &host,
                     host_id,
                 )
@@ -310,9 +312,9 @@ async fn client_forwarder_loop(
             let tx = event_tx.clone();
             let entry = entry.clone();
             tokio::spawn(async move {
-                let (client, host) = {
+                let (client, ssh, host) = {
                     let g = entry.lock().await;
-                    (g.primary_client(), g.host.clone())
+                    (g.primary_client(), g.ssh.clone(), g.host.clone())
                 };
                 if let Some(client) = client {
                     let _ = notifications::refresh_pane_index(
@@ -323,6 +325,7 @@ async fn client_forwarder_loop(
                         &ctx.tool_integration_seen,
                         &tx,
                         &client,
+                        ssh.as_ref(),
                         &host,
                         host_id,
                     )
@@ -500,6 +503,7 @@ async fn supervise(
             Ok(connected) => {
                 let primary_id = connected.primary_session_id.clone();
                 let ssh = connected.ssh.clone();
+                let ssh_for_detect = ssh.clone();
 
                 // Replace sup_rx with a fresh one — old forwarders are
                 // gone, new ones get a new sender.
@@ -546,6 +550,7 @@ async fn supervise(
                         &notif_ctx.tool_integration_seen,
                         &event_tx,
                         pc,
+                        ssh_for_detect.as_ref(),
                         &host,
                         host_id,
                     )

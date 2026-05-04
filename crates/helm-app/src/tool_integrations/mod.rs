@@ -42,6 +42,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use helm_domain::{Host, HostEvent, HostId};
+use helm_ssh::SshSession;
 use helm_tmux::TmuxClient;
 
 pub mod claude_code;
@@ -90,13 +91,17 @@ pub trait ToolIntegration: Send + Sync {
     /// for the canonical hook content (deep-equal on the snippet).
     ///
     /// `primary` is the host's primary tmux client, available for
-    /// integrations that need to query remote state via `send_command`.
-    /// Local integrations can ignore it and use `dirs::home_dir()`
-    /// when `host.port == 0`.
+    /// integrations that want to query state through tmux. `ssh` is
+    /// the host's underlying SSH session — `None` for localhost,
+    /// `Some` for remote — used by integrations that need to
+    /// read/write remote files via `SshSession::run_oneshot`.
+    /// Localhost-only integrations ignore both and use
+    /// `dirs::home_dir()` + `std::fs`.
     async fn is_installed(
         &self,
         host: &Host,
         primary: &Arc<TmuxClient>,
+        ssh: Option<&Arc<SshSession>>,
     ) -> Result<bool, String>;
 
     /// Install the integration. Must be idempotent — if already
@@ -107,6 +112,7 @@ pub trait ToolIntegration: Send + Sync {
         &self,
         host: &Host,
         primary: &Arc<TmuxClient>,
+        ssh: Option<&Arc<SshSession>>,
     ) -> Result<(), String>;
 
     /// Remove the integration. The reverse of `install`: drop only the
@@ -116,6 +122,7 @@ pub trait ToolIntegration: Send + Sync {
         &self,
         host: &Host,
         primary: &Arc<TmuxClient>,
+        ssh: Option<&Arc<SshSession>>,
     ) -> Result<(), String>;
 
     /// One-line message to show after a successful install. Usually
@@ -163,27 +170,22 @@ pub fn any_pending(suggested: &Arc<DashMap<(HostId, String), ()>>, host_id: Host
 /// connect, on `%window-added` etc.). Cheap: one `list-panes` call
 /// + one is_installed per never-checked integration.
 pub async fn detect_and_suggest(
-    suggested: &Arc<DashMap<(HostId, String), ()>>,
+    seen: &Arc<DashMap<(HostId, String), ()>>,
     event_tx: &Option<UnboundedSender<HostEvent>>,
     primary: &Arc<TmuxClient>,
+    ssh: Option<&Arc<SshSession>>,
     host: &Host,
     host_id: HostId,
 ) {
     let raw = match primary.list_panes("#{pane_current_command}").await {
         Ok(s) => s,
-        Err(e) => {
-            tracing::debug!("detect_and_suggest list_panes failed: {e}");
-            return;
-        }
+        Err(_) => return,
     };
     let commands: std::collections::HashSet<String> = raw
         .lines()
         .filter(|l| !l.is_empty())
         .map(|s| s.trim().to_string())
         .collect();
-    tracing::debug!(
-        "detect_and_suggest on {host_id:?} sees commands: {commands:?}"
-    );
     if commands.is_empty() {
         return;
     }
@@ -191,8 +193,7 @@ pub async fn detect_and_suggest(
     for integration in registry() {
         let id = integration.id().to_string();
         let key = (host_id, id.clone());
-        if suggested.contains_key(&key) {
-            tracing::debug!("integration {id} already suggested for {host_id:?}");
+        if seen.contains_key(&key) {
             continue;
         }
 
@@ -203,41 +204,22 @@ pub async fn detect_and_suggest(
             .iter()
             .any(|cmd| integration.pane_matches(cmd));
         if !matched {
-            tracing::debug!(
-                "integration {id}: no process match in {commands:?}"
-            );
-            continue;
-        }
-        tracing::debug!("integration {id}: process match!");
-
-        // v1: only local hosts. Remote support is gated on a sync
-        // `SshSession::run_oneshot` helper landing in helm-ssh.
-        // Mark as suggested so we don't keep sweeping for it.
-        if host.port != 0 {
-            tracing::debug!("integration {id}: skipped (remote host, v1 local-only)");
-            suggested.insert(key, ());
             continue;
         }
 
         // Pre-check: don't suggest if already installed. is_installed
-        // for local Claude is a single fs::read; cheap.
-        let already_installed = match integration.is_installed(host, primary).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("integration {id} is_installed failed: {e}");
-                false
-            }
-        };
-        tracing::debug!(
-            "integration {id}: already_installed={already_installed}"
-        );
-        suggested.insert(key.clone(), ());
+        // for local Claude is a single fs::read; for remote it's a
+        // single `cat` over the existing SSH session — both cheap.
+        let already_installed = integration
+            .is_installed(host, primary, ssh)
+            .await
+            .unwrap_or(false);
+        seen.insert(key.clone(), ());
         if already_installed {
             continue;
         }
 
         if let Some(tx) = event_tx {
-            tracing::debug!("integration {id}: emitting ToolIntegrationSuggested event");
             let _ = tx.send(HostEvent::ToolIntegrationSuggested {
                 host_id,
                 integration_id: id,
@@ -245,8 +227,6 @@ pub async fn detect_and_suggest(
                 description: integration.description().to_string(),
                 post_install_note: integration.post_install_note().to_string(),
             });
-        } else {
-            tracing::debug!("integration {id}: no event_tx, can't emit");
         }
     }
 }

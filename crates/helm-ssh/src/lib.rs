@@ -154,10 +154,11 @@ pub enum SshAuth {
 /// teardown signal, so each tmux control client (one per workspace)
 /// shares the same TCP/auth handshake instead of re-doing it N times.
 pub struct SshSession {
-    /// Send a channel-open request to the I/O thread. Each request
-    /// carries the command to exec + a oneshot for the resulting pipe
-    /// halves.
-    request_tx: tokio::sync::mpsc::UnboundedSender<ChannelOpenRequest>,
+    /// Send a session request to the I/O thread. Variants cover the
+    /// long-lived PTY-bound exec channel (used for tmux control
+    /// clients) and the short-lived no-PTY exec used for one-shot
+    /// remote commands (read/write a config file, query env, etc.).
+    request_tx: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
     /// Set once per session. Sending fires the cleanup path on the I/O
     /// thread (russh disconnect, drop all channels, exit the runtime).
     teardown: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
@@ -165,15 +166,23 @@ pub struct SshSession {
     join: parking_lot::Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Request from the caller's thread to the I/O thread to open a new
-/// exec channel. Shape lets the I/O thread report errors back without
-/// the caller blocking on a tokio runtime.
-struct ChannelOpenRequest {
-    command: String,
-    /// Sync channel — caller is on a regular OS thread (helm-app's
-    /// connect path runs inside `spawn_blocking`), so a tokio oneshot
-    /// would force them onto an async context.
-    response: sync_mpsc::SyncSender<Result<OpenedChannel, SshError>>,
+/// Request from the caller's thread to the I/O thread. The I/O thread
+/// dispatches based on variant — `Exec` opens a long-lived PTY channel
+/// for tmux to drive, `OneShot` runs a non-PTY command and captures
+/// its full stdout/stderr/exit_code. Shape lets the I/O thread report
+/// errors back without the caller blocking on a tokio runtime.
+enum SessionRequest {
+    Exec {
+        command: String,
+        /// Sync channel — caller is on a regular OS thread (helm-app's
+        /// connect path runs inside `spawn_blocking`), so a tokio oneshot
+        /// would force them onto an async context.
+        response: sync_mpsc::SyncSender<Result<OpenedChannel, SshError>>,
+    },
+    OneShot {
+        command: String,
+        response: sync_mpsc::SyncSender<Result<OneShotResult, SshError>>,
+    },
 }
 
 /// Result of `SshSession::open_exec` — sync byte streams plus a guard
@@ -185,11 +194,22 @@ pub struct OpenedChannel {
     pub writer: PipeWriter,
 }
 
+/// Result of `SshSession::run_oneshot` — full captured stdout/stderr
+/// and the exit code if the remote sent one (most do; missing only on
+/// transport drop or signal-based termination).
+#[derive(Debug, Clone)]
+pub struct OneShotResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<u32>,
+}
+
 impl SshSession {
-    /// Open a new exec channel on this session. Reuses the existing
-    /// TCP + auth + russh `Handle`; only the per-channel `request_pty`
-    /// + `exec` runs over the wire. Cheap (a couple of round-trips) so
-    /// it's fine to call once per workspace at connect time.
+    /// Open a new long-lived exec channel on this session. Reuses the
+    /// existing TCP + auth + russh `Handle`; only the per-channel
+    /// `request_pty` + `exec` runs over the wire. Cheap (a couple of
+    /// round-trips) so it's fine to call once per workspace at connect
+    /// time.
     ///
     /// Sync-blocking with a 15s timeout. If the I/O thread has died
     /// (transport drop, cleanup in flight), returns
@@ -198,13 +218,32 @@ impl SshSession {
     pub fn open_exec(&self, command: String) -> Result<OpenedChannel, SshError> {
         let (tx, rx) = sync_mpsc::sync_channel(1);
         self.request_tx
-            .send(ChannelOpenRequest {
+            .send(SessionRequest::Exec {
                 command,
                 response: tx,
             })
             .map_err(|_| SshError::Thread("session I/O thread is gone".into()))?;
         rx.recv_timeout(Duration::from_secs(15))
             .map_err(|_| SshError::Channel("open_exec timed out".into()))?
+    }
+
+    /// Run `command` on the remote in a no-PTY exec channel and
+    /// capture its full stdout/stderr + exit code. Use for short
+    /// one-shot operations: cat a file, write a heredoc, query env.
+    /// Long-running streaming work belongs in [`open_exec`].
+    ///
+    /// Sync-blocking with a 30s timeout (longer than open_exec since
+    /// the remote command may take time to produce all its output).
+    pub fn run_oneshot(&self, command: String) -> Result<OneShotResult, SshError> {
+        let (tx, rx) = sync_mpsc::sync_channel(1);
+        self.request_tx
+            .send(SessionRequest::OneShot {
+                command,
+                response: tx,
+            })
+            .map_err(|_| SshError::Thread("session I/O thread is gone".into()))?;
+        rx.recv_timeout(Duration::from_secs(30))
+            .map_err(|_| SshError::Channel("run_oneshot timed out".into()))?
     }
 
     /// Best-effort clean teardown. Idempotent.
@@ -255,7 +294,7 @@ pub fn connect_session(
 ) -> Result<SshSession, SshError> {
     let (ready_tx, ready_rx) = sync_mpsc::sync_channel::<Result<(), SshError>>(1);
     let (teardown_tx, teardown_rx) = oneshot::channel::<()>();
-    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<ChannelOpenRequest>();
+    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<SessionRequest>();
 
     let join = thread::Builder::new()
         .name("helm-ssh".into())
@@ -319,7 +358,7 @@ fn session_io_thread(
     target: SshTarget,
     auth: SshAuth,
     ready: sync_mpsc::SyncSender<Result<(), SshError>>,
-    mut request_rx: tokio::sync::mpsc::UnboundedReceiver<ChannelOpenRequest>,
+    mut request_rx: tokio::sync::mpsc::UnboundedReceiver<SessionRequest>,
     teardown: oneshot::Receiver<()>,
     prompter: Option<Arc<dyn HostKeyPrompter>>,
 ) {
@@ -361,12 +400,23 @@ fn session_io_thread(
                         debug!("ssh: request channel closed");
                         break;
                     };
-                    match open_exec_channel(&handle, req.command).await {
-                        Ok((reader, writer)) => {
-                            let _ = req.response.send(Ok(OpenedChannel { reader, writer }));
+                    match req {
+                        SessionRequest::Exec { command, response } => {
+                            match open_exec_channel(&handle, command).await {
+                                Ok((reader, writer)) => {
+                                    let _ = response.send(Ok(OpenedChannel {
+                                        reader,
+                                        writer,
+                                    }));
+                                }
+                                Err(e) => {
+                                    let _ = response.send(Err(e));
+                                }
+                            }
                         }
-                        Err(e) => {
-                            let _ = req.response.send(Err(e));
+                        SessionRequest::OneShot { command, response } => {
+                            let result = run_oneshot_channel(&handle, command).await;
+                            let _ = response.send(result);
                         }
                     }
                 }
@@ -499,8 +549,59 @@ fn spawn_channel_pumps(
     });
 }
 
+/// Run `command` on the remote in a fresh non-PTY exec channel and
+/// drain its stdout / stderr / exit-status to completion. Closes the
+/// channel before returning. Suitable for short one-shot operations
+/// (read a config file, write a heredoc, query env). Long-running
+/// streaming commands belong in `open_exec_channel` instead.
+///
+/// Output is captured as `String` via lossy UTF-8 conversion — the
+/// only consumer (tool-integration JSON read/write) is text-only.
+async fn run_oneshot_channel(
+    handle: &Handle<Client>,
+    command: String,
+) -> Result<OneShotResult, SshError> {
+    use russh::ChannelMsg;
+
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| SshError::Channel(format!("open session: {e}")))?;
+    // No PTY — we want clean stdout (no terminal-mode mangling, no
+    // CR/LF injection) and the remote shell stays non-interactive.
+    channel
+        .exec(true, command.into_bytes())
+        .await
+        .map_err(|e| SshError::Channel(format!("exec: {e}")))?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code: Option<u32> = None;
+
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            // ext == 1 is stderr per RFC 4254 §5.2; other extended
+            // data types are ignored (we don't expect any).
+            ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
+                stderr.extend_from_slice(&data)
+            }
+            ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+            ChannelMsg::Eof | ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    Ok(OneShotResult {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+    })
+}
+
 /// TCP + auth + jump-host. Returns the russh `Handle` for the session.
-/// Channels are opened on top via `open_exec_channel`.
+/// Channels are opened on top via `open_exec_channel` /
+/// `run_oneshot_channel`.
 async fn auth_handshake(
     target: SshTarget,
     auth: SshAuth,

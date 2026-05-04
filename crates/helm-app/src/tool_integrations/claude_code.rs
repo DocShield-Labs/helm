@@ -30,20 +30,24 @@
 //!
 //! ## Remote scope
 //!
-//! v1 implements local only. Remote (port != 0) returns an error; the
-//! frontend gates the suggestion toast on local for now. Remote
-//! follows once we add a sync `SshSession::run_oneshot(command)`
-//! helper to helm-ssh — needed to read/write `~/.claude/settings.json`
-//! through the existing SSH session without spinning up a dedicated
-//! exec channel per file op.
+//! Both local and remote hosts are supported. Local uses
+//! `dirs::home_dir()` + `std::fs`. Remote uses
+//! `SshSession::run_oneshot` over the existing SSH session — `cat` to
+//! read, `base64 -d` heredoc to write atomically. The same
+//! idempotency + JSON-preservation guarantees apply: parse,
+//! `ensure_hook` / `remove_hook` mutations, write back. base64
+//! transport sidesteps every shell-quoting concern (any byte the JSON
+//! contains survives the round trip).
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use helm_domain::Host;
+use helm_ssh::SshSession;
 use helm_tmux::TmuxClient;
 
 use super::ToolIntegration;
@@ -96,14 +100,9 @@ impl ToolIntegration for ClaudeCodeIntegration {
         &self,
         host: &Host,
         _primary: &Arc<TmuxClient>,
+        ssh: Option<&Arc<SshSession>>,
     ) -> Result<bool, String> {
-        ensure_local(host)?;
-        let path = settings_path()?;
-        let value = match fs::read_to_string(&path) {
-            Ok(s) => parse_or_empty(&s)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(format!("read {}: {e}", path.display())),
-        };
+        let value = read_settings(host, ssh).await?;
         Ok(has_hook(&value, "Notification") && has_hook(&value, "Stop"))
     }
 
@@ -111,34 +110,24 @@ impl ToolIntegration for ClaudeCodeIntegration {
         &self,
         host: &Host,
         _primary: &Arc<TmuxClient>,
+        ssh: Option<&Arc<SshSession>>,
     ) -> Result<(), String> {
-        ensure_local(host)?;
-        let path = settings_path()?;
-        let mut value = match fs::read_to_string(&path) {
-            Ok(s) => parse_or_empty(&s)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Default::default()),
-            Err(e) => return Err(format!("read {}: {e}", path.display())),
-        };
+        let mut value = read_settings(host, ssh).await?;
         ensure_hook(&mut value, "Notification");
         ensure_hook(&mut value, "Stop");
-        write_atomic(&path, &value)
+        write_settings(host, ssh, &value).await
     }
 
     async fn uninstall(
         &self,
         host: &Host,
         _primary: &Arc<TmuxClient>,
+        ssh: Option<&Arc<SshSession>>,
     ) -> Result<(), String> {
-        ensure_local(host)?;
-        let path = settings_path()?;
-        let mut value = match fs::read_to_string(&path) {
-            Ok(s) => parse_or_empty(&s)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(format!("read {}: {e}", path.display())),
-        };
+        let mut value = read_settings(host, ssh).await?;
         remove_hook(&mut value, "Notification");
         remove_hook(&mut value, "Stop");
-        write_atomic(&path, &value)
+        write_settings(host, ssh, &value).await
     }
 
     fn post_install_note(&self) -> &'static str {
@@ -157,15 +146,79 @@ fn is_semver_like(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
-fn ensure_local(host: &Host) -> Result<(), String> {
+/// Read `~/.claude/settings.json` from the right side of the wire and
+/// parse to a `serde_json::Value`. Returns an empty object for a
+/// missing file (the install path treats missing the same as empty —
+/// we'll create it).
+async fn read_settings(host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<Value, String> {
     if host.port == 0 {
-        Ok(())
+        let path = local_settings_path()?;
+        match fs::read_to_string(&path) {
+            Ok(s) => parse_or_empty(&s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Value::Object(Default::default()))
+            }
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+        }
     } else {
-        Err("remote hosts not yet supported for this integration".into())
+        let ssh = ssh.ok_or_else(|| "remote host missing SSH session".to_string())?;
+        // `cat` to stdout; if missing, `|| echo '{}'` substitutes an
+        // empty object so the parser can proceed without a special case.
+        let cmd = "cat \"$HOME/.claude/settings.json\" 2>/dev/null || echo '{}'".to_string();
+        let out = tokio::task::spawn_blocking({
+            let ssh = ssh.clone();
+            move || ssh.run_oneshot(cmd)
+        })
+        .await
+        .map_err(|e| format!("ssh task: {e}"))?
+        .map_err(|e| e.to_string())?;
+        parse_or_empty(&out.stdout)
     }
 }
 
-fn settings_path() -> Result<PathBuf, String> {
+/// Write `value` back to `~/.claude/settings.json` atomically. Local
+/// uses a sibling `.tmp` rename. Remote sends the JSON over the
+/// existing SSH session base64-encoded so any byte the JSON contains
+/// (quotes, newlines, dollar signs, heredoc markers) survives intact.
+async fn write_settings(
+    host: &Host,
+    ssh: Option<&Arc<SshSession>>,
+    value: &Value,
+) -> Result<(), String> {
+    let serialized =
+        serde_json::to_string_pretty(value).map_err(|e| format!("serialize: {e}"))?;
+    if host.port == 0 {
+        let path = local_settings_path()?;
+        return write_atomic_local(&path, &serialized);
+    }
+    let ssh = ssh.ok_or_else(|| "remote host missing SSH session".to_string())?;
+    let b64 = STANDARD.encode(serialized.as_bytes());
+    // Equivalent of write_atomic_local: stage into `.helm.tmp`, then
+    // rename over the canonical path. Atomic against concurrent
+    // readers (Claude Code itself) — they never see a partial file.
+    let cmd = format!(
+        "mkdir -p \"$HOME/.claude\" && \
+         echo '{b64}' | base64 -d > \"$HOME/.claude/settings.json.helm.tmp\" && \
+         mv \"$HOME/.claude/settings.json.helm.tmp\" \"$HOME/.claude/settings.json\""
+    );
+    let out = tokio::task::spawn_blocking({
+        let ssh = ssh.clone();
+        move || ssh.run_oneshot(cmd)
+    })
+    .await
+    .map_err(|e| format!("ssh task: {e}"))?
+    .map_err(|e| e.to_string())?;
+    if !matches!(out.exit_code, Some(0) | None) {
+        return Err(format!(
+            "remote write failed (exit {:?}): {}",
+            out.exit_code,
+            out.stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn local_settings_path() -> Result<PathBuf, String> {
     dirs::home_dir()
         .map(|h| h.join(".claude").join("settings.json"))
         .ok_or_else(|| "no $HOME — can't locate ~/.claude/settings.json".into())
@@ -263,17 +316,15 @@ fn remove_hook(value: &mut Value, event: &str) {
     });
 }
 
-/// Write `value` to `path` atomically: serialize to a sibling `.tmp`
-/// file then rename over the canonical path. Same pattern the host
-/// persistence layer uses.
-fn write_atomic(path: &std::path::Path, value: &Value) -> Result<(), String> {
+/// Write `serialized` to `path` atomically: stage into a sibling
+/// `.tmp` file then rename over the canonical path. Same pattern the
+/// host persistence layer uses.
+fn write_atomic_local(path: &std::path::Path, serialized: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("json.helm.tmp");
-    let serialized = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("serialize: {e}"))?;
     fs::write(&tmp, serialized).map_err(|e| format!("write tmp: {e}"))?;
     fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
