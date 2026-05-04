@@ -160,6 +160,7 @@ fn upsert(
     // notifications upsert (next block) would invert lock order.
     let (preview, window_id, session_id) =
         runtime_snapshot(&ctx.pane_runtime, host_id, pane_id);
+    let focus_snapshot = ctx.focus.lock().clone();
     if window_id.is_empty() {
         // Diagnostic — a notification with no window_id can't be
         // routed to a sidebar row breadcrumb or jumped to via click.
@@ -184,7 +185,7 @@ fn upsert(
     // (occasional false positives are better than missing a real
     // event because we couldn't resolve breadcrumbs in time).
     if !window_id.is_empty() {
-        if let Some((focused_host, focused_window)) = ctx.focus.lock().clone() {
+        if let Some((focused_host, focused_window)) = focus_snapshot {
             if focused_host == host_id && focused_window == window_id {
                 return;
             }
@@ -391,10 +392,19 @@ fn format_preview(bytes: &[u8]) -> String {
     }
 }
 
-/// Dismiss every notification for `host_id` whose pane is in `pane_ids`,
-/// emitting a `NotificationDismissed` for each. Used by `notification_dismiss_for_window`
-/// once it's resolved which panes belong to the requested window, and by
-/// the host-disconnect / window-killed cleanup paths.
+/// Dismiss every notification for `host_id` whose pane is in
+/// `pane_ids`, emitting a `NotificationDismissed` for each. Used by
+/// `notification_dismiss_for_window` (user typed in a live pane) and
+/// by the refresh-stale path (pane is genuinely gone).
+///
+/// Deliberately does NOT touch `pane_runtime` — dismissing a
+/// notification is independent of whether the pane is alive. The
+/// refresh-stale caller handles its own runtime eviction explicitly,
+/// since it's the only path that has confirmation the pane is dead.
+/// (Earlier versions evicted runtime here too; the consequence was
+/// subsequent events on the same live pane carrying empty window_id,
+/// which broke active-window suppression and dismiss-on-keystroke
+/// because both depend on the runtime cache.)
 pub fn dismiss_for_panes(
     ctx: &NotificationsCtx,
     event_tx: &Option<UnboundedSender<HostEvent>>,
@@ -413,7 +423,6 @@ pub fn dismiss_for_panes(
                 },
             );
         }
-        ctx.pane_runtime.remove(&key);
     }
 }
 
@@ -512,6 +521,13 @@ pub async fn refresh_pane_index(
         .collect();
     if !stale.is_empty() {
         dismiss_for_panes(ctx, event_tx, host_id, &stale);
+        // Pane is genuinely gone (not in list-panes). Evict its runtime
+        // entry too — `dismiss_for_panes` only handles the notification
+        // side. If we left the runtime entry, it'd accumulate over the
+        // host's lifetime as panes come and go.
+        for pane_id in &stale {
+            ctx.pane_runtime.remove(&(host_id, pane_id.clone()));
+        }
     }
     Ok(())
 }

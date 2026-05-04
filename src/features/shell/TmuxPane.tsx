@@ -143,17 +143,11 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
           }
         }
         if (windowId) {
-          let hasNotif = false
-          for (const n of store.notifications.values()) {
-            if (n.host_id === hostId && n.window_id === windowId) {
-              hasNotif = true
-              break
-            }
-            if (n.host_id === hostId && n.pane_id === paneId) {
-              hasNotif = true
-              break
-            }
-          }
+          const hasNotif = [...store.notifications.values()].some(
+            (n) =>
+              n.host_id === hostId &&
+              (n.window_id === windowId || n.pane_id === paneId),
+          )
           if (hasNotif) {
             void commands.notificationDismissForWindow(hostId, windowId)
           }
