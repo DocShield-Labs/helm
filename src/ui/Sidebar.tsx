@@ -11,6 +11,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { commands } from '@lib/ipc'
 import {
+  isWindowRunning,
+  isWorkspaceRunning,
   notificationsForHost,
   notificationsForWindow,
   notificationsForWorkspace,
@@ -21,6 +23,7 @@ import {
 } from '@lib/store'
 import { connectHost, selectWorkspace } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
+import { prettyCwd } from '@lib/path'
 import { killWindow } from '@lib/actions/window'
 import type { Host, HostId } from '@bindings'
 import { StatusDot } from './StatusDot'
@@ -29,7 +32,7 @@ import { SidebarWorkspaceRow } from './SidebarWorkspaceRow'
 import { SidebarWindowRow } from './SidebarWindowRow'
 import { InboxSection } from '@features/activity-feed/InboxSection'
 import { PinnedSection } from '@features/pinned/PinnedSection'
-import { phaseFor, pinDotState, resolvePin, rollupActivity } from '@features/pinned/resolve'
+import { activityFor, phaseFor, pinDotState, resolvePin, rollupActivity } from '@features/pinned/resolve'
 
 export interface SidebarProps {
   /** Open the host editor for a brand-new host. */
@@ -98,62 +101,58 @@ function ExpandedSidebar({
   const sessions = useStore((s) => s.sessions)
   const statuses = useStore((s) => s.statuses)
   const notifications = useStore((s) => s.notifications)
+  const runningPanes = useStore((s) => s.runningPanes)
   const toggleWorkspaceCollapsed = useStore((s) => s.toggleWorkspaceCollapsed)
+  const expandedHosts = useStore((s) => s.expandedHosts)
+  const toggleHostExpanded = useStore((s) => s.toggleHostExpanded)
   const pinnedWindows = useStore((s) => s.pinnedWindows)
   const addPinnedWindow = useStore((s) => s.addPinnedWindow)
   const removePinnedWindow = useStore((s) => s.removePinnedWindow)
-  const sidebarTab = useStore((s) => s.sidebarTab)
-  const setSidebarTab = useStore((s) => s.setSidebarTab)
-
-  // Force a sensible tab when context changes — e.g. unpinning the last
-  // pin while sitting on the Pinned tab would leave the user staring at
-  // an empty section. Snap them back to Hosts in that case.
-  const effectiveTab = sidebarTab === 'pinned' && pinnedWindows.length === 0 ? 'hosts' : sidebarTab
+  const pinnedSectionCollapsed = useStore((s) => s.pinnedSectionCollapsed)
+  const setPinnedSectionCollapsed = useStore((s) => s.setPinnedSectionCollapsed)
+  const hostsSectionCollapsed = useStore((s) => s.hostsSectionCollapsed)
+  const setHostsSectionCollapsed = useStore((s) => s.setHostsSectionCollapsed)
 
   return (
     <>
     {/* Scrollable content area. The collapse chevron lives in its
-        own bottom bar (below this) — pulled out of the tab strip so
-        it sits in the same vertical region as the expand chevron in
-        the collapsed rail. State changes don't move the affordance. */}
+        own bottom bar (below this) — pulled out so it sits in the
+        same vertical region as the expand chevron in the collapsed
+        rail. State changes don't move the affordance. */}
     <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3">
       <InboxSection />
 
-      <div className="flex items-center border-b border-white/[0.04] pb-px">
-        <TabButton
-          label="Pinned"
-          count={pinnedWindows.length}
-          active={effectiveTab === 'pinned'}
-          onClick={() => setSidebarTab('pinned')}
-        />
-        <TabButton
-          label="Hosts"
-          active={effectiveTab === 'hosts'}
-          onClick={() => setSidebarTab('hosts')}
-        />
-      </div>
+      <SectionHeader
+        label="PINNED"
+        count={pinnedWindows.length}
+        collapsed={pinnedSectionCollapsed}
+        onToggle={() => setPinnedSectionCollapsed(!pinnedSectionCollapsed)}
+      />
+      {!pinnedSectionCollapsed && <PinnedSection />}
 
-      {effectiveTab === 'pinned' ? (
-        <PinnedSection />
-      ) : (
-        <>
-        <div className="flex items-center justify-between pb-1 pt-2 pl-2 pr-1">
-          <span className="text-[10px] font-medium tracking-[0.08em] text-text-tertiary">
-            HOSTS
-          </span>
+      <SectionHeader
+        label="HOSTS"
+        collapsed={hostsSectionCollapsed}
+        onToggle={() => setHostsSectionCollapsed(!hostsSectionCollapsed)}
+        rightAffordance={
           <button
             type="button"
-            onClick={onAddHost}
+            onClick={(e) => {
+              e.stopPropagation()
+              onAddHost()
+            }}
             className="rounded-sm px-1.5 font-mono text-[12px] leading-none text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
             title="Add host"
           >
             +
           </button>
-        </div>
-        {sortedHosts.map((h) => {
+        }
+      />
+      {!hostsSectionCollapsed && sortedHosts.map((h) => {
         const hs = sessions.get(h.id)
         const status = statuses.get(h.id) ?? 'disconnected'
         const isActive = activeHostId === h.id
+        const hostExpanded = expandedHosts.has(h.id)
         const hostNotifs = notificationsForHost(notifications, h.id)
         const workspaceList = hs
           ? [...hs.workspaces.values()].sort((a, b) => a.name.localeCompare(b.name))
@@ -164,15 +163,18 @@ function ExpandedSidebar({
               name={h.name}
               status={displayedHostStatus(h, status, hs?.detachedReason ?? null)}
               state={isActive ? 'active' : 'rest'}
-              expanded
+              expanded={hostExpanded}
+              onToggleExpand={() => toggleHostExpanded(h.id)}
               notificationCount={hostNotifs.length}
+              // Body click toggles expansion AND sets active so users
+              // can drill in with a single click. Connect lives on the
+              // status dot — see onConnect below.
               onClick={() => {
                 setActiveHost(h.id)
-                // Click acts as manual reconnect whenever the host
-                // isn't actually live — covers a fresh remote
-                // (`disconnected`), a remote stuck reconnecting, and
-                // localhost whose tmux died. Connected/idle hosts
-                // just get their selection updated.
+                toggleHostExpanded(h.id)
+              }}
+              onConnect={() => {
+                setActiveHost(h.id)
                 if (status !== 'connected' && status !== 'idle') {
                   void connectHost(h.id)
                 }
@@ -180,9 +182,9 @@ function ExpandedSidebar({
               onEdit={h.port === 0 ? undefined : () => onEditHost(h)}
               onContextMenu={h.port === 0 ? undefined : () => onDeleteHost(h)}
             />
-            {isActive &&
+            {hostExpanded &&
               workspaceList.map((w) => {
-                const isActiveWs = hs?.activeWorkspaceId === w.id
+                const isActiveWs = isActive && hs?.activeWorkspaceId === w.id
                 const expanded = !(hs?.collapsedWorkspaces.has(w.id) ?? false)
                 const winsForWs = [...w.windows.values()].sort((a, b) =>
                   a.id.localeCompare(b.id),
@@ -192,11 +194,12 @@ function ExpandedSidebar({
                   <div key={w.id} className="flex flex-col gap-1">
                     <SidebarWorkspaceRow
                       name={w.name}
-                      // Dot exists ONLY for unread notifications now —
-                      // active state is already conveyed by the row's
-                      // bg-accent-muted, so an ambient running/idle dot
-                      // would just be noise.
-                      activity={wsNotifs.length > 0 ? rollupActivity(wsNotifs) : 'none'}
+                      // Dot reflects unread notifications + a live
+                      // spinner when any pane in the workspace is
+                      // running a command. Active state itself is
+                      // conveyed by bg-accent-muted, so the dot stays
+                      // a pure activity signal rather than chrome.
+                      activity={activityFor(wsNotifs, isWorkspaceRunning(runningPanes, h.id, w))}
                       state={isActiveWs ? 'active' : 'rest'}
                       expanded={expanded}
                       onClick={() => toggleWorkspaceCollapsed(h.id, w.id)}
@@ -235,12 +238,12 @@ function ExpandedSidebar({
                               <SidebarWindowRow
                                 key={win.id}
                                 name={win.name}
-                                command={paneCommandFor(win.id, w)}
-                                // Dot only when this specific window
-                                // has unread notifications. The focused
-                                // row's bg-accent-muted already shows
-                                // which window is active.
-                                activity={winNotifs.length > 0 ? rollupActivity(winNotifs) : 'none'}
+                                label={prettyCwd(paneCwdFor(win.id, w))}
+                                // Dot folds notifications + the live
+                                // spinner: a running pane in this
+                                // window outranks a stale "completed"
+                                // dot, but failed/bell still win.
+                                activity={activityFor(winNotifs, isWindowRunning(runningPanes, h.id, w, win.id))}
                                 state={isFocused ? 'focused' : 'rest'}
                                 isPinned={pinnedWindows.some(
                                   p => p.hostId === h.id && p.workspaceName === w.name && p.windowId === win.id,
@@ -279,7 +282,7 @@ function ExpandedSidebar({
                   </div>
                 )
               })}
-            {isActive && (
+            {hostExpanded && (
               <button
                 type="button"
                 className="rounded-md px-2 py-1 text-left font-mono text-[11px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
@@ -292,8 +295,6 @@ function ExpandedSidebar({
           </div>
         )
       })}
-        </>
-      )}
     </div>
 
     {/* Persistent bottom bar — collapse chevron sits here so its
@@ -314,36 +315,38 @@ function ExpandedSidebar({
   )
 }
 
-interface TabButtonProps {
+interface SectionHeaderProps {
   label: string
-  active: boolean
   count?: number
-  onClick: () => void
+  collapsed: boolean
+  onToggle: () => void
+  rightAffordance?: React.ReactNode
 }
-function TabButton({ label, active, count, onClick }: TabButtonProps) {
+
+/** Header row for the Pinned/Hosts groups. Click anywhere on the
+ * header (including the chevron) toggles collapsed state. The right
+ * affordance slot is for buttons like "+ host" that shouldn't toggle
+ * the section when clicked. */
+function SectionHeader({ label, count, collapsed, onToggle, rightAffordance }: SectionHeaderProps) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`relative flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium tracking-[0.04em] ${
-        active ? 'text-text-primary' : 'text-text-tertiary hover:text-text-secondary'
-      }`}
+    <div
+      role="button"
+      onClick={onToggle}
+      className="group flex cursor-pointer items-center justify-between rounded-sm pb-1 pt-2 pl-1 pr-1 hover:bg-white/[0.02]"
     >
-      <span>{label}</span>
-      {count !== undefined && count > 0 && (
-        <span
-          className={`font-mono text-[10px] ${active ? 'text-text-tertiary' : 'text-text-tertiary'}`}
-        >
-          {count}
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block w-3 text-center font-mono text-[10px] leading-none text-text-tertiary">
+          {collapsed ? '▸' : '▾'}
         </span>
-      )}
-      {active && (
-        <span
-          className="absolute inset-x-0 -bottom-px h-px"
-          style={{ background: 'var(--accent-default)' }}
-        />
-      )}
-    </button>
+        <span className="text-[10px] font-medium tracking-[0.08em] text-text-tertiary">
+          {label}
+          {count !== undefined && count > 0 && (
+            <span className="ml-1.5 font-mono text-text-tertiary opacity-70">{count}</span>
+          )}
+        </span>
+      </span>
+      {rightAffordance}
+    </div>
   )
 }
 
@@ -366,20 +369,8 @@ function CollapsedSidebar({
   const statuses = useStore((s) => s.statuses)
   const activeHostId = useStore((s) => s.activeHostId)
   const setActiveHost = useStore((s) => s.setActiveHost)
-  const sidebarTab = useStore((s) => s.sidebarTab)
   const pinnedWindows = useStore((s) => s.pinnedWindows)
-
-  // Mirror the expanded sidebar's tab fall-through so an empty Pinned
-  // tab in collapsed mode shows the host rail instead of nothing.
-  const effectiveTab = sidebarTab === 'pinned' && pinnedWindows.length === 0 ? 'hosts' : sidebarTab
-
-  if (effectiveTab === 'pinned') {
-    return (
-      <CollapsedPinnedRail
-        onExpand={onExpand}
-      />
-    )
-  }
+  const hosts = useStore((s) => s.hosts)
 
   const [peekHostId, setPeekHostId] = useState<HostId | null>(null)
   const [peekAnchorTop, setPeekAnchorTop] = useState(0)
@@ -405,6 +396,64 @@ function CollapsedSidebar({
   return (
     <div className="flex h-full flex-col items-center gap-1 px-2 pt-3 pb-2">
       <CollapsedInboxIndicator />
+
+      {/* Pinned dots (working set, cross-host). Rendered first so the
+          user's curated pins anchor the top of the rail. */}
+      {pinnedWindows.map((pin) => {
+        const resolved = resolvePin(pin, hosts, sessions)
+        const status = statuses.get(pin.hostId)
+        const phase = phaseFor(
+          resolved.host,
+          status,
+          resolved.treeLoaded,
+          !!resolved.workspace,
+          !!resolved.window,
+        )
+        const dot = pinDotState(resolved.host, status, phase)
+        const isActive =
+          activeHostId === pin.hostId &&
+          sessions.get(pin.hostId)?.activeWorkspaceId === resolved.workspace?.id &&
+          resolved.window?.active === true
+        const stale = phase === 'stale'
+
+        const click = () => {
+          if (!resolved.host) return
+          if (phase === 'offline') {
+            void connectHost(pin.hostId)
+            return
+          }
+          if (stale || !resolved.workspace || !resolved.window) return
+          const store = useStore.getState()
+          store.setActiveHost(pin.hostId)
+          store.setActiveWindow(pin.hostId, resolved.workspace.id, resolved.window.id)
+          void selectWorkspace(pin.hostId, resolved.workspace.id)
+          void commands.tmuxSelectWindow(pin.hostId, resolved.window.id)
+        }
+
+        return (
+          <button
+            key={pinnedKey(pin.hostId, pin.workspaceName, pin.windowId)}
+            type="button"
+            onClick={click}
+            title={`${resolved.window?.name ?? pin.windowName} · ${pin.hostName} · ${pin.workspaceName}`}
+            className={`flex h-8 w-8 items-center justify-center rounded-md ${
+              isActive ? 'bg-accent-muted' : 'hover:bg-white/[0.04]'
+            } ${stale ? 'opacity-55' : ''}`}
+          >
+            <StatusDot state={dot} />
+          </button>
+        )
+      })}
+
+      {/* Divider between pins and hosts — only when both groups have
+          something to show. Same accent rule used in the inbox indicator. */}
+      {pinnedWindows.length > 0 && sortedHosts.length > 0 && (
+        <div
+          className="my-0.5 h-px w-7 rounded-full"
+          style={{ background: 'var(--accent-default)', opacity: 0.5 }}
+        />
+      )}
+
       {sortedHosts.map((h) => {
         const status = statuses.get(h.id) ?? 'disconnected'
         const isActive = activeHostId === h.id
@@ -470,83 +519,6 @@ function CollapsedSidebar({
           }}
         />
       )}
-    </div>
-  )
-}
-
-// ===========================================================================
-// Collapsed pinned rail — minimal rail showing the user's pins as
-// clickable status dots. No hover-peek for v1; user can expand for
-// detail. Mirrors the chrome of the host rail (same widths/spacing) so
-// switching tabs feels like flipping the same surface, not a new one.
-// ===========================================================================
-
-function CollapsedPinnedRail({ onExpand }: { onExpand: () => void }) {
-  const pinnedWindows = useStore((s) => s.pinnedWindows)
-  const hosts = useStore((s) => s.hosts)
-  const sessions = useStore((s) => s.sessions)
-  const statuses = useStore((s) => s.statuses)
-  const activeHostId = useStore((s) => s.activeHostId)
-
-  return (
-    <div className="flex h-full flex-col items-center gap-1 px-2 pt-3 pb-2">
-      <CollapsedInboxIndicator />
-      {pinnedWindows.map((pin) => {
-        const resolved = resolvePin(pin, hosts, sessions)
-        const status = statuses.get(pin.hostId)
-        const phase = phaseFor(
-          resolved.host,
-          status,
-          resolved.treeLoaded,
-          !!resolved.workspace,
-          !!resolved.window,
-        )
-        const dot = pinDotState(resolved.host, status, phase)
-        const isActive =
-          activeHostId === pin.hostId &&
-          sessions.get(pin.hostId)?.activeWorkspaceId === resolved.workspace?.id &&
-          resolved.window?.active === true
-        const stale = phase === 'stale'
-
-        const click = () => {
-          if (!resolved.host) return
-          if (phase === 'offline') {
-            void connectHost(pin.hostId)
-            return
-          }
-          if (stale || !resolved.workspace || !resolved.window) return
-          const store = useStore.getState()
-          store.setActiveHost(pin.hostId)
-          store.setActiveWindow(pin.hostId, resolved.workspace.id, resolved.window.id)
-          void selectWorkspace(pin.hostId, resolved.workspace.id)
-          void commands.tmuxSelectWindow(pin.hostId, resolved.window.id)
-        }
-
-        return (
-          <button
-            key={pinnedKey(pin.hostId, pin.workspaceName, pin.windowId)}
-            type="button"
-            onClick={click}
-            title={`${resolved.window?.name ?? pin.windowName} · ${pin.hostName} · ${pin.workspaceName}`}
-            className={`flex h-8 w-8 items-center justify-center rounded-md ${
-              isActive ? 'bg-accent-muted' : 'hover:bg-white/[0.04]'
-            } ${stale ? 'opacity-55' : ''}`}
-          >
-            <StatusDot state={dot} />
-          </button>
-        )
-      })}
-
-      <div className="flex-1" />
-
-      <button
-        type="button"
-        onClick={onExpand}
-        className="flex h-8 w-8 items-center justify-center rounded-md font-mono text-[12px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
-        title="Expand sidebar (⌘\)"
-      >
-        ⇥
-      </button>
     </div>
   )
 }
@@ -716,8 +688,11 @@ function HostPeekPopover({
                         >
                           {win.name}
                         </span>
-                        <span className="flex-1 truncate text-left font-mono text-[10px] text-text-tertiary">
-                          {paneCommandFor(win.id, w)}
+                        <span
+                          className="flex-1 truncate text-left font-mono text-[10px] text-text-tertiary"
+                          title={paneCwdFor(win.id, w) || undefined}
+                        >
+                          {prettyCwd(paneCwdFor(win.id, w))}
                         </span>
                       </button>
                     )
@@ -762,11 +737,12 @@ function useSortedHosts(): Host[] {
   )
 }
 
-function paneCommandFor(windowId: string, w: TmuxWorkspace): string {
+function paneCwdFor(windowId: string, w: TmuxWorkspace): string {
   const inWindow = [...w.panes.values()].filter((p) => p.windowId === windowId)
   const active = inWindow.find((p) => p.active) ?? inWindow[0]
-  return active?.command ?? ''
+  return active?.cwd ?? ''
 }
+
 
 // Inbox count + tone badge that sits at the top of the collapsed
 // rail. Visible only when there are pending notifications. Click
@@ -782,6 +758,9 @@ function CollapsedInboxIndicator() {
   if (count === 0) return null
 
   const tone = rollupActivity([...notifications.values()])
+  // The CSS token `--activity-running` is the legacy name for the blue
+  // "command finished cleanly" colour — the right swatch for the
+  // 'completed' branch even though the variable name lags behind.
   const color =
     tone === 'failed'
       ? 'var(--activity-failed)'

@@ -8,7 +8,7 @@
 
 import type { Host, HostStatus, Notification } from '@bindings'
 import type { PinnedWindow, TmuxWindow, TmuxWorkspace } from '@lib/store'
-import type { StatusDotState } from '@ui'
+import type { ActivityDotState, StatusDotState } from '@ui'
 
 export type PinPhase = 'normal' | 'loading' | 'stale' | 'offline'
 
@@ -82,7 +82,7 @@ export function pinDotState(
   return 'connected'
 }
 
-export function rollupActivity(notifs: Notification[]): 'failed' | 'attention' | 'running' {
+export function rollupActivity(notifs: Notification[]): 'failed' | 'attention' | 'completed' {
   let hasFailed = false
   let hasBell = false
   for (const n of notifs) {
@@ -96,5 +96,34 @@ export function rollupActivity(notifs: Notification[]): 'failed' | 'attention' |
   }
   if (hasFailed) return 'failed'
   if (hasBell) return 'attention'
-  return 'running'
+  return 'completed'
+}
+
+/** Compose the visual state for an ActivityDot from notifications +
+ * a live "is something running here" flag. Priority is failed first
+ * (broken needs eyes most), then attention (a bell is the user being
+ * summoned), then running (live work), then completed (clean done),
+ * then nothing.
+ *
+ * The dot in the sidebar collapses everything happening in a window
+ * down to a single glyph, so the priority decides which truth wins
+ * when several apply at once. */
+export function activityFor(notifs: Notification[], running: boolean): ActivityDotState {
+  if (notifs.length === 0 && !running) return 'none'
+  // Walk notifs once, pulling out the two flags we care about.
+  let hasFailed = false
+  let hasBell = false
+  for (const n of notifs) {
+    if (
+      n.kind.kind === 'command_done' &&
+      n.kind.exit_code !== null &&
+      n.kind.exit_code !== undefined &&
+      n.kind.exit_code !== 0
+    ) hasFailed = true
+    if (n.kind.kind === 'bell') hasBell = true
+  }
+  if (hasFailed) return 'failed'
+  if (hasBell) return 'attention'
+  if (running) return 'running'
+  return 'completed'
 }

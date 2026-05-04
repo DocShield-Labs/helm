@@ -12,7 +12,11 @@ export type SidebarWindowRowState = 'rest' | 'hover' | 'focused'
 
 export interface SidebarWindowRowProps {
   name: string
-  command: string
+  /** Secondary label rendered under the name in the tertiary slot.
+   * Currently used to surface the active pane's working directory; when
+   * empty the slot collapses. The full string is exposed via the
+   * `<span title>` so long paths stay readable on hover. */
+  label: string
   activity?: ActivityDotState
   state?: SidebarWindowRowState
   onClick?: () => void
@@ -31,7 +35,7 @@ export interface SidebarWindowRowProps {
 
 export function SidebarWindowRow({
   name,
-  command,
+  label,
   activity = 'none',
   state = 'rest',
   onClick,
@@ -150,8 +154,11 @@ export function SidebarWindowRow({
           >
             {name}
           </span>
-          <span className="flex-1 truncate text-left font-mono text-[10px] text-text-tertiary">
-            {command}
+          <span
+            className="flex-1 truncate text-left font-mono text-[10px] text-text-tertiary"
+            title={label || undefined}
+          >
+            {label}
           </span>
           {onKill && (
             <span

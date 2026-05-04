@@ -25,6 +25,7 @@
 import { useMemo, useState } from 'react'
 import { commands } from '@lib/ipc'
 import {
+  isWindowRunning,
   notificationsForWindow,
   pinnedKey,
   useStore,
@@ -42,7 +43,8 @@ import {
   type ContextMenuItem,
   StatusDot,
 } from '@ui'
-import { phaseFor, pinDotState, resolvePin, rollupActivity } from './resolve'
+import { prettyCwd } from '@lib/path'
+import { activityFor, phaseFor, pinDotState, resolvePin } from './resolve'
 
 export function PinnedSection() {
   const pinnedWindows = useStore((s) => s.pinnedWindows)
@@ -51,6 +53,7 @@ export function PinnedSection() {
   const sessions = useStore((s) => s.sessions)
   const statuses = useStore((s) => s.statuses)
   const notifications = useStore((s) => s.notifications)
+  const runningPanes = useStore((s) => s.runningPanes)
   const activeHostId = useStore((s) => s.activeHostId)
 
   const resolved = useMemo(
@@ -89,6 +92,11 @@ export function PinnedSection() {
               ? notificationsForWindow(notifications, sessions.get(pin.hostId), pin.hostId, window.id)
               : []
           }
+          running={
+            workspace && window
+              ? isWindowRunning(runningPanes, pin.hostId, workspace, window.id)
+              : false
+          }
           isActive={
             activeHostId === pin.hostId &&
             sessions.get(pin.hostId)?.activeWorkspaceId === workspace?.id &&
@@ -111,6 +119,7 @@ interface PinnedRowProps {
   treeLoaded: boolean
   status: HostStatus | undefined
   notifications: Notification[]
+  running: boolean
   isActive: boolean
   onRemove: () => void
 }
@@ -123,6 +132,7 @@ function PinnedRow({
   treeLoaded,
   status,
   notifications,
+  running,
   isActive,
   onRemove,
 }: PinnedRowProps) {
@@ -132,10 +142,22 @@ function PinnedRow({
   const stale = phase === 'stale'
   const offline = phase === 'offline'
 
-  const activity: ActivityDotState =
-    notifications.length > 0 ? rollupActivity(notifications) : 'none'
+  const activity: ActivityDotState = activityFor(notifications, running)
 
-  const subtitle = `${pin.hostName} · ${pin.workspaceName}`
+  // Resolve the active pane's cwd for the subtitle. When the pin is
+  // stale or offline we don't have a live tree, so fall back to the
+  // pin-time workspace label so the user still has a recognisable
+  // breadcrumb.
+  const activePane =
+    workspace && window
+      ? [...workspace.panes.values()]
+          .filter((p) => p.windowId === window.id)
+          .find((p) => p.active) ?? null
+      : null
+  const cwd = activePane?.cwd ?? ''
+  const subtitle = cwd
+    ? `${pin.hostName} · ${prettyCwd(cwd)}`
+    : `${pin.hostName} · ${pin.workspaceName}`
 
   const click = () => {
     if (!host) return
@@ -207,7 +229,10 @@ function PinnedRow({
               </span>
             )}
           </div>
-          <span className="truncate text-left font-mono text-[10px] text-text-tertiary">
+          <span
+            className="truncate text-left font-mono text-[10px] text-text-tertiary"
+            title={cwd || undefined}
+          >
             {subtitle}
           </span>
         </div>

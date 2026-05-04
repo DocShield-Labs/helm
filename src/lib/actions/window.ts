@@ -99,18 +99,26 @@ export function killWindow(hostId: HostId, workspaceId: string, window: TmuxWind
   })
 }
 
-/** Keymap dispatcher for next/prev — picks pinned-cycle vs in-workspace
- * neighbour based on which sidebar tab is showing. Same logic the
- * inline App.tsx switch had before this refactor. */
+/** Keymap dispatcher for next/prev — cycle within the user's pinned
+ * working set if the active window is itself a pin, otherwise step
+ * to the neighbour window inside the same workspace. The active
+ * window's pin-membership is the natural signal now that the sidebar
+ * has no Pinned/Hosts tab — the user is "in pinned mode" exactly when
+ * they're sitting on a pinned row. */
 async function stepWindow(direction: 1 | -1): Promise<void> {
   const state = useStore.getState()
-  if (state.sidebarTab === 'pinned' && state.pinnedWindows.length > 0) {
-    await cyclePinnedWindow(direction)
-    return
-  }
   const hostId = state.activeHostId
   const ws = activeWorkspace()
   const win = activeWindow()
+  const onPinned =
+    !!hostId &&
+    !!ws &&
+    !!win &&
+    state.isWindowPinned(hostId, ws.name, win.id)
+  if (onPinned && state.pinnedWindows.length > 0) {
+    await cyclePinnedWindow(direction)
+    return
+  }
   if (!hostId || !ws) return
   const next = neighbourWindowId(ws, win?.id, direction)
   if (!next) return

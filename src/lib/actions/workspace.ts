@@ -61,21 +61,32 @@ export async function createWorkspace(hostId: HostId): Promise<void> {
   await selectWorkspace(hostId, workspaceId)
 }
 
-/** Schedule a workspace kill with a 5s undo window. The toast carries
- * the actual kill as its deferred action; pressing the toast's Undo
- * button dismisses without firing. Cmd+Z (global undo handler) reaches
- * into the same toast queue. */
+/** Optimistic workspace kill with a 5s undo. Mirrors the `killWindow`
+ * pattern in `window.ts` — the workspace (with its windows + panes) is
+ * snapshotted into `pendingWorkspaceKills` and stripped from the live
+ * sessions tree immediately so the sidebar collapses without waiting
+ * for the deferred tmux kill. The toast's Undo button (and the global
+ * Cmd+Z handler) restores the snapshot; the deferred action fires the
+ * real `tmux_kill_session` after the timer elapses. */
 export async function killWorkspace(hostId: HostId, workspace: TmuxWorkspace): Promise<void> {
-  const toastId = `kill-workspace::${hostId}::${workspace.id}`
-  const { pushToast } = useStore.getState()
-  pushToast({
+  const state = useStore.getState()
+  const key = `${hostId}::${workspace.id}`
+  const toastId = `kill-workspace::${key}`
+  state.optimisticRemoveWorkspace(hostId, workspace.id)
+  state.pushToast({
     id: toastId,
-    message: `Killing workspace "${workspace.name}"`,
+    message: `Killed workspace "${workspace.name}"`,
     durationMs: 5_000,
     deferredAction: () => {
       void commands.tmuxKillSession(hostId, workspace.id)
+      useStore.getState().commitPendingWorkspaceKill(key)
     },
-    action: { label: 'Undo', onClick: () => {} },
+    action: {
+      label: 'Undo',
+      onClick: () => {
+        useStore.getState().restorePendingWorkspaceKill(key)
+      },
+    },
   })
 }
 

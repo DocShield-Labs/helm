@@ -80,6 +80,7 @@ export async function subscribeHostEvents(): Promise<void> {
       if (evt.status === 'disconnected' && prev === 'connected') {
         store.setWorkspaces(evt.host_id, [])
         store.clearPaneCapturesForHost(evt.host_id)
+        store.clearRunningForHost(evt.host_id)
         prehydratingHosts.delete(evt.host_id)
         prehydratedHosts.delete(evt.host_id)
       }
@@ -100,6 +101,7 @@ export async function subscribeHostEvents(): Promise<void> {
         if (host && host.port === 0) {
           store.setWorkspaces(evt.host_id, [])
           store.clearPaneCapturesForHost(evt.host_id)
+          store.clearRunningForHost(evt.host_id)
           prehydratingHosts.delete(evt.host_id)
           prehydratedHosts.delete(evt.host_id)
         }
@@ -148,6 +150,19 @@ export async function subscribeHostEvents(): Promise<void> {
     const store = useStore.getState()
     switch (n.kind) {
       case 'output':
+        // Mirror the OSC 133 lifecycle into the store so the sidebar
+        // dot can show a live spinner. BlockTracker still consumes the
+        // same markers in-pane for block chrome — both readers run
+        // independently. We walk in marker order so a chunk containing
+        // `D` followed by a fresh `B` (one prompt cycle ending, the
+        // next command starting) settles to "running".
+        for (const m of n.markers) {
+          if (m.marker.kind === 'command_start') {
+            store.markPaneRunning(host_id, n.pane_id, m.marker.command)
+          } else if (m.marker.kind === 'command_done') {
+            store.markPaneIdle(host_id, n.pane_id)
+          }
+        }
         deliverOutput(host_id, n.pane_id, n.bytes, n.markers)
         return
 

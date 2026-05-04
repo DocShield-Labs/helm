@@ -70,3 +70,19 @@ button:not(:disabled),
 .xterm-viewport::-webkit-scrollbar-thumb {
   background: transparent;
 }
+
+/*
+ * ActivityDot 'running' state — pure-CSS rotation. One glyph, one
+ * keyframe, animation lives in the compositor so per-row React
+ * renders stay idle even when many panes are running concurrently.
+ */
+@keyframes activity-running-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.activity-running-spinner {
+  animation: activity-running-spin 1s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .activity-running-spinner { animation: none; }
+}

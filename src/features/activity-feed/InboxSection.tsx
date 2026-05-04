@@ -21,6 +21,7 @@ import { AnimatePresence, motion } from 'motion/react'
 import { commands } from '@lib/ipc'
 import { useStore, workspaceForWindow, type HostSessions } from '@lib/store'
 import { selectWorkspace } from '@lib/host'
+import { prettyCwd } from '@lib/path'
 import type { Host, Notification, NotificationId, NotificationKind } from '@bindings'
 
 export function InboxSection() {
@@ -181,6 +182,7 @@ export function InboxSection() {
               notification={n}
               host={hosts.get(n.host_id)}
               windowName={resolveWindowName(sessions.get(n.host_id), n)}
+              cwd={resolvePaneCwd(sessions.get(n.host_id), n)}
               selected={isSelected(n)}
               onJump={() => onJump(n)}
               onDismiss={() => onDismiss(n)}
@@ -199,6 +201,7 @@ interface InboxRowProps {
   notification: Notification
   host: Host | undefined
   windowName: string
+  cwd: string
   selected: boolean
   onJump: () => void
   onDismiss: () => void
@@ -210,6 +213,7 @@ function InboxRow({
   notification: n,
   host,
   windowName,
+  cwd,
   selected,
   onJump,
   onDismiss,
@@ -265,9 +269,12 @@ function InboxRow({
         </span>
       </div>
       <div className="flex items-center gap-2 pl-4">
-        <span className="truncate text-left font-mono text-[10px] text-text-tertiary">
-          {host?.name ?? '?'} · {tone.label}
-          {n.preview ? ` · ${n.preview}` : ''}
+        <span
+          className="truncate text-left font-mono text-[10px] text-text-tertiary"
+          title={cwd || undefined}
+        >
+          {host?.name ?? '?'}
+          {cwd ? ` · ${prettyCwd(cwd)}` : ''}
         </span>
       </div>
     </button>
@@ -326,6 +333,19 @@ function formatMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`
   return `${(ms / 60_000).toFixed(1)}m`
+}
+
+/** Look up the originating pane's working directory from the live
+ * session tree. Returns '' when the pane can't be located — the caller
+ * suppresses the cwd segment in that case so the row falls back to
+ * just the host name. */
+function resolvePaneCwd(hs: HostSessions | undefined, n: Notification): string {
+  if (!hs) return ''
+  for (const ws of hs.workspaces.values()) {
+    const pane = ws.panes.get(n.pane_id)
+    if (pane) return pane.cwd
+  }
+  return ''
 }
 
 /** Best-effort resolution: prefer the live tree (always current names)

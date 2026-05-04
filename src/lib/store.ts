@@ -102,6 +102,18 @@ export interface PendingWindowKill {
   panes: TmuxPane[]
 }
 
+/** Snapshot of an entire workspace that's been optimistically removed
+ * pending a 5s undo. Two paths populate this:
+ *   1. User explicitly killed the workspace (UI X button or right-click).
+ *   2. User killed the workspace's last window — we cascade the
+ *      teardown so the empty workspace doesn't linger in the sidebar.
+ * Restore re-inserts the full workspace (with its windows + panes)
+ * verbatim. */
+export interface PendingWorkspaceKill {
+  hostId: string
+  workspace: TmuxWorkspace
+}
+
 /** Transient notification, shown at the bottom-right of the window. May
  * carry a deferred action that fires after `durationMs` unless the toast
  * is dismissed first (used for "undo within 5s" patterns). */
@@ -139,11 +151,23 @@ interface HelmState {
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
 
-  /** Which tab is showing in the expanded sidebar's body. `pinned` is
-   * the user's curated working set (windows pinned across hosts);
-   * `hosts` is the full host/workspace/window tree. Persisted. */
-  sidebarTab: 'pinned' | 'hosts'
-  setSidebarTab: (tab: 'pinned' | 'hosts') => void
+  /** Whether the Pinned section in the expanded sidebar is collapsed.
+   * Persisted via localStorage so the preference survives restarts.
+   * The Inbox / Pinned / Hosts sections all live in one scrollable
+   * column now — the user toggles each independently. */
+  pinnedSectionCollapsed: boolean
+  setPinnedSectionCollapsed: (v: boolean) => void
+  /** Whether the Hosts section in the expanded sidebar is collapsed. */
+  hostsSectionCollapsed: boolean
+  setHostsSectionCollapsed: (v: boolean) => void
+
+  /** Hosts the user has explicitly expanded. Default is **collapsed**:
+   * launch always opens to a quiet sidebar with hosts shown as a tidy
+   * list of dots, and the user opts in by clicking a host row to drill
+   * into its workspace tree. Not persisted — every launch starts with
+   * all hosts collapsed. Independent of `activeHostId`. */
+  expandedHosts: Set<HostId>
+  toggleHostExpanded: (host: HostId) => void
 
   /** Command palette open state and which entry mode it was opened in.
    * `actions` is the default Cmd+K view (recents + fuzzy actions);
@@ -251,6 +275,32 @@ interface HelmState {
   optimisticRemoveWindow: (host: HostId, workspaceId: string, windowId: string) => void
   restorePendingWindowKill: (key: string) => void
   commitPendingWindowKill: (key: string) => void
+
+  // ---------- pending workspace kills (5s undo) ----------
+  /** Snapshots of workspaces optimistically removed pending a kill,
+   * keyed by `${hostId}::${workspaceId}`. Two entry points: explicit
+   * `optimisticRemoveWorkspace` (user clicked the workspace X), and a
+   * cascade from `optimisticRemoveWindow` when the killed window was
+   * the last one in its workspace. The store strips these from
+   * incoming refetches just like pendingWindowKills. */
+  pendingWorkspaceKills: Map<string, PendingWorkspaceKill>
+  optimisticRemoveWorkspace: (host: HostId, workspaceId: string) => void
+  restorePendingWorkspaceKill: (key: string) => void
+  commitPendingWorkspaceKill: (key: string) => void
+
+  // ---------- live running indicator ----------
+  /** Panes whose most recent OSC 133 marker was `B` (CommandStart) and
+   * which haven't yet received a matching `D` (CommandDone). Sourced
+   * from the same `output` events that drive BlockTracker — the
+   * sidebar dot rolls this up to "is anything in this window/workspace
+   * currently busy?" so the user sees a spinner on rows where work is
+   * happening live. Keyed by `${hostId}::${paneId}`. */
+  runningPanes: Map<string, { hostId: HostId; startedAt: number; command: string | null }>
+  markPaneRunning: (host: HostId, paneId: string, command: string | null) => void
+  markPaneIdle: (host: HostId, paneId: string) => void
+  /** Drop every running entry for a host. Called on disconnect and
+   * host removal so a stale spinner doesn't outlive its tmux server. */
+  clearRunningForHost: (host: HostId) => void
 
   // ---------- toasts ----------
   toasts: Toast[]
@@ -438,19 +488,19 @@ const readPinnedWindows = (): PinnedWindow[] =>
   readJsonArray(PINNED_WINDOWS_KEY, isPinnedWindow)
 const writePinnedWindows = (pins: PinnedWindow[]) => writeJson(PINNED_WINDOWS_KEY, pins)
 
-const SIDEBAR_TAB_KEY = 'helm.sidebarTab'
-/** Default tab is `hosts` until the user has pinned something — an
- * empty Pinned tab as the landing page would feel broken on first run. */
-const readSidebarTab = (hasPins: boolean): 'pinned' | 'hosts' => {
+const PINNED_SECTION_COLLAPSED_KEY = 'helm.pinnedSectionCollapsed'
+const HOSTS_SECTION_COLLAPSED_KEY = 'helm.hostsSectionCollapsed'
+const readBoolPref = (key: string, fallback: boolean): boolean => {
   try {
-    const v = localStorage.getItem(SIDEBAR_TAB_KEY)
-    if (v === 'pinned' || v === 'hosts') return v
+    const v = localStorage.getItem(key)
+    if (v === '1') return true
+    if (v === '0') return false
   } catch { /* fall through */ }
-  return hasPins ? 'pinned' : 'hosts'
+  return fallback
 }
-const writeSidebarTab = (tab: 'pinned' | 'hosts') => {
+const writeBoolPref = (key: string, v: boolean) => {
   try {
-    localStorage.setItem(SIDEBAR_TAB_KEY, tab)
+    localStorage.setItem(key, v ? '1' : '0')
   } catch { /* ignore */ }
 }
 
@@ -470,14 +520,27 @@ export const useStore = create<HelmState>((set, get) => ({
       return { sidebarCollapsed: next }
     }),
 
-  // Pin-aware tab default — first run with pins lands you on Pinned;
-  // first run without pins lands on Hosts so the body isn't empty.
   pinnedWindows: readPinnedWindows(),
-  sidebarTab: readSidebarTab(readPinnedWindows().length > 0),
-  setSidebarTab: (tab) => {
-    writeSidebarTab(tab)
-    set({ sidebarTab: tab })
+
+  pinnedSectionCollapsed: readBoolPref(PINNED_SECTION_COLLAPSED_KEY, false),
+  setPinnedSectionCollapsed: (v) => {
+    writeBoolPref(PINNED_SECTION_COLLAPSED_KEY, v)
+    set({ pinnedSectionCollapsed: v })
   },
+  hostsSectionCollapsed: readBoolPref(HOSTS_SECTION_COLLAPSED_KEY, false),
+  setHostsSectionCollapsed: (v) => {
+    writeBoolPref(HOSTS_SECTION_COLLAPSED_KEY, v)
+    set({ hostsSectionCollapsed: v })
+  },
+
+  expandedHosts: new Set(),
+  toggleHostExpanded: (host) =>
+    set((s) => {
+      const next = new Set(s.expandedHosts)
+      if (next.has(host)) next.delete(host)
+      else next.add(host)
+      return { expandedHosts: next }
+    }),
 
   paletteOpen: false,
   paletteMode: 'actions',
@@ -544,12 +607,24 @@ export const useStore = create<HelmState>((set, get) => ({
       for (const [nid, n] of s.notifications) {
         if (n.host_id !== id) nextNotifications.set(nid, n)
       }
+      const runningPrefix = `${id}::`
+      let nextRunning = s.runningPanes
+      for (const k of s.runningPanes.keys()) {
+        if (k.startsWith(runningPrefix)) {
+          nextRunning = new Map(s.runningPanes)
+          for (const k2 of s.runningPanes.keys()) {
+            if (k2.startsWith(runningPrefix)) nextRunning.delete(k2)
+          }
+          break
+        }
+      }
       return {
         hosts: nextHosts,
         statuses: nextStatuses,
         sessions: nextSessions,
         hostErrors: nextErrors,
         notifications: nextNotifications,
+        runningPanes: nextRunning,
         activeHostId: s.activeHostId === id ? null : s.activeHostId,
       }
     }),
@@ -632,20 +707,28 @@ export const useStore = create<HelmState>((set, get) => ({
 
   setWorkspaces: (host, workspaces) =>
     set((s) => {
-      // Strip windows whose kill is mid-undo. Without this filter, any
-      // refetch in the 5s window (e.g. from a `%window-add` event in
-      // another workspace) would resurrect a row the user just killed,
-      // and the deferred kill would still fire — so the row would die
-      // again 5s later with no visible cause. Both the window AND its
-      // panes are removed; restore puts both back from the snapshot.
-      const pendingForHost = new Set<string>()
+      // Strip windows AND workspaces whose kill is mid-undo. Without
+      // this filter, any refetch in the 5s window (e.g. from a
+      // `%window-add` event in another workspace) would resurrect a row
+      // the user just killed, and the deferred kill would still fire —
+      // so the row would die again 5s later with no visible cause. Both
+      // the window/workspace AND any associated panes are removed;
+      // restore puts both back from the snapshot.
       const prefix = `${host}::`
+      const pendingForHost = new Set<string>()
       for (const k of s.pendingWindowKills.keys()) {
         if (k.startsWith(prefix)) pendingForHost.add(k.slice(prefix.length))
       }
-      const filtered = pendingForHost.size === 0
+      const pendingWorkspaceForHost = new Set<string>()
+      for (const k of s.pendingWorkspaceKills.keys()) {
+        if (k.startsWith(prefix)) pendingWorkspaceForHost.add(k.slice(prefix.length))
+      }
+      const workspaceFiltered = pendingWorkspaceForHost.size === 0
         ? workspaces
-        : workspaces.map((ws) => {
+        : workspaces.filter((ws) => !pendingWorkspaceForHost.has(ws.id))
+      const filtered = pendingForHost.size === 0
+        ? workspaceFiltered
+        : workspaceFiltered.map((ws) => {
             // Skip allocation when this workspace has no pending-kill
             // overlap — the common case, since pending kills are rare
             // and scoped to one workspace.
@@ -763,28 +846,73 @@ export const useStore = create<HelmState>((set, get) => ({
       const nextPending = new Map(s.pendingWindowKills)
       nextPending.set(key, { hostId: host, workspaceId, window: win, panes })
 
-      // Remove from the live tree.
-      const nextWindows = new Map(ws.windows)
-      nextWindows.delete(windowId)
-      const nextPanes = new Map(ws.panes)
-      for (const p of panes) nextPanes.delete(p.id)
-      const nextWorkspaces = new Map(hs.workspaces)
-      nextWorkspaces.set(workspaceId, { ...ws, windows: nextWindows, panes: nextPanes })
+      // If this is the last window in the workspace, cascade the
+      // teardown: snapshot the (pre-strip) workspace into
+      // pendingWorkspaceKills and remove it from the sessions tree, so
+      // the user doesn't see a ghost empty workspace until the timer
+      // elapses. Restore brings both back together.
+      const willBeEmpty = ws.windows.size === 1 && ws.windows.has(windowId)
       const nextSessions = new Map(s.sessions)
-      nextSessions.set(host, { ...hs, workspaces: nextWorkspaces })
-      return { sessions: nextSessions, pendingWindowKills: nextPending }
+      let nextPendingWorkspace = s.pendingWorkspaceKills
+      if (willBeEmpty) {
+        const wsKey = `${host}::${workspaceId}`
+        nextPendingWorkspace = new Map(s.pendingWorkspaceKills)
+        nextPendingWorkspace.set(wsKey, { hostId: host, workspace: ws })
+        const nextWorkspaces = new Map(hs.workspaces)
+        nextWorkspaces.delete(workspaceId)
+        // Pick a fallback active workspace if the killed one was active.
+        const nextActive =
+          hs.activeWorkspaceId === workspaceId
+            ? [...nextWorkspaces.values()].sort((a, b) => a.name.localeCompare(b.name))[0]?.id ?? null
+            : hs.activeWorkspaceId
+        nextSessions.set(host, {
+          ...hs,
+          workspaces: nextWorkspaces,
+          activeWorkspaceId: nextActive,
+        })
+      } else {
+        // Workspace stays — strip the window + its panes only.
+        const nextWindows = new Map(ws.windows)
+        nextWindows.delete(windowId)
+        const nextPanes = new Map(ws.panes)
+        for (const p of panes) nextPanes.delete(p.id)
+        const nextWorkspaces = new Map(hs.workspaces)
+        nextWorkspaces.set(workspaceId, { ...ws, windows: nextWindows, panes: nextPanes })
+        nextSessions.set(host, { ...hs, workspaces: nextWorkspaces })
+      }
+      return {
+        sessions: nextSessions,
+        pendingWindowKills: nextPending,
+        pendingWorkspaceKills: nextPendingWorkspace,
+      }
     }),
   restorePendingWindowKill: (key) =>
     set((s) => {
       const snap = s.pendingWindowKills.get(key)
       if (!snap) return {}
       const hs = s.sessions.get(snap.hostId)
-      const ws = hs?.workspaces.get(snap.workspaceId)
-      if (!hs || !ws) {
-        // Workspace itself is gone — drop the snapshot, nothing to restore.
+      // If the workspace was cascaded out, restore it first so we have
+      // somewhere to put the window back.
+      const wsKey = `${snap.hostId}::${snap.workspaceId}`
+      const wsSnap = s.pendingWorkspaceKills.get(wsKey)
+      let workingHs = hs
+      let nextPendingWorkspace = s.pendingWorkspaceKills
+      if (wsSnap && (!hs || !hs.workspaces.has(snap.workspaceId))) {
+        const baseHs = hs ?? emptyHostSessions()
+        const restoredWorkspaces = new Map(baseHs.workspaces)
+        restoredWorkspaces.set(snap.workspaceId, wsSnap.workspace)
+        workingHs = { ...baseHs, workspaces: restoredWorkspaces }
+        nextPendingWorkspace = new Map(s.pendingWorkspaceKills)
+        nextPendingWorkspace.delete(wsKey)
+      }
+      const ws = workingHs?.workspaces.get(snap.workspaceId)
+      if (!workingHs || !ws) {
         const nextPending = new Map(s.pendingWindowKills)
         nextPending.delete(key)
-        return { pendingWindowKills: nextPending }
+        return {
+          pendingWindowKills: nextPending,
+          pendingWorkspaceKills: nextPendingWorkspace,
+        }
       }
       const nextWindows = new Map(ws.windows)
       // Force `active: false` on restore so the user's current focus
@@ -794,20 +922,108 @@ export const useStore = create<HelmState>((set, get) => ({
       nextWindows.set(snap.window.id, { ...snap.window, active: false })
       const nextPanes = new Map(ws.panes)
       for (const p of snap.panes) nextPanes.set(p.id, p)
-      const nextWorkspaces = new Map(hs.workspaces)
+      const nextWorkspaces = new Map(workingHs.workspaces)
       nextWorkspaces.set(snap.workspaceId, { ...ws, windows: nextWindows, panes: nextPanes })
       const nextSessions = new Map(s.sessions)
-      nextSessions.set(snap.hostId, { ...hs, workspaces: nextWorkspaces })
+      nextSessions.set(snap.hostId, { ...workingHs, workspaces: nextWorkspaces })
       const nextPending = new Map(s.pendingWindowKills)
       nextPending.delete(key)
-      return { sessions: nextSessions, pendingWindowKills: nextPending }
+      return {
+        sessions: nextSessions,
+        pendingWindowKills: nextPending,
+        pendingWorkspaceKills: nextPendingWorkspace,
+      }
     }),
   commitPendingWindowKill: (key) =>
     set((s) => {
       if (!s.pendingWindowKills.has(key)) return {}
       const next = new Map(s.pendingWindowKills)
+      const snap = s.pendingWindowKills.get(key)
       next.delete(key)
-      return { pendingWindowKills: next }
+      // Drop the cascaded workspace snapshot too — once tmux kills the
+      // last window, the empty session tears down server-side anyway.
+      let nextWorkspacePending = s.pendingWorkspaceKills
+      if (snap) {
+        const wsKey = `${snap.hostId}::${snap.workspaceId}`
+        if (s.pendingWorkspaceKills.has(wsKey)) {
+          nextWorkspacePending = new Map(s.pendingWorkspaceKills)
+          nextWorkspacePending.delete(wsKey)
+        }
+      }
+      return {
+        pendingWindowKills: next,
+        pendingWorkspaceKills: nextWorkspacePending,
+      }
+    }),
+
+  pendingWorkspaceKills: new Map(),
+  optimisticRemoveWorkspace: (host, workspaceId) =>
+    set((s) => {
+      const hs = s.sessions.get(host)
+      const ws = hs?.workspaces.get(workspaceId)
+      if (!hs || !ws) return {}
+      const wsKey = `${host}::${workspaceId}`
+      const nextPending = new Map(s.pendingWorkspaceKills)
+      nextPending.set(wsKey, { hostId: host, workspace: ws })
+      const nextWorkspaces = new Map(hs.workspaces)
+      nextWorkspaces.delete(workspaceId)
+      const nextActive =
+        hs.activeWorkspaceId === workspaceId
+          ? [...nextWorkspaces.values()].sort((a, b) => a.name.localeCompare(b.name))[0]?.id ?? null
+          : hs.activeWorkspaceId
+      const nextSessions = new Map(s.sessions)
+      nextSessions.set(host, {
+        ...hs,
+        workspaces: nextWorkspaces,
+        activeWorkspaceId: nextActive,
+      })
+      return { sessions: nextSessions, pendingWorkspaceKills: nextPending }
+    }),
+  restorePendingWorkspaceKill: (key) =>
+    set((s) => {
+      const snap = s.pendingWorkspaceKills.get(key)
+      if (!snap) return {}
+      const hs = s.sessions.get(snap.hostId) ?? emptyHostSessions()
+      const nextWorkspaces = new Map(hs.workspaces)
+      nextWorkspaces.set(snap.workspace.id, snap.workspace)
+      const nextSessions = new Map(s.sessions)
+      nextSessions.set(snap.hostId, { ...hs, workspaces: nextWorkspaces })
+      const nextPending = new Map(s.pendingWorkspaceKills)
+      nextPending.delete(key)
+      return { sessions: nextSessions, pendingWorkspaceKills: nextPending }
+    }),
+  commitPendingWorkspaceKill: (key) =>
+    set((s) => {
+      if (!s.pendingWorkspaceKills.has(key)) return {}
+      const next = new Map(s.pendingWorkspaceKills)
+      next.delete(key)
+      return { pendingWorkspaceKills: next }
+    }),
+
+  runningPanes: new Map(),
+  markPaneRunning: (host, paneId, command) =>
+    set((s) => {
+      const key = `${host}::${paneId}`
+      const next = new Map(s.runningPanes)
+      next.set(key, { hostId: host, startedAt: Date.now(), command })
+      return { runningPanes: next }
+    }),
+  markPaneIdle: (host, paneId) =>
+    set((s) => {
+      const key = `${host}::${paneId}`
+      if (!s.runningPanes.has(key)) return {}
+      const next = new Map(s.runningPanes)
+      next.delete(key)
+      return { runningPanes: next }
+    }),
+  clearRunningForHost: (host) =>
+    set((s) => {
+      const prefix = `${host}::`
+      const next = new Map<string, { hostId: HostId; startedAt: number; command: string | null }>()
+      for (const [k, v] of s.runningPanes) {
+        if (!k.startsWith(prefix)) next.set(k, v)
+      }
+      return next.size === s.runningPanes.size ? {} : { runningPanes: next }
     }),
 
   toasts: [],
@@ -955,6 +1171,36 @@ export function notificationsForWindow(
   }
   out.sort((a, b) => a.created_at - b.created_at)
   return out
+}
+
+/** True when any pane in this window has an open command (we received
+ * a `command_start` marker that hasn't been closed by `command_done`).
+ * Walks the workspace's pane map filtered by windowId — cheap relative
+ * to the per-pane keys lookup we'd need to do otherwise. */
+export function isWindowRunning(
+  runningPanes: Map<string, { hostId: HostId; startedAt: number; command: string | null }>,
+  hostId: HostId,
+  workspace: TmuxWorkspace,
+  windowId: string,
+): boolean {
+  for (const pane of workspace.panes.values()) {
+    if (pane.windowId !== windowId) continue
+    if (runningPanes.has(`${hostId}::${pane.id}`)) return true
+  }
+  return false
+}
+
+/** True when any pane anywhere in this workspace is currently running
+ * a command. Used by the workspace-row activity dot. */
+export function isWorkspaceRunning(
+  runningPanes: Map<string, { hostId: HostId; startedAt: number; command: string | null }>,
+  hostId: HostId,
+  workspace: TmuxWorkspace,
+): boolean {
+  for (const pane of workspace.panes.values()) {
+    if (runningPanes.has(`${hostId}::${pane.id}`)) return true
+  }
+  return false
 }
 
 /** All notifications for a workspace (any window). Same window_id

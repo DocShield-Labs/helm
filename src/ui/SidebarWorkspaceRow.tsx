@@ -145,6 +145,20 @@ export function SidebarWorkspaceRow({
           +
         </span>
       )}
+      {onKill && (
+        <span
+          role="button"
+          aria-label="Kill workspace"
+          title="Kill workspace (⌘⇧W)"
+          onClick={(e) => {
+            e.stopPropagation()
+            onKill()
+          }}
+          className="cursor-pointer rounded-sm px-1 font-mono text-[12px] leading-none text-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 hover:bg-white/[0.06] hover:text-text-secondary"
+        >
+          ×
+        </span>
+      )}
       <ActivityDot state={activity} />
     </button>
   )
