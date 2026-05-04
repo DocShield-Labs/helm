@@ -1255,8 +1255,10 @@ integrations (pgcli, mosh, anything) drop in as a single trait impl.
 - Stable id + display name + description + post-install note + process
   names (matched against `pane_current_command`).
 - `is_installed`, `install`, `uninstall` — all idempotent, async, take
-  a primary `TmuxClient` for integrations that need to query/write
-  remote state.
+  a primary `TmuxClient` AND `Option<&Arc<SshSession>>`. Local
+  integrations ignore both and use `dirs::home_dir()` + `std::fs`;
+  remote-aware integrations use the SSH session to read/write remote
+  state via `SshSession::run_oneshot`.
 - `pane_matches(current_command) → bool` with a default impl that
   checks `process_names`. Override for tools that mutate their process
   title (e.g. Claude Code reports its semver as the title).
@@ -1268,15 +1270,22 @@ integrations (pgcli, mosh, anything) drop in as a single trait impl.
   `Notification` + `Stop` hooks emitting `printf '\a' > /dev/tty
   2>/dev/null || true`. Uninstall removes only entries matching our
   exact command — preserves any other hooks the user authored.
-- Atomic write (sibling tmp file + rename).
+- Atomic write (sibling tmp file + rename for local; staged-then-mv
+  via heredoc for remote).
 - `is_semver_like` heuristic for the process-title quirk: Claude Code
   reports `"2.1.126"` as `pane_current_command` instead of `"claude"`,
   so `pane_matches` accepts both the literal binary name AND any
   string matching `^[\d.]+$` containing at least one dot. False
   positives vanishingly rare; install is gated on a user click anyway.
-- v1 supports local hosts only (`host.port == 0`); remote returns an
-  error. Remote support is gated on adding a sync `SshSession::run_oneshot`
-  helper to `helm-ssh` for one-shot file ops.
+- **Local + remote both supported.** Local path uses
+  `dirs::home_dir()` + `std::fs`. Remote path uses
+  `SshSession::run_oneshot` over the existing SSH session — `cat
+  $HOME/.claude/settings.json 2>/dev/null || echo '{}'` to read,
+  `mkdir -p && echo '<base64>' | base64 -d > .tmp && mv .tmp
+  settings.json` to write atomically. base64 transport sidesteps
+  every shell-quoting concern (any byte the JSON contains survives
+  the round trip). Same idempotency + JSON-preservation guarantees
+  apply.
 
 **Detection (`detect_and_suggest`):**
 - Three triggers:
@@ -1306,6 +1315,17 @@ integrations (pgcli, mosh, anything) drop in as a single trait impl.
 - `HostEvent::ToolIntegrationSuggested` carries id + name + description
   + post-install note. Pushed by the backend, consumed by the frontend.
 
+**`helm-ssh::SshSession::run_oneshot`:**
+- New non-PTY exec path on the multi-channel session. Refactored the
+  request mpsc into a `SessionRequest` enum dispatching `Exec`
+  (existing PTY-bound channel for tmux clients) vs `OneShot` (new).
+  OneShot opens a session channel without PTY, exec's the command,
+  drains stdout/stderr/exit_code via `channel.wait().await`, returns
+  `OneShotResult { stdout, stderr, exit_code }`. Sync-blocking
+  `SshSession::run_oneshot(command)` for callers (helm-app's
+  ClaudeCodeIntegration today; future remote-aware integrations
+  next).
+
 **Frontend (`src/features/activity-feed/IntegrationSuggestionHost.tsx`):**
 - Sticky suggestion card bottom-right, separate from the regular Toast
   stack. Two buttons: `Install` / `Not now`. After install: card flips
@@ -1321,9 +1341,6 @@ integrations (pgcli, mosh, anything) drop in as a single trait impl.
   process name in unexpected ways won't be detected without an explicit
   `pane_matches` override. Claude is the first instance; future
   integrations may need similar special-casing.
-- **Remote integrations are local-only in v1.** Remote support requires
-  a sync `SshSession::run_oneshot` helper to read/write the remote
-  `~/.claude/settings.json`. Tracked for a follow-up.
 
 ### Lessons learned
 
@@ -1345,6 +1362,36 @@ integrations (pgcli, mosh, anything) drop in as a single trait impl.
   events, mouse events (DECSET 1006/1000), cursor-position responses,
   bracketed-paste markers. Real keystrokes still dismiss; xterm's
   background reports don't.
+
+- **`dismiss_for_panes` was wiping `pane_runtime` for live panes.**
+  `pane_runtime` caches the pane → window/session mapping populated by
+  `refresh_pane_index`. Both active-window suppression
+  (`upsert` reads `window_id` from runtime to compare against focus)
+  and dismiss-on-keystroke (`notification_dismiss_for_window` filters
+  panes by their cached `window_id`) depend on it. The original
+  `dismiss_for_panes` removed the runtime entry too, on the theory
+  that "dismissing a notification means we're done with this pane."
+  Wrong: dismissing a notification doesn't mean the pane is dead.
+  Consequence: after a Claude permission request was dismissed, the
+  next bell on the same pane created a notification with empty
+  `window_id` (fresh `or_default` runtime entry), so suppression
+  silently failed and the user got an inbox row even while staring
+  at the Claude window. And if they pressed Enter to approve, the
+  backend dismiss lookup found no matching panes (empty `window_id`
+  in cache) → notification stuck. Fixed by removing the line; only
+  `refresh_pane_index`'s stale-cleanup path now evicts runtime
+  entries (it's the only path with confirmation the pane is gone).
+
+- **base64 transport sidesteps shell quoting for remote file writes.**
+  Writing JSON over SSH via heredoc is a quoting nightmare —
+  embedded `$`, backticks, the heredoc terminator itself, all
+  hazards. For Claude's `~/.claude/settings.json`, instead of trying
+  to quote the JSON, we base64-encode helm-side and send
+  `echo '<b64>' | base64 -d > $HOME/.claude/settings.json.helm.tmp
+  && mv ... settings.json`. The base64 alphabet has nothing
+  shell-special; any byte the JSON contains survives the round trip.
+  Same trick we already use for the integration-script install
+  heredoc in `integration::remote_install_command`.
 
 ---
 
