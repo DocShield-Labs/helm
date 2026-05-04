@@ -101,6 +101,22 @@ pub enum SupervisorSignal {
     /// present without one. Coalesced if multiple clients fire it
     /// in quick succession.
     SessionsChanged,
+    /// A `%session-changed` notification carried a session id different
+    /// from the one this client was originally attached to. Tmux
+    /// migrated us — typically because our session was destroyed while
+    /// `detach-on-destroy` was set to `off|previous|next|no-detached`,
+    /// so instead of exiting cleanly the client got reattached to a
+    /// surviving session.
+    ///
+    /// The supervisor re-keys this client's entry from `from` to `to`,
+    /// or — if `to` already has its own client — aborts this redundant
+    /// one (otherwise both forwarders would pump the same `%output`
+    /// for `to` into the global event channel, producing N× echoed
+    /// input/output).
+    ClientMigrated {
+        from: String, /* session_id we were keyed under */
+        to: String,   /* session_id we're now attached to */
+    },
 }
 
 impl HostEntry {

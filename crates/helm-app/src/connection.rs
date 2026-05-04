@@ -279,11 +279,21 @@ fn spawn_session_client(
 /// Per-client forwarder. Drains the TmuxNotification receiver for one
 /// attached session, forwards each notification to the global event
 /// channel, post-processes `%output` markers, and signals the host
-/// supervisor on transport close + `%sessions-changed`.
+/// supervisor on transport close + `%sessions-changed` + tmux-driven
+/// session migration.
 ///
 /// Exits naturally when the receiver closes (transport EOF / `%exit`
 /// for this session). The supervisor handles the corresponding
 /// `clients` map mutation.
+///
+/// Migration tracking: tmux's first `%session-changed` after attach
+/// carries the session id we asked for, matching `current`. Subsequent
+/// `%session-changed` events with a different id mean tmux moved us
+/// to another session (typically because ours was destroyed under
+/// `detach-on-destroy off|previous|next|no-detached`). We fire
+/// `ClientMigrated` so the supervisor can re-key — or kill this client
+/// if the destination already has one — and update `current` so a
+/// later `ClientDied` is reported under the correct (latest) key.
 async fn client_forwarder_loop(
     host_id: HostId,
     session_id: String,
@@ -293,8 +303,22 @@ async fn client_forwarder_loop(
     sup_tx: mpsc::UnboundedSender<SupervisorSignal>,
     entry: SharedHostEntry,
 ) {
+    let mut current = session_id.clone();
     while let Some(n) = events.recv().await {
         let is_exit = matches!(n, TmuxNotification::Exit { .. });
+
+        // Detect tmux-driven session migration before forwarding.
+        // The supervisor still gets the raw notification too — the
+        // frontend's session_changed handler depends on it.
+        if let TmuxNotification::SessionChanged { session_id: new_sid, .. } = &n {
+            if new_sid != &current {
+                let _ = sup_tx.send(SupervisorSignal::ClientMigrated {
+                    from: current.clone(),
+                    to: new_sid.clone(),
+                });
+                current = new_sid.clone();
+            }
+        }
 
         if let TmuxNotification::Output {
             pane_id,
@@ -378,7 +402,10 @@ async fn client_forwarder_loop(
     }
     // Either the channel closed (transport drop) or we hit %exit.
     // Either way, signal the supervisor that this client is gone.
-    let _ = sup_tx.send(SupervisorSignal::ClientDied(session_id));
+    // Use `current` (not `session_id`) so a forwarder that was
+    // re-keyed via `%session-changed` reports under the key the
+    // supervisor knows it by.
+    let _ = sup_tx.send(SupervisorSignal::ClientDied(current));
 }
 
 /// Host supervisor — handles per-client deaths, incremental session
@@ -469,6 +496,22 @@ async fn supervise(
                             "supervisor: spawn_missing_clients failed for {host_id:?}: {e}"
                         );
                     }
+                    // Backstop: if a prior migration was missed (mid-
+                    // flight supervisor restart, race with a fresh
+                    // connect, etc.), two of our clients can end up
+                    // attached to the same session and silently
+                    // double-pump `%output`. Asking each client which
+                    // session it currently sees reconciles that.
+                    if let Err(e) =
+                        reconcile_client_sessions(&entry, host_id).await
+                    {
+                        tracing::warn!(
+                            "supervisor: reconcile_client_sessions failed for {host_id:?}: {e}"
+                        );
+                    }
+                }
+                SupervisorSignal::ClientMigrated { from, to } => {
+                    handle_client_migration(&entry, host_id, from, to).await;
                 }
             }
         }
@@ -715,6 +758,107 @@ async fn spawn_missing_clients(
         );
         let mut guard = entry.lock().await;
         guard.clients.insert(sid, client);
+    }
+    Ok(())
+}
+
+/// Re-key (or kill) a client whose tmux `-CC` process was migrated
+/// onto a different session. Called from the supervisor on
+/// `ClientMigrated`. `from` is the old session id we had this client
+/// keyed under in `clients`; `to` is the session id tmux just told
+/// the forwarder it's now attached to.
+///
+/// If `to` already has its own client, this one is redundant — both
+/// would forward `%output` for `to`'s panes, producing N× duplicated
+/// input/output. We abort the redundant forwarder; dropping the
+/// SessionClient drops the inner `Arc<TmuxClient>`, whose Drop kills
+/// the surplus `tmux -CC` process.
+async fn handle_client_migration(
+    entry: &SharedHostEntry,
+    host_id: HostId,
+    from: String,
+    to: String,
+) {
+    let mut guard = entry.lock().await;
+    let Some(client) = guard.clients.remove(&from) else {
+        return;
+    };
+    if guard.clients.contains_key(&to) {
+        tracing::info!(
+            "supervisor: client for {from} migrated onto already-attached {to} on {host_id:?}; aborting duplicate"
+        );
+        client.forwarder.abort();
+        drop(client);
+        // If `from` was the primary, the surviving client at `to` is
+        // a fine fallback — pick it explicitly so a stale primary id
+        // doesn't linger.
+        if guard.primary_session_id.as_deref() == Some(from.as_str()) {
+            guard.primary_session_id = Some(to);
+        }
+    } else {
+        tracing::info!(
+            "supervisor: re-keying client {from} → {to} on {host_id:?}"
+        );
+        guard.clients.insert(to.clone(), client);
+        if guard.primary_session_id.as_deref() == Some(from.as_str()) {
+            guard.primary_session_id = Some(to);
+        }
+    }
+}
+
+/// Backstop reconciler. Asks every helm-managed client which session
+/// it currently sees (`#{client_session}` via `display-message`) and
+/// collapses any duplicates that have ended up on the same target.
+///
+/// Forward-going correctness comes from `handle_client_migration`,
+/// which fires the moment tmux emits `%session-changed`. This pass
+/// catches the cases where that signal was missed: supervisor was
+/// restarted between the migration and our handling of it; a fresh
+/// `do_connect` raced an in-flight forwarder; or — pre-fix — the
+/// state machine simply didn't know about migration. Cheap: one
+/// roundtrip per client per `%sessions-changed`, which is rare.
+async fn reconcile_client_sessions(
+    entry: &SharedHostEntry,
+    host_id: HostId,
+) -> Result<(), String> {
+    // Snapshot (key, tmux) pairs outside the lock. We only hold the
+    // lock again at the end to mutate.
+    let snapshot: Vec<(String, Arc<TmuxClient>)> = {
+        let g = entry.lock().await;
+        g.clients
+            .iter()
+            .map(|(k, c)| (k.clone(), c.tmux.clone()))
+            .collect()
+    };
+    if snapshot.len() < 2 {
+        return Ok(());
+    }
+    // Ask each one which session it actually sees right now.
+    let mut actual: Vec<(String, String)> = Vec::with_capacity(snapshot.len());
+    for (key, tmux) in snapshot {
+        match tmux
+            .send_command("display-message -p '#{client_session}'")
+            .await
+        {
+            Ok(s) => {
+                let live = s.trim().to_string();
+                if !live.is_empty() {
+                    actual.push((key, live));
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "reconcile: client {key} on {host_id:?} did not answer display-message: {e}"
+                );
+            }
+        }
+    }
+    // Apply migrations one by one through the existing handler so the
+    // primary-promotion + redundant-kill logic stays in one place.
+    for (key, live) in actual {
+        if key != live {
+            handle_client_migration(entry, host_id, key, live).await;
+        }
     }
     Ok(())
 }

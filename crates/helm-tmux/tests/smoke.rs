@@ -135,9 +135,18 @@ async fn window_add_notification_fires() {
 async fn send_keys_hex_round_trip() {
     let (session, client, _events) = fresh_session().await;
 
-    // `<session>:0.0` is "first pane of first window in this session" —
-    // scoped to the session we just created.
-    let pane_target = format!("{}:0.0", session);
+    // Query the session's first pane id rather than assuming index 0
+    // — users with `base-index 1` / `pane-base-index 1` set break
+    // any hard-coded `0.0` target.
+    let pane_target = client
+        .send_command(format!(
+            "display-message -t '{}' -p '#{{pane_id}}'",
+            session
+        ))
+        .await
+        .expect("display-message pane_id")
+        .trim()
+        .to_string();
 
     client
         .send_keys(&pane_target, b"echo helm\n")
