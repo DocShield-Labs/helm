@@ -401,7 +401,7 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
       )}
       <div
         ref={hostRef}
-        className="absolute inset-0 overflow-hidden pl-8 pr-3 py-2"
+        className="absolute inset-0 overflow-hidden pl-6 pr-2 py-2"
       />
       {termRef.current && hostRef.current && (
         <BlockOverlay

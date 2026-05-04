@@ -114,7 +114,7 @@ export function TerminalScrollbar({ term }: Props) {
     <div
       ref={trackRef}
       onMouseDown={onTrackMouseDown}
-      className="pointer-events-auto absolute right-1 top-2 bottom-2 z-30 w-2 rounded-full"
+      className="pointer-events-auto absolute right-0 top-2 bottom-2 z-30 w-2 rounded-full"
       style={{ background: 'rgba(255,255,255,0.02)' }}
     >
       <div

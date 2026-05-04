@@ -51,14 +51,14 @@ interface Props {
   onJumpTo: (line: number) => void
 }
 
-/** xterm host has `pl-8 pr-3 pt-2 pb-[88px]`. Coordinates here are
+/** xterm host has `pl-6 pr-2 py-2`. Coordinates here are
  * relative to the OUTER pane wrapper (the same parent xterm sits in),
  * so we offset by the host's padding to line up with rendered rows. */
 const HOST_PADDING_TOP = 8
-const HOST_PADDING_LEFT = 32
+const HOST_PADDING_LEFT = 24
 /** Distance from the screen edge to the centre of the left border.
  * Sits inside the xterm padding gap so it can't be occluded by glyphs. */
-const BORDER_LEFT = 14
+const BORDER_LEFT = 10
 /** Gap between the end of the shell-printed header text and the
  * inline running/exit chip. */
 const HEADER_CHIP_GAP_CELLS = 2
