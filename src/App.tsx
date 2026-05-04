@@ -415,7 +415,14 @@ export function App() {
         {activePane?.cwd && (
           <>
             <StatusBarDivider />
-            <StatusBarSegment>
+            <StatusBarSegment
+              onClick={
+                activeHost?.port === 0
+                  ? () => void commands.revealInFinder(activePane.cwd!)
+                  : undefined
+              }
+              title={activeHost?.port === 0 ? 'Reveal in Finder' : undefined}
+            >
               <span className="font-mono text-[11px] text-text-secondary">
                 {prettyPath(activePane.cwd)}
               </span>

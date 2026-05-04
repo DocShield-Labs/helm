@@ -1,6 +1,8 @@
 /**
- * StatusBarSegment — generic clickable segment in the status bar.
- * Hover lifts the segment with a 4% white tint; never with the accent.
+ * StatusBarSegment — segment in the status bar. Interactive (button +
+ * 4% white-tint hover) when an `onClick` is supplied, otherwise a flat
+ * non-interactive `<div>` so segments without an action don't lie about
+ * being clickable.
  */
 
 import type { ReactNode } from 'react'
@@ -12,6 +14,13 @@ export interface StatusBarSegmentProps {
 }
 
 export function StatusBarSegment({ children, onClick, title }: StatusBarSegmentProps) {
+  if (!onClick) {
+    return (
+      <div title={title} className="flex h-6 items-center gap-2 px-3">
+        {children}
+      </div>
+    )
+  }
   return (
     <button
       type="button"

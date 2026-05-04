@@ -23,6 +23,7 @@ use crate::state::{AppState, SharedHostEntry};
 
 pub mod host;
 pub mod notifications;
+pub mod system;
 pub mod tmux;
 pub mod tools;
 

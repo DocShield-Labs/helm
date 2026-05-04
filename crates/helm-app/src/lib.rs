@@ -58,6 +58,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::tools::tool_integration_install,
         commands::tools::tool_integration_uninstall,
         commands::tools::tool_integration_dismiss,
+        commands::system::reveal_in_finder,
     ])
 }
 
