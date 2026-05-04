@@ -28,3 +28,6 @@ crates/helm-app/gen/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# claude code harness (local state, runtime locks, conversation history)
+.claude/
