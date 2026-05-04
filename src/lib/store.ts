@@ -241,6 +241,15 @@ interface HelmState {
   peekedInboxId: NotificationId | null
   setPeekedInboxId: (id: NotificationId | null) => void
 
+  /** Notification whose peek is mid-merge into the main pane after a
+   * click. While set, the peek panel runs its dissolve animation
+   * (scale + blur + opacity) instead of unmounting cleanly — so the
+   * user perceives one continuous transition from peek → live pane.
+   * NotificationPeek clears this along with peekedInboxId once the
+   * animation timer fires. */
+  mergingInboxId: NotificationId | null
+  setMergingInboxId: (id: NotificationId | null) => void
+
   // ---------- tool integration suggestions ----------
   /** Sticky cards prompting the user to install a tool integration
    * (e.g. Claude Code's bell hooks). Pushed by the backend when it
@@ -663,6 +672,9 @@ export const useStore = create<HelmState>((set, get) => ({
 
   peekedInboxId: null,
   setPeekedInboxId: (id) => set({ peekedInboxId: id }),
+
+  mergingInboxId: null,
+  setMergingInboxId: (id) => set({ mergingInboxId: id }),
 
   toolSuggestions: [],
   pushToolSuggestion: (sug) =>

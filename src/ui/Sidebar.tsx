@@ -110,34 +110,26 @@ function ExpandedSidebar({
   const effectiveTab = sidebarTab === 'pinned' && pinnedWindows.length === 0 ? 'hosts' : sidebarTab
 
   return (
-    <div className="flex flex-1 flex-col gap-1 overflow-y-auto p-3">
+    <>
+    {/* Scrollable content area. The collapse chevron lives in its
+        own bottom bar (below this) — pulled out of the tab strip so
+        it sits in the same vertical region as the expand chevron in
+        the collapsed rail. State changes don't move the affordance. */}
+    <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3">
       <InboxSection />
 
-      {/* Tab strip: tabs left, persistent collapse button right. The
-          collapse affordance lives here (not in the HOSTS eyebrow) so
-          it's always reachable regardless of which tab is showing. */}
-      <div className="flex items-center justify-between border-b border-white/[0.04] pb-px">
-        <div className="flex items-center">
-          <TabButton
-            label="Pinned"
-            count={pinnedWindows.length}
-            active={effectiveTab === 'pinned'}
-            onClick={() => setSidebarTab('pinned')}
-          />
-          <TabButton
-            label="Hosts"
-            active={effectiveTab === 'hosts'}
-            onClick={() => setSidebarTab('hosts')}
-          />
-        </div>
-        <button
-          type="button"
-          onClick={onCollapse}
-          className="rounded-sm px-1.5 py-1 font-mono text-[12px] leading-none text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
-          title="Collapse sidebar (⌘\)"
-        >
-          ⇤
-        </button>
+      <div className="flex items-center border-b border-white/[0.04] pb-px">
+        <TabButton
+          label="Pinned"
+          count={pinnedWindows.length}
+          active={effectiveTab === 'pinned'}
+          onClick={() => setSidebarTab('pinned')}
+        />
+        <TabButton
+          label="Hosts"
+          active={effectiveTab === 'hosts'}
+          onClick={() => setSidebarTab('hosts')}
+        />
       </div>
 
       {effectiveTab === 'pinned' ? (
@@ -302,6 +294,22 @@ function ExpandedSidebar({
         </>
       )}
     </div>
+
+    {/* Persistent bottom bar — collapse chevron sits here so its
+        screen position matches the expand chevron in the collapsed
+        rail. Right-aligned so the ⇤ glyph (pointing left) anchors at
+        the right edge it's pointing away from. */}
+    <div className="flex shrink-0 justify-end px-3 pt-1 pb-2">
+      <button
+        type="button"
+        onClick={onCollapse}
+        className="rounded-sm px-2 py-1 font-mono text-[12px] leading-none text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+        title="Collapse sidebar (⌘\)"
+      >
+        ⇤
+      </button>
+    </div>
+    </>
   )
 }
 

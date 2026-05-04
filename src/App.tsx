@@ -89,6 +89,20 @@ export function App() {
         setActiveHost(localId)
 
         await connectHost(localId)
+
+        // Pre-connect every remote host that has a pin so the user's
+        // working set comes alive immediately on launch — no need to
+        // click each pin to wake it up. Fired in parallel; errors are
+        // silenced because a stuck remote shouldn't block boot, and
+        // the row will just resolve to "offline · click to connect"
+        // if the auto-connect fails.
+        const seen = new Set<string>([localId])
+        for (const pin of useStore.getState().pinnedWindows) {
+          if (seen.has(pin.hostId)) continue
+          seen.add(pin.hostId)
+          if (!useStore.getState().hosts.has(pin.hostId)) continue
+          void connectHost(pin.hostId).catch(() => {})
+        }
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e)
         setBootError(msg)

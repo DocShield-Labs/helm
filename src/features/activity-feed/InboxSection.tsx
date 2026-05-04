@@ -89,6 +89,14 @@ export function InboxSection() {
   const hasItems = list.length > 0
 
   const onJump = (n: Notification) => {
+    // If the peek is currently showing this notification, hand off
+    // to the merge animation: keep the panel visible while the new
+    // pane mounts behind it, then dissolve. NotificationPeek owns
+    // the timer that clears both ids when the animation finishes.
+    const state = useStore.getState()
+    if (state.peekedInboxId === n.id) {
+      state.setMergingInboxId(n.id)
+    }
     setActiveHost(n.host_id)
     const hs = sessions.get(n.host_id)
     // Resolve workspace_id + window_id from whatever the notification
@@ -214,6 +222,13 @@ function InboxRow({
     <button
       type="button"
       onClick={onJump}
+      // Always fire — the suppression of "don't show peek when viewing
+      // the same window" lives inside NotificationPeek's render
+      // condition. Gating it here breaks the re-hover case: if the
+      // mouse stays on the row while active flips back via keyboard
+      // or sidebar click, mouseEnter never re-fires, so a row-level
+      // gate would leave the peek silently disarmed until the user
+      // does a manual mouse-out / mouse-in cycle.
       onMouseEnter={onPeekEnter}
       onMouseLeave={onPeekLeave}
       className={`group relative flex w-full flex-col items-stretch gap-0.5 rounded-md px-2 py-1.5 text-left ${
