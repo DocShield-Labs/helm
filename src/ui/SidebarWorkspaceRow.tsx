@@ -36,7 +36,9 @@ export function SidebarWorkspaceRow({
   onAddWindow,
 }: SidebarWorkspaceRowProps) {
   const isActive = state === 'active'
-  const bg = isActive ? 'bg-accent-muted' : state === 'hover' ? 'bg-white/[0.025]' : ''
+  // Workspaces get the lightest tier (5%) so a selected workspace
+  // doesn't visually outweigh a selected window inside it.
+  const bg = isActive ? 'bg-accent-muted-workspace' : state === 'hover' ? 'bg-white/[0.025]' : ''
 
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(name)

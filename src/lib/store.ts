@@ -125,6 +125,25 @@ interface HelmState {
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
 
+  /** Which tab is showing in the expanded sidebar's body. `pinned` is
+   * the user's curated working set (windows pinned across hosts);
+   * `hosts` is the full host/workspace/window tree. Persisted. */
+  sidebarTab: 'pinned' | 'hosts'
+  setSidebarTab: (tab: 'pinned' | 'hosts') => void
+
+  // ---------- pinned windows ----------
+  /** User's pinned windows — the working set surfaced in the Pinned
+   * tab. Identity is `{hostId, workspaceName, windowId}`: workspace by
+   * name (resilient to session-id churn after disconnect), window by id
+   * (specific within the session). When the underlying window dies the
+   * pin shows as stale and the user can remove it explicitly.
+   * Persisted via localStorage. */
+  pinnedWindows: PinnedWindow[]
+  addPinnedWindow: (pin: PinnedWindow) => void
+  removePinnedWindow: (key: string) => void
+  /** True when there's a pinned entry matching this window's identity. */
+  isWindowPinned: (hostId: HostId, workspaceName: string, windowId: string) => boolean
+
   // ---------- hosts ----------
   hosts: Map<HostId, Host>
   statuses: Map<HostId, HostStatus>
@@ -215,6 +234,13 @@ interface HelmState {
    * event path. */
   dismissNotificationsForHost: (hostId: HostId) => void
 
+  /** Notification currently being hover-peeked. Drives the
+   * NotificationPeek overlay that slides down over the main pane to
+   * show the source window's recent text without requiring a click.
+   * Set on mouse-enter of an inbox row, cleared on leave (debounced). */
+  peekedInboxId: NotificationId | null
+  setPeekedInboxId: (id: NotificationId | null) => void
+
   // ---------- tool integration suggestions ----------
   /** Sticky cards prompting the user to install a tool integration
    * (e.g. Claude Code's bell hooks). Pushed by the backend when it
@@ -234,6 +260,29 @@ export interface ToolIntegrationSuggestion {
   name: string
   description: string
   postInstallNote: string
+}
+
+/** A window the user has pinned to their working-set view. We store the
+ * display labels (hostName, workspaceName, windowName) at pin time so a
+ * stale entry — host removed, workspace renamed, window killed — still
+ * has something readable to show before the user clears it.
+ *
+ * Resolution at render time: find host by id → find session by name →
+ * find window by id. Any miss = stale. */
+export interface PinnedWindow {
+  hostId: HostId
+  workspaceName: string
+  windowId: string
+  /** Snapshot labels captured when the pin was created. */
+  hostName: string
+  windowName: string
+}
+
+/** Stable key for a pin. Using both ids keeps localhost+remote pins
+ * distinct even if their tmux ids happen to collide (they won't, but
+ * defensive). */
+export function pinnedKey(hostId: HostId, workspaceName: string, windowId: string): string {
+  return `${hostId}::${workspaceName}::${windowId}`
 }
 
 function withHostSessions(
@@ -275,7 +324,50 @@ const writeCollapsed = (v: boolean) => {
   }
 }
 
-export const useStore = create<HelmState>((set) => ({
+const PINNED_WINDOWS_KEY = 'helm.pinnedWindows'
+const readPinnedWindows = (): PinnedWindow[] => {
+  try {
+    const raw = localStorage.getItem(PINNED_WINDOWS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (p): p is PinnedWindow =>
+        typeof p === 'object' &&
+        p !== null &&
+        typeof p.hostId === 'string' &&
+        typeof p.workspaceName === 'string' &&
+        typeof p.windowId === 'string',
+    )
+  } catch {
+    return []
+  }
+}
+const writePinnedWindows = (pins: PinnedWindow[]) => {
+  try {
+    localStorage.setItem(PINNED_WINDOWS_KEY, JSON.stringify(pins))
+  } catch {
+    /* ignore — pins are best-effort */
+  }
+}
+
+const SIDEBAR_TAB_KEY = 'helm.sidebarTab'
+/** Default tab is `hosts` until the user has pinned something — an
+ * empty Pinned tab as the landing page would feel broken on first run. */
+const readSidebarTab = (hasPins: boolean): 'pinned' | 'hosts' => {
+  try {
+    const v = localStorage.getItem(SIDEBAR_TAB_KEY)
+    if (v === 'pinned' || v === 'hosts') return v
+  } catch { /* fall through */ }
+  return hasPins ? 'pinned' : 'hosts'
+}
+const writeSidebarTab = (tab: 'pinned' | 'hosts') => {
+  try {
+    localStorage.setItem(SIDEBAR_TAB_KEY, tab)
+  } catch { /* ignore */ }
+}
+
+export const useStore = create<HelmState>((set, get) => ({
   bootstrap: { ready: false, message: '' },
   setBootstrap: (b) => set({ bootstrap: b }),
 
@@ -290,6 +382,41 @@ export const useStore = create<HelmState>((set) => ({
       writeCollapsed(next)
       return { sidebarCollapsed: next }
     }),
+
+  // Pin-aware tab default — first run with pins lands you on Pinned;
+  // first run without pins lands on Hosts so the body isn't empty.
+  pinnedWindows: readPinnedWindows(),
+  sidebarTab: readSidebarTab(readPinnedWindows().length > 0),
+  setSidebarTab: (tab) => {
+    writeSidebarTab(tab)
+    set({ sidebarTab: tab })
+  },
+  addPinnedWindow: (pin) =>
+    set((s) => {
+      const k = pinnedKey(pin.hostId, pin.workspaceName, pin.windowId)
+      // Idempotent: re-pinning is a no-op rather than a duplicate.
+      if (s.pinnedWindows.some(p => pinnedKey(p.hostId, p.workspaceName, p.windowId) === k)) {
+        return s
+      }
+      const next = [...s.pinnedWindows, pin]
+      writePinnedWindows(next)
+      return { pinnedWindows: next }
+    }),
+  removePinnedWindow: (key) =>
+    set((s) => {
+      const next = s.pinnedWindows.filter(
+        p => pinnedKey(p.hostId, p.workspaceName, p.windowId) !== key,
+      )
+      if (next.length === s.pinnedWindows.length) return s
+      writePinnedWindows(next)
+      return { pinnedWindows: next }
+    }),
+  isWindowPinned: (hostId, workspaceName, windowId) => {
+    const k = pinnedKey(hostId, workspaceName, windowId)
+    return get().pinnedWindows.some(
+      p => pinnedKey(p.hostId, p.workspaceName, p.windowId) === k,
+    )
+  },
 
   hosts: new Map(),
   statuses: new Map(),
@@ -533,6 +660,9 @@ export const useStore = create<HelmState>((set) => ({
       }
       return changed ? { notifications: next } : {}
     }),
+
+  peekedInboxId: null,
+  setPeekedInboxId: (id) => set({ peekedInboxId: id }),
 
   toolSuggestions: [],
   pushToolSuggestion: (sug) =>

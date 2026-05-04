@@ -12,13 +12,10 @@ export interface SidebarHostRowProps {
   status: StatusDotState
   state?: SidebarHostRowState
   expanded?: boolean
-  dim?: boolean
   /** Number of pending inbox notifications belonging to this host.
    * Renders as a small badge to the right of the status dot when > 0. */
   notificationCount?: number
   onClick?: () => void
-  onToggleExpand?: () => void
-  onAddWorkspace?: () => void
   /** Double-click handler (used to open the host editor). */
   onEdit?: () => void
   /** Right-click handler (used to confirm + delete the host). */
@@ -30,14 +27,20 @@ export function SidebarHostRow({
   status,
   state = 'rest',
   expanded = false,
-  dim = false,
   notificationCount = 0,
   onClick,
   onEdit,
   onContextMenu,
 }: SidebarHostRowProps) {
+  // Selected hosts get the lightest accent fill (6%) — they sit
+  // visually outside the workspace/window selection so a stronger
+  // tint would compete with a selected child below.
   const bg =
-    state === 'active' ? 'bg-accent-muted' : state === 'hover' ? 'bg-white/[0.025]' : ''
+    state === 'active'
+      ? 'bg-accent-muted-host'
+      : state === 'hover'
+        ? 'bg-white/[0.025]'
+        : ''
   return (
     <button
       type="button"
@@ -55,7 +58,6 @@ export function SidebarHostRow({
         }
       }}
       className={`flex h-[30px] w-full items-center gap-2 rounded-md px-2 ${bg}
-                  ${dim ? 'opacity-50' : ''}
                   text-text-primary hover:bg-white/[0.025]`}
     >
       <span className="font-mono text-[10px] text-text-tertiary">{expanded ? '▾' : '▸'}</span>

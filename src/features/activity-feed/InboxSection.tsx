@@ -16,11 +16,12 @@
  * user can investigate without losing their list.
  */
 
-import { useMemo } from 'react'
+import { useMemo, useRef } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
 import { commands } from '@lib/ipc'
-import { useStore, workspaceForWindow } from '@lib/store'
+import { useStore, workspaceForWindow, type HostSessions } from '@lib/store'
 import { selectWorkspace } from '@lib/host'
-import type { Host, Notification, NotificationKind } from '@bindings'
+import type { Host, Notification, NotificationId, NotificationKind } from '@bindings'
 
 export function InboxSection() {
   const notifications = useStore((s) => s.notifications)
@@ -28,17 +29,64 @@ export function InboxSection() {
   const sessions = useStore((s) => s.sessions)
   const setActiveHost = useStore((s) => s.setActiveHost)
   const setActiveWindow = useStore((s) => s.setActiveWindow)
+  const activeHostId = useStore((s) => s.activeHostId)
 
-  // Sort oldest first — the user reads top-to-bottom and expects the
-  // thing they were waiting on longest to be at the top. New events
-  // append at the bottom.
+  // Hover-peek glue: a single shared close timer at the section level
+  // so quickly traversing rows doesn't flicker the preview.
+  const setPeekedInboxId = useStore((s) => s.setPeekedInboxId)
+  const peekTimer = useRef<number | null>(null)
+  const cancelPeekClose = () => {
+    if (peekTimer.current !== null) {
+      window.clearTimeout(peekTimer.current)
+      peekTimer.current = null
+    }
+  }
+  const onPeekEnter = (id: NotificationId) => {
+    cancelPeekClose()
+    setPeekedInboxId(id)
+  }
+  const onPeekLeave = () => {
+    cancelPeekClose()
+    peekTimer.current = window.setTimeout(() => {
+      setPeekedInboxId(null)
+      peekTimer.current = null
+    }, 120)
+  }
+
+  /** True when this notification's window is the user's currently-
+   * active pane — used to highlight the matching inbox row so the
+   * user can tell which entry corresponds to the pane they're viewing.
+   * Especially valuable in Pinned mode where the source might not be
+   * in the pinned list. */
+  const isSelected = (n: Notification): boolean => {
+    if (activeHostId !== n.host_id) return false
+    const hs = sessions.get(n.host_id)
+    if (!hs) return false
+    const ws = hs.activeWorkspaceId ? hs.workspaces.get(hs.activeWorkspaceId) : undefined
+    if (!ws) return false
+    for (const w of ws.windows.values()) {
+      if (w.active && w.id === n.window_id) return true
+    }
+    return false
+  }
+
+  // Newest first. New events drop onto the top of the stack from
+  // above, pushing older items down — matches how the rest of the
+  // app shows time-ordered surfaces (chat-style "latest at top").
   const list = useMemo(() => {
     const out = [...notifications.values()]
-    out.sort((a, b) => a.created_at - b.created_at)
+    out.sort((a, b) => b.created_at - a.created_at)
     return out
   }, [notifications])
 
-  if (list.length === 0) return null
+  // We *always* render the wrapper + AnimatePresence so the section
+  // doesn't unmount when the inbox empties. Unmounting kills
+  // AnimatePresence's lifecycle memory — the next arriving notification
+  // would mount fresh with initial={false} and skip its drop-in
+  // animation. Conditionally rendering only the header and divider
+  // keeps the visual identical to "return null" while preserving
+  // animation continuity.
+  const hasItems = list.length > 0
 
   const onJump = (n: Notification) => {
     setActiveHost(n.host_id)
@@ -85,30 +133,56 @@ export function InboxSection() {
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="group flex items-center justify-between pb-1 pt-1 pl-2 pr-1">
-        <span className="text-[10px] font-medium tracking-[0.08em] text-text-tertiary">
-          INBOX · {list.length}
-        </span>
-        <button
-          type="button"
-          onClick={onClearAll}
-          className="rounded-sm px-1.5 font-mono text-[10px] leading-none text-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 hover:bg-white/[0.04] hover:text-text-secondary"
-          title="Clear all notifications"
-        >
-          clear
-        </button>
-      </div>
-      {list.map((n) => (
-        <InboxRow
-          key={n.id}
-          notification={n}
-          host={hosts.get(n.host_id)}
-          windowName={resolveWindowName(sessions.get(n.host_id), n)}
-          onJump={() => onJump(n)}
-          onDismiss={() => onDismiss(n)}
-        />
-      ))}
-      <div className="my-1 border-t border-white/[0.06]" />
+      {hasItems && (
+        <div className="group flex items-center justify-between pb-1 pt-1 pl-2 pr-1">
+          <span className="text-[10px] font-medium tracking-[0.08em] text-text-tertiary">
+            INBOX · {list.length}
+          </span>
+          <button
+            type="button"
+            onClick={onClearAll}
+            className="rounded-sm px-1.5 font-mono text-[10px] leading-none text-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 hover:bg-white/[0.04] hover:text-text-secondary"
+            title="Clear all notifications"
+          >
+            clear
+          </button>
+        </div>
+      )}
+      <AnimatePresence initial={false}>
+        {list.map((n) => (
+          <motion.div
+            key={n.id}
+            // Enter: drop in from above, push items below down via the
+            // height transition. Exit: slide left + fade + collapse so
+            // the list closes the gap as it leaves.
+            initial={{ opacity: 0, height: 0, y: -8 }}
+            animate={{ opacity: 1, height: 'auto', y: 0 }}
+            exit={{ opacity: 0, height: 0, x: -32 }}
+            transition={{
+              opacity: { duration: 0.18 },
+              height: { duration: 0.22, ease: [0.2, 0.7, 0.2, 1] },
+              y: { duration: 0.22, ease: [0.2, 0.7, 0.2, 1] },
+              x: { duration: 0.18, ease: [0.4, 0, 1, 1] },
+            }}
+            // overflow-hidden so the height collapse clips the row's
+            // own padding instead of letting it bleed during the
+            // transition (otherwise rows look like they're squashing).
+            style={{ overflow: 'hidden' }}
+          >
+            <InboxRow
+              notification={n}
+              host={hosts.get(n.host_id)}
+              windowName={resolveWindowName(sessions.get(n.host_id), n)}
+              selected={isSelected(n)}
+              onJump={() => onJump(n)}
+              onDismiss={() => onDismiss(n)}
+              onPeekEnter={() => onPeekEnter(n.id)}
+              onPeekLeave={onPeekLeave}
+            />
+          </motion.div>
+        ))}
+      </AnimatePresence>
+      {hasItems && <div className="my-1 border-t border-white/[0.06]" />}
     </div>
   )
 }
@@ -117,16 +191,22 @@ interface InboxRowProps {
   notification: Notification
   host: Host | undefined
   windowName: string
+  selected: boolean
   onJump: () => void
   onDismiss: () => void
+  onPeekEnter: () => void
+  onPeekLeave: () => void
 }
 
 function InboxRow({
   notification: n,
   host,
   windowName,
+  selected,
   onJump,
   onDismiss,
+  onPeekEnter,
+  onPeekLeave,
 }: InboxRowProps) {
   const tone = notificationTone(n.kind)
 
@@ -134,7 +214,11 @@ function InboxRow({
     <button
       type="button"
       onClick={onJump}
-      className="group relative flex w-full flex-col items-stretch gap-0.5 rounded-md px-2 py-1.5 text-left hover:bg-white/[0.04]"
+      onMouseEnter={onPeekEnter}
+      onMouseLeave={onPeekLeave}
+      className={`group relative flex w-full flex-col items-stretch gap-0.5 rounded-md px-2 py-1.5 text-left ${
+        selected ? 'bg-accent-muted' : 'hover:bg-white/[0.04]'
+      }`}
     >
       <div className="flex items-center gap-2">
         <span
@@ -232,12 +316,7 @@ function formatMs(ms: number): string {
 /** Best-effort resolution: prefer the live tree (always current names)
  * via window_id, fall back to pane_id lookup when window_id wasn't
  * populated, fall back to the raw window_id, fall back to '?'. */
-function resolveWindowName(
-  hs: ReturnType<typeof useStore.getState>['sessions'] extends Map<infer _K, infer V>
-    ? V | undefined
-    : never,
-  n: Notification,
-): string {
+function resolveWindowName(hs: HostSessions | undefined, n: Notification): string {
   if (!hs) return n.window_id || '?'
   if (n.window_id) {
     for (const ws of hs.workspaces.values()) {

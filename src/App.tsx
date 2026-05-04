@@ -22,10 +22,12 @@ import {
   type TmuxWorkspace,
 } from '@lib/store'
 import { connectHost, selectWorkspace, subscribeHostEvents } from '@lib/host'
+import { displayedHostStatus } from '@lib/host-status'
 import { TmuxPane } from '@features/shell/TmuxPane'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
 import { HostKeyPromptModal } from '@features/host-key/HostKeyPromptModal'
 import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSuggestionHost'
+import { NotificationPeek } from '@features/activity-feed/NotificationPeek'
 import { ReconnectingOverlay } from '@features/workspace/ReconnectingOverlay'
 import {
   Sidebar,
@@ -224,26 +226,38 @@ export function App() {
         case ']':
         case 'arrowright': {
           e.preventDefault()
-          const next = neighbourWindowId(windowList, activeWindow?.id, +1)
-          if (next) {
-            void commands.tmuxSelectWindow(activeHostId, next).then((res) => {
-              if (res.status !== 'ok') {
-                console.warn('tmux_select_window failed:', res.error)
-              }
-            })
+          // In Pinned mode, cycle through the user's working set
+          // across hosts. Otherwise, cycle within the active workspace.
+          const state = useStore.getState()
+          if (state.sidebarTab === 'pinned' && state.pinnedWindows.length > 0) {
+            void cyclePinnedWindow(+1)
+          } else {
+            const next = neighbourWindowId(windowList, activeWindow?.id, +1)
+            if (next) {
+              void commands.tmuxSelectWindow(activeHostId, next).then((res) => {
+                if (res.status !== 'ok') {
+                  console.warn('tmux_select_window failed:', res.error)
+                }
+              })
+            }
           }
           return
         }
         case '[':
         case 'arrowleft': {
           e.preventDefault()
-          const prev = neighbourWindowId(windowList, activeWindow?.id, -1)
-          if (prev) {
-            void commands.tmuxSelectWindow(activeHostId, prev).then((res) => {
-              if (res.status !== 'ok') {
-                console.warn('tmux_select_window failed:', res.error)
-              }
-            })
+          const state = useStore.getState()
+          if (state.sidebarTab === 'pinned' && state.pinnedWindows.length > 0) {
+            void cyclePinnedWindow(-1)
+          } else {
+            const prev = neighbourWindowId(windowList, activeWindow?.id, -1)
+            if (prev) {
+              void commands.tmuxSelectWindow(activeHostId, prev).then((res) => {
+                if (res.status !== 'ok') {
+                  console.warn('tmux_select_window failed:', res.error)
+                }
+              })
+            }
           }
           return
         }
@@ -384,6 +398,7 @@ export function App() {
           {activeHost && activeStatus === 'reconnecting' && (
             <ReconnectingOverlay host={activeHost} />
           )}
+          <NotificationPeek />
         </main>
       </div>
 
@@ -477,6 +492,45 @@ function jumpToOldestNotification(): void {
     void selectWorkspace(oldest.hostId, ws.id)
   }
   void commands.tmuxSelectWindow(oldest.hostId, oldest.windowId)
+}
+
+/** Cmd+] / Cmd+[ in Pinned mode — walk the user's pinned working set
+ * across hosts. Skips stale/loading pins so the user can't get stuck on
+ * a pin whose window doesn't exist anymore; if every pin is unreachable
+ * (rare), we just leave the active selection alone. */
+async function cyclePinnedWindow(dir: 1 | -1): Promise<void> {
+  const state = useStore.getState()
+  const pins = state.pinnedWindows
+  if (pins.length === 0) return
+
+  // Resolve which pin (if any) is currently active so we can step from it.
+  const curIdx = pins.findIndex((p) => {
+    if (p.hostId !== state.activeHostId) return false
+    const hs = state.sessions.get(p.hostId)
+    if (!hs) return false
+    const ws = [...hs.workspaces.values()].find((w) => w.name === p.workspaceName)
+    if (!ws || hs.activeWorkspaceId !== ws.id) return false
+    const win = ws.windows.get(p.windowId)
+    return !!win && win.active
+  })
+
+  // Try every pin once starting from the next slot — skipping any that
+  // don't resolve so we don't land on a stale row.
+  const start = curIdx === -1 ? (dir > 0 ? 0 : pins.length - 1) : curIdx + dir
+  for (let i = 0; i < pins.length; i++) {
+    const idx = ((start + i * dir) % pins.length + pins.length) % pins.length
+    const target = pins[idx]
+    const hs = state.sessions.get(target.hostId)
+    const ws = hs ? [...hs.workspaces.values()].find((w) => w.name === target.workspaceName) : undefined
+    const win = ws?.windows.get(target.windowId)
+    if (!ws || !win) continue // stale or loading; skip
+
+    state.setActiveHost(target.hostId)
+    state.setActiveWindow(target.hostId, ws.id, win.id)
+    await selectWorkspace(target.hostId, ws.id)
+    void commands.tmuxSelectWindow(target.hostId, win.id)
+    return
+  }
 }
 
 /** Pick a free `workspace N` name and create it on the host. */
@@ -624,45 +678,5 @@ function neighbourWindowId(
   if (idx < 0) return undefined
   const next = (idx + direction + stable.length) % stable.length
   return stable[next].id
-}
-
-function hostRowStatus(
-  status: HostStatus,
-  detached: string | null,
-): 'connected' | 'connecting' | 'disconnected' | 'error' {
-  if (detached) return 'disconnected'
-  if (status === 'connected' || status === 'idle') return 'connected'
-  // `reconnecting` collapses to the amber `connecting` color — the
-  // overlay tells the user *why*; the dot just signals "in flight".
-  if (status === 'connecting' || status === 'reconnecting') return 'connecting'
-  if (status === 'error') return 'error'
-  return 'disconnected'
-}
-
-/**
- * Localhost displays a softened status: when the tmux client is healthy
- * (or we haven't heard otherwise yet), the dot stays green — network-style
- * "disconnected" is meaningless for the local machine and the steady-state
- * UX should match the user's mental model of "localhost is always there."
- *
- * But when the supervisor is actually in trouble — Reconnecting because
- * tmux died and we're respawning, or stuck Errored because tmux can't be
- * brought up — we surface the real status so the user has a path to
- * recover (sidebar click reconnects, overlay shows the error).
- *
- * Remote hosts always use the real status.
- */
-function displayedHostStatus(
-  host: Host,
-  status: HostStatus | undefined,
-  detached: string | null,
-): 'connected' | 'connecting' | 'disconnected' | 'error' {
-  if (host.port === 0) {
-    if (status === undefined || status === 'connected' || status === 'idle') {
-      return 'connected'
-    }
-    return hostRowStatus(status, detached)
-  }
-  return hostRowStatus(status ?? 'disconnected', detached)
 }
 

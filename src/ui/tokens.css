@@ -28,12 +28,21 @@
   --text-disabled:  #404853;
   --text-inverse:   #0B0C0E;
 
-  /* ---------- Accent (warm coral) ---------- */
-  --accent-default: #F4856B;
-  --accent-hover:   #FF9A82;
-  --accent-muted:   rgba(244, 133, 107, 0.12);
-  --accent-border:  rgba(244, 133, 107, 0.30);
-  --accent-text:    #FFB39E;
+  /* ---------- Accent (Tokyo Night blue) ----------
+   * The three muted variants give selected rows a clear visual
+   * hierarchy in the sidebar tree:
+   *   - hosts at 6%     (the broadest container, lightest fill)
+   *   - workspaces at 5% (one level in, even lighter so it doesn't
+   *                       compete with a selected host above it)
+   *   - windows / pins at 10% (the actionable leaves — strongest)
+   */
+  --accent-default: #7AA2F7;
+  --accent-hover:   #94B4F9;
+  --accent-muted:           rgba(122, 162, 247, 0.10);
+  --accent-muted-host:      rgba(122, 162, 247, 0.06);
+  --accent-muted-workspace: rgba(122, 162, 247, 0.05);
+  --accent-border:  rgba(122, 162, 247, 0.30);
+  --accent-text:    #B7CDFF;
 
   /* ---------- Status (semantic — never decorative) ---------- */
   --status-connected:    #3FCF8E;

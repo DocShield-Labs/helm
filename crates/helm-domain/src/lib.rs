@@ -34,6 +34,25 @@ newtype_id!(WindowId);
 newtype_id!(PaneId);
 newtype_id!(NotificationId);
 
+impl HostId {
+    /// The localhost host id is stable across app launches so any
+    /// frontend state keyed on it (pinned windows, last-active host,
+    /// activity dots, …) survives a restart. The previous behavior —
+    /// minting a fresh Uuid::new_v4() every boot — left those features
+    /// silently broken since the on-disk pin's hostId no longer
+    /// matched the in-memory localhost entry.
+    ///
+    /// Hardcoded constant rather than derived-from-machine because
+    /// localhost is a per-app-instance concept; the stability we need
+    /// is "same id between launches of THIS app on THIS machine,"
+    /// which a constant trivially provides.
+    pub fn local() -> Self {
+        // Constant rather than `uuid!(...)` so we don't need to opt
+        // the workspace into the `macros` feature for this one call.
+        Self(Uuid::from_u128(1))
+    }
+}
+
 // ---------- tmux notifications (cross the IPC boundary) ----------
 
 /// In-band markers extracted from a pane's `%output` byte stream before
@@ -296,7 +315,7 @@ impl Host {
     /// Convenience constructor for the always-present localhost entry.
     pub fn localhost() -> Self {
         Self {
-            id: HostId::new(),
+            id: HostId::local(),
             name: "localhost".into(),
             hostname: "localhost".into(),
             port: 0,

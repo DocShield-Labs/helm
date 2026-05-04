@@ -6,6 +6,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { ActivityDot, type ActivityDotState } from './ActivityDot'
+import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 
 export type SidebarWindowRowState = 'rest' | 'hover' | 'focused'
 
@@ -17,8 +18,15 @@ export interface SidebarWindowRowProps {
   onClick?: () => void
   /** Called when user finishes renaming (Enter). No-op on Esc / blur. */
   onRename?: (next: string) => void
-  /** Hover-revealed × button — kill this window. */
+  /** Hover-revealed × button + Kill menu item — kill this window. */
   onKill?: () => void
+  /** Whether this window is currently in the user's pinned list. Drives
+   * whether the context menu shows "Pin" or "Unpin". */
+  isPinned?: boolean
+  /** Pin this window. Omit (alongside onUnpin) to hide the menu entry. */
+  onPin?: () => void
+  /** Remove this window from pins. */
+  onUnpin?: () => void
 }
 
 export function SidebarWindowRow({
@@ -29,6 +37,9 @@ export function SidebarWindowRow({
   onClick,
   onRename,
   onKill,
+  isPinned = false,
+  onPin,
+  onUnpin,
 }: SidebarWindowRowProps) {
   const focused = state === 'focused'
   const bg = focused ? 'bg-accent-muted' : state === 'hover' ? 'bg-white/[0.025]' : ''
@@ -36,6 +47,30 @@ export function SidebarWindowRow({
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(name)
   const inputRef = useRef<HTMLInputElement>(null)
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+
+  // Build the context menu lazily so we don't recompute on every render.
+  // Items list adapts to which callbacks the parent provided — pin
+  // entries vanish when no onPin/onUnpin is wired.
+  const menuItems: Array<ContextMenuItem | 'separator'> = []
+  if (isPinned && onUnpin) {
+    menuItems.push({ id: 'unpin', label: 'Unpin from sidebar', icon: '☆', onClick: onUnpin })
+  } else if (!isPinned && onPin) {
+    menuItems.push({ id: 'pin', label: 'Pin to sidebar', icon: '★', onClick: onPin })
+  }
+  if (onRename) {
+    menuItems.push({
+      id: 'rename', label: 'Rename window', icon: 'A', shortcut: '⏎⏎',
+      onClick: () => setEditing(true),
+    })
+  }
+  if (onKill) {
+    if (menuItems.length > 0) menuItems.push('separator')
+    menuItems.push({
+      id: 'kill', label: 'Kill window', icon: '×', shortcut: '⌘W',
+      destructive: true, onClick: onKill,
+    })
+  }
 
   // Reset draft when entering edit mode or when the underlying name changes.
   useEffect(() => {
@@ -57,6 +92,7 @@ export function SidebarWindowRow({
   const cancel = () => setEditing(false)
 
   return (
+    <>
     <button
       type="button"
       onClick={() => {
@@ -68,14 +104,14 @@ export function SidebarWindowRow({
           setEditing(true)
         }
       }}
+      onContextMenu={(e) => {
+        if (menuItems.length === 0) return
+        e.preventDefault()
+        e.stopPropagation()
+        setMenu({ x: e.clientX, y: e.clientY })
+      }}
       className={`group relative flex h-[26px] w-full items-center gap-2 rounded-md pl-[54px] pr-2 ${bg} ${focused ? '' : 'hover:bg-white/[0.025]'}`}
     >
-      {focused && (
-        <span
-          className="absolute left-0 top-[6px] block h-[14px] w-[2px] rounded-[1px]"
-          style={{ background: 'var(--accent-default)' }}
-        />
-      )}
       <span
         className="font-mono text-[11px] leading-none"
         style={{ color: focused ? 'var(--accent-text)' : 'var(--text-tertiary)' }}
@@ -135,5 +171,15 @@ export function SidebarWindowRow({
         </>
       )}
     </button>
+    {menu && (
+      <ContextMenu
+        open
+        x={menu.x}
+        y={menu.y}
+        items={menuItems}
+        onClose={() => setMenu(null)}
+      />
+    )}
+    </>
   )
 }

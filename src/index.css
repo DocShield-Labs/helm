@@ -20,11 +20,13 @@
   --color-text-disabled:  var(--text-disabled);
   --color-text-inverse:   var(--text-inverse);
 
-  --color-accent:         var(--accent-default);
-  --color-accent-hover:   var(--accent-hover);
-  --color-accent-muted:   var(--accent-muted);
-  --color-accent-border:  var(--accent-border);
-  --color-accent-text:    var(--accent-text);
+  --color-accent:                  var(--accent-default);
+  --color-accent-hover:            var(--accent-hover);
+  --color-accent-muted:            var(--accent-muted);
+  --color-accent-muted-host:       var(--accent-muted-host);
+  --color-accent-muted-workspace:  var(--accent-muted-workspace);
+  --color-accent-border:           var(--accent-border);
+  --color-accent-text:             var(--accent-text);
 
   --color-status-connected:    var(--status-connected);
   --color-status-connecting:   var(--status-connecting);
