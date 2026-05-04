@@ -251,9 +251,18 @@ export function App() {
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-text-primary">
       {/* drag bar — title centered to the geometric middle of the window
           (macOS convention) via absolute positioning so the traffic-light
-          reservation and right-side affordances don't bias it off-center. */}
-      <div className="relative flex h-10 items-center justify-end border-b border-white/[0.06] bg-sidebar pl-[76px] pr-3">
-        <span className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-[11px] text-text-tertiary">
+          reservation and right-side affordances don't bias it off-center.
+          `data-tauri-drag-region` makes the bar draggable; with the Overlay
+          title-bar style the OS has no native title bar to grab, so this
+          attribute is what lets the user move the window. */}
+      <div
+        data-tauri-drag-region
+        className="relative flex h-10 items-center justify-end border-b border-white/[0.06] bg-sidebar pl-[76px] pr-3"
+      >
+        <span
+          data-tauri-drag-region
+          className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-[11px] text-text-tertiary"
+        >
           {activeHost?.name ?? '—'} · {activeWorkspace?.name ?? '—'} ·{' '}
           {activeWindow?.name ?? '—'}
         </span>
