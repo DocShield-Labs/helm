@@ -54,6 +54,17 @@ pub(crate) async fn do_connect(
     network_online: watch::Receiver<bool>,
     notif_ctx: NotificationsCtx,
 ) -> Result<(), String> {
+    // Serialize connect attempts for this host. Held for the full
+    // function so a concurrent `host_connect` (StrictMode, HMR,
+    // host_added re-fire) can't race the long async connect work and
+    // leave its just-spawned `-CC` clients silently overwritten by the
+    // first caller's. See `HostEntry::connect_lock`.
+    let connect_lock = {
+        let g = entry.lock().await;
+        g.connect_lock.clone()
+    };
+    let _connect_guard = connect_lock.lock().await;
+
     emit_event(&event_tx, HostEvent::Status {
         host_id,
         status: HostStatus::Connecting,
@@ -112,9 +123,20 @@ pub(crate) async fn do_connect(
             // Connected here so the frontend renders the tree as soon
             // as we're done bootstrapping (refresh_pane_index runs next
             // and only refines the per-pane breadcrumbs).
+            //
+            // `connect_lock` should mean the map is empty here, but
+            // tear down any straggler defensively — a plain `=` would
+            // drop SessionClient Arcs without calling
+            // `forwarder.abort()`, leaking the old forwarder + its
+            // attached `-CC` PTY into the global event channel.
             {
                 let mut guard = entry.lock().await;
-                guard.clients = session_clients;
+                let stragglers =
+                    std::mem::replace(&mut guard.clients, session_clients);
+                for (_, c) in stragglers {
+                    c.forwarder.abort();
+                    drop(c);
+                }
                 guard.primary_session_id = Some(primary_id.clone());
                 guard.ssh = ssh;
                 guard.supervisor_tx = Some(sup_tx.clone());
@@ -509,6 +531,13 @@ async fn supervise(
         }
 
         // ----- attempt full reconnect (multi-client) -----
+        // Hold connect_lock for the attempt so a concurrent
+        // `host_connect` Tauri call can't interleave its own
+        // connect_host_multi with ours and end up overwriting one
+        // set of fresh `-CC` clients with another. The lock is
+        // dropped at the end of the match block.
+        let connect_lock = entry.lock().await.connect_lock.clone();
+        let _reconnect_guard = connect_lock.lock().await;
         match connect_host_multi(host.clone(), Some(prompter.clone())).await {
             Ok(connected) => {
                 let primary_id = connected.primary_session_id.clone();
@@ -542,7 +571,12 @@ async fn supervise(
                 }
                 {
                     let mut guard = entry.lock().await;
-                    guard.clients = session_clients;
+                    let stragglers =
+                        std::mem::replace(&mut guard.clients, session_clients);
+                    for (_, c) in stragglers {
+                        c.forwarder.abort();
+                        drop(c);
+                    }
                     guard.primary_session_id = Some(primary_id);
                     guard.ssh = ssh;
                     guard.supervisor_tx = Some(sup_tx_new.clone());

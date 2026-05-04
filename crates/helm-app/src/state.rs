@@ -57,6 +57,21 @@ pub struct HostEntry {
     /// forwarders. Replaced on every reconnect so signals from a stale
     /// forwarder can't leak into a fresh supervisor's stream.
     pub supervisor_tx: Option<mpsc::UnboundedSender<SupervisorSignal>>,
+    /// Serializes connect attempts (initial connect via `host_connect`
+    /// + supervisor reconnect) for this host. The outer entry mutex is
+    /// released across the long async connect work, so two concurrent
+    /// `do_connect` calls (React StrictMode double-effect, vite HMR
+    /// re-firing the bootstrap effect, host_added re-fire, user clicks)
+    /// would otherwise both run `shutdown_clients` on an empty map,
+    /// race through `connect_host_multi`, and the second's
+    /// `guard.clients = …` would silently drop the first's
+    /// SessionClients without aborting their forwarders — leaving
+    /// orphan `tmux -CC` PTYs streaming `%output` into the global
+    /// event channel and producing duplicated input/output. Held
+    /// across the entire connect path; the second caller waits, then
+    /// runs its own `shutdown_clients` against whatever the first
+    /// installed (last-call-wins, with proper teardown).
+    pub connect_lock: Arc<Mutex<()>>,
 }
 
 /// One control client (one `tmux -CC attach -t $session_id`) for a
@@ -99,6 +114,7 @@ impl HostEntry {
             voluntary_disconnect: false,
             supervisor: None,
             supervisor_tx: None,
+            connect_lock: Arc::new(Mutex::new(())),
         }
     }
 
