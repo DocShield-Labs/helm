@@ -133,6 +133,16 @@ export async function subscribeHostEvents(): Promise<void> {
       useStore.getState().removeNotification(evt.notification_id)
       return
     }
+    if (evt.kind === 'tool_integration_suggested') {
+      useStore.getState().pushToolSuggestion({
+        hostId: evt.host_id,
+        integrationId: evt.integration_id,
+        name: evt.name,
+        description: evt.description,
+        postInstallNote: evt.post_install_note,
+      })
+      return
+    }
     // evt.kind === 'tmux'
     const { host_id, notification: n } = evt
     const store = useStore.getState()

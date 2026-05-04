@@ -192,6 +192,14 @@ pub struct AppState {
     /// Per-host serialization lock for `refresh_pane_index`. See
     /// `NotificationsCtx::refresh_locks` for rationale.
     pub refresh_locks: Arc<DashMap<HostId, Arc<tokio::sync::Mutex<()>>>>,
+
+    /// Per-(host, integration_id) flag tracking whether we've already
+    /// surfaced (or the user has dismissed) the suggestion toast for
+    /// a tool integration this app session. Prevents the toast from
+    /// re-firing every time `refresh_pane_index` runs and re-detects
+    /// the same `claude` process. Cleared on app restart — we re-suggest
+    /// each launch since the user may have changed their mind.
+    pub tool_integration_seen: Arc<DashMap<(HostId, String), ()>>,
 }
 
 /// Mutable per-pane state the notifications layer accumulates between
@@ -223,10 +231,11 @@ pub struct PaneRuntime {
 /// for a single-line preview after we strip ANSI and tail to ~120 chars.
 pub const PREVIEW_BYTES: usize = 512;
 
-/// Cheap-to-clone bundle of notification storage handles. Passed to the
-/// supervisor task so it can call into the marker post-processor without
-/// needing the full `AppState` (which is wrapped in Tauri's `State<'_>`
-/// and inconvenient to thread through long-running futures).
+/// Cheap-to-clone bundle of supervisor-side handles. Passed to long-
+/// running tasks (forwarders, supervise, refresh helpers) so they can
+/// call into the notifications layer + tool-integration detection
+/// without needing the full `AppState` (which is wrapped in Tauri's
+/// `State<'_>` and inconvenient to thread through long-running futures).
 #[derive(Clone)]
 pub struct NotificationsCtx {
     pub notifications: Arc<DashMap<NotificationId, Notification>>,
@@ -238,10 +247,14 @@ pub struct NotificationsCtx {
     /// `%sessions-changed` and wants to refresh) don't race their
     /// stale-cleanup steps and wipe valid entries.
     pub refresh_locks: Arc<DashMap<HostId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-(host, integration_id) flag tracking whether we've already
+    /// surfaced (or processed) the suggestion toast for a tool
+    /// integration this session. See AppState's same-named field.
+    pub tool_integration_seen: Arc<DashMap<(HostId, String), ()>>,
 }
 
 impl AppState {
-    /// Cheap snapshot of the notification handles. Clones five `Arc`s.
+    /// Cheap snapshot of the supervisor-side handles. Clones six `Arc`s.
     pub fn notifications_ctx(&self) -> NotificationsCtx {
         NotificationsCtx {
             notifications: self.notifications.clone(),
@@ -249,6 +262,7 @@ impl AppState {
             pane_runtime: self.pane_runtime.clone(),
             focus: self.focus.clone(),
             refresh_locks: self.refresh_locks.clone(),
+            tool_integration_seen: self.tool_integration_seen.clone(),
         }
     }
 }
@@ -291,6 +305,7 @@ impl Default for AppState {
             pane_runtime: Arc::new(DashMap::new()),
             focus: Arc::new(parking_lot::Mutex::new(None)),
             refresh_locks: Arc::new(DashMap::new()),
+            tool_integration_seen: Arc::new(DashMap::new()),
         }
     }
 }

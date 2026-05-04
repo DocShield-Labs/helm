@@ -557,4 +557,67 @@ mod tests {
         let s = format_preview(&raw);
         assert_eq!(s.chars().count(), PREVIEW_CHAR_LIMIT);
     }
+
+    fn cmd_done(exit: Option<i32>) -> NotificationKind {
+        NotificationKind::CommandDone {
+            exit_code: exit,
+            command: String::new(),
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn merged_kind_priority_bell_beats_success() {
+        // Bell (2) > CommandDone(ok) (1) — `printf '\a'` followed by
+        // exit-0 keeps the bell visible instead of demoting to "done."
+        let merged = merged_kind(&NotificationKind::Bell, &cmd_done(Some(0)));
+        assert_eq!(merged, NotificationKind::Bell);
+    }
+
+    #[test]
+    fn merged_kind_priority_failure_beats_bell() {
+        // CommandDone(non-zero) (3) > Bell (2) — failures are critical
+        // and outrank an explicit bell ring.
+        let merged = merged_kind(&NotificationKind::Bell, &cmd_done(Some(1)));
+        assert_eq!(merged, cmd_done(Some(1)));
+    }
+
+    #[test]
+    fn merged_kind_same_priority_latest_wins() {
+        // Two successive failures: the latest exit code is what the
+        // user cares about, so we replace rather than keep the older.
+        let merged = merged_kind(&cmd_done(Some(1)), &cmd_done(Some(127)));
+        assert_eq!(merged, cmd_done(Some(127)));
+    }
+
+    /// Build a NotificationsCtx with empty maps suitable for upsert tests.
+    fn test_ctx() -> NotificationsCtx {
+        NotificationsCtx {
+            notifications: Arc::new(DashMap::new()),
+            notification_by_pane: Arc::new(DashMap::new()),
+            pane_runtime: Arc::new(DashMap::new()),
+            focus: Arc::new(parking_lot::Mutex::new(None)),
+            refresh_locks: Arc::new(DashMap::new()),
+            tool_integration_seen: Arc::new(DashMap::new()),
+        }
+    }
+
+    #[test]
+    fn upsert_coalesces_repeated_events() {
+        // Two bells on the same pane should collapse to one notification
+        // with count=2, not two separate inbox rows.
+        let ctx = test_ctx();
+        let host = HostId::new();
+        let pane = "%1".to_string();
+
+        upsert(&ctx, &None, host, &pane, NotificationKind::Bell, 1000);
+        upsert(&ctx, &None, host, &pane, NotificationKind::Bell, 2000);
+
+        assert_eq!(ctx.notifications.len(), 1, "should still be a single inbox row");
+        let id = *ctx.notification_by_pane.get(&(host, pane)).unwrap();
+        let n = ctx.notifications.get(&id).unwrap();
+        assert_eq!(n.count, 2);
+        assert_eq!(n.updated_at, 2000);
+        assert_eq!(n.created_at, 1000);
+    }
 }

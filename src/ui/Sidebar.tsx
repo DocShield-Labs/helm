@@ -164,13 +164,11 @@ function ExpandedSidebar({
                   <div key={w.id} className="flex flex-col gap-1">
                     <SidebarWorkspaceRow
                       name={w.name}
-                      activity={
-                        wsNotifs.length > 0
-                          ? rollupActivity(wsNotifs)
-                          : w.windows.size > 0
-                            ? 'running'
-                            : 'idle'
-                      }
+                      // Dot exists ONLY for unread notifications now —
+                      // active state is already conveyed by the row's
+                      // bg-accent-muted, so an ambient running/idle dot
+                      // would just be noise.
+                      activity={wsNotifs.length > 0 ? rollupActivity(wsNotifs) : 'none'}
                       state={isActiveWs ? 'active' : 'rest'}
                       expanded={expanded}
                       onClick={() => toggleWorkspaceCollapsed(h.id, w.id)}
@@ -210,13 +208,11 @@ function ExpandedSidebar({
                                 key={win.id}
                                 name={win.name}
                                 command={paneCommandFor(win.id, w)}
-                                activity={
-                                  winNotifs.length > 0
-                                    ? rollupActivity(winNotifs)
-                                    : win.active
-                                      ? 'running'
-                                      : 'idle'
-                                }
+                                // Dot only when this specific window
+                                // has unread notifications. The focused
+                                // row's bg-accent-muted already shows
+                                // which window is active.
+                                activity={winNotifs.length > 0 ? rollupActivity(winNotifs) : 'none'}
                                 state={isFocused ? 'focused' : 'rest'}
                                 onClick={() => {
                                   const store = useStore.getState()

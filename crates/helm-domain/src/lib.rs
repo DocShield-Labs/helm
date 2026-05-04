@@ -168,6 +168,19 @@ pub enum HostEvent {
         host_id: HostId,
         notification_id: NotificationId,
     },
+    /// Helm detected a tool running in a pane that has a known
+    /// integration available (e.g. Claude Code). Frontend surfaces a
+    /// sticky toast offering to install the integration. Coalesced
+    /// per (host, integration_id) for the lifetime of the app — once
+    /// the user installs or dismisses, no more suggestions for that
+    /// integration on that host.
+    ToolIntegrationSuggested {
+        host_id: HostId,
+        integration_id: String,
+        name: String,
+        description: String,
+        post_install_note: String,
+    },
 }
 
 // ---------- notifications ----------

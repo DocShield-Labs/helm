@@ -19,7 +19,9 @@ nothing internal-ships until phase 2.
 | 2C    | Persistence + Keychain + host editor | **done**     |
 | 2D    | Reconnect, host-key TOFU, raw PTY    | **done**     |
 | 3     | Command palette + keyboard map       | later        |
-| 4     | Inbox notifications + shell integ.   | **mostly done** |
+| 4     | Inbox notifications + shell integ.   | **done**     |
+| 4G    | Multi-control-client tmux refactor   | **done**     |
+| 4H    | Tool integration framework           | **done**     |
 | 4F    | Warp-style blocks UI from OSC 133    | later        |
 | 5     | Performance + IPC optimisation       | later        |
 
@@ -859,7 +861,7 @@ Make every action reachable in two keystrokes.
 
 ---
 
-## Phase 4 — Inbox notifications + shell integration · **mostly done**
+## Phase 4 — Inbox notifications + shell integration · **done**
 
 Surface "things that want your attention" across every connected host
 in a single sidebar inbox section. Two signal layers feed it: BEL
@@ -1088,6 +1090,261 @@ but are now their own phases:
 - **Status bar polish** — click handlers, tmux uptime, git branch
   segment (latter blocked on `host_run_shell` IPC — see the parked
   notes elsewhere).
+
+---
+
+## Phase 4G — Multi-control-client tmux refactor · **done**
+
+The phase-4 inbox worked beautifully on a single workspace and silently
+broke across workspaces. Tmux's `-CC` mode only delivers `%output`
+notifications for the session a control client is attached to —
+cross-workspace bells, command-done events, and OSC 133 markers were
+buffered until the user switched sessions, making the inbox concept
+incomplete for the multi-workspace use case.
+
+Fix: maintain one control client *per tmux session* on each host, all
+permanently attached. Output flows for every session in real time.
+
+### Done
+
+**Multi-channel SSH (`helm-ssh`):**
+- Refactored the I/O thread from one-channel-per-session to a
+  long-running event loop accepting channel-open requests over an mpsc.
+- New API: `connect_session(target, auth, timeout, prompter) → SshSession`
+  (TCP + auth, no exec) and `SshSession::open_exec(command) → OpenedChannel`
+  (one round-trip channel open + PTY + exec, returns blocking pipe halves).
+- Legacy `connect()` retained as a thin wrapper for back-compat.
+- One TCP+auth handshake per host; N exec channels multiplexed over it.
+  Avoids OpenSSH's `MaxStartups` limit and saves N-1 handshakes.
+
+**Per-session local clients (`helm-tmux`):**
+- New `bootstrap_local(default_workspace) → Vec<String>`: one-shot
+  enumerate-or-create that returns every session id on the local server.
+  Uses sync subprocess invocations (no control client). Sibling sync
+  helpers `probe_tmux_sync` + `list_local_sessions`.
+- New `spawn_attach_local(session_id) → (TmuxClient, events)`: opens a
+  fresh PTY pair, runs `tmux -CC attach -t $session_id`, wraps in a
+  TmuxClient. One PTY per session.
+- Legacy `spawn_local()` becomes a thin wrapper over both for tests.
+
+**Multi-client `HostEntry` (`helm-app::state`):**
+- `tmux: Option<Arc<TmuxClient>>` → `clients: HashMap<String /* session_id */, Arc<SessionClient>>`.
+- `primary_session_id: Option<String>` — first session at connect time;
+  used as the routing target for global commands (every existing tmux
+  command works through any client since pane/window/session ids are
+  server-globally unique).
+- `SessionClient { tmux, forwarder: AbortHandle }` — one per session.
+- `supervisor_tx` — the mpsc sender into the live supervisor's signal
+  channel, cloned by per-client forwarders + `spawn_missing_clients`.
+- `shutdown_clients()` helper — aborts every forwarder, drops every
+  client, clears ssh + supervisor_tx in one call.
+
+**Connection state machine (`helm-app::connection`):**
+- `do_connect` rebuilds: bootstrap step → spawn N clients → register all
+  in HostEntry → spawn host supervisor.
+- `client_forwarder_loop` per client: drains its TmuxNotification
+  receiver, forwards each event to the global channel, post-processes
+  `%output` markers. On EOF / `%exit` signals supervisor via
+  `SupervisorSignal::ClientDied(session_id)`.
+- `supervise` consolidated: `select!` on supervisor signals + reachability
+  watch. ClientDied promotes a new primary or triggers full reconnect
+  when no clients remain. SessionsChanged invokes `spawn_missing_clients`
+  to incrementally attach to newly-created workspaces.
+- `spawn_session_client(...)` extracted helper used by all three spawn
+  sites (do_connect, supervise reconnect, spawn_missing_clients).
+- Reconnect ladder unchanged — `[1, 2, 4, 8, 30]s` clamped to 30s, with
+  reachability-watch early-wake on `false → true` transitions.
+
+**Remote connect command:**
+- First exec channel installs integration + bootstraps a session if
+  none exist + `tmux set-environment -g HELM_INTEGRATION/ZDOTDIR/...`
+  server-globally + per-session, then attaches the first control client.
+- Per-session attach commands run with env exports + `exec tmux -CC
+  attach -t $sid`, no install heredoc (already done by the first).
+- Per-session channels open *concurrently* via `futures_join_attach_channels`
+  — each pays the cost of one remote shell startup (~1-3s with heavy
+  `.zshrc`); parallelizing drops total wall time to ~one shell-init
+  period regardless of N.
+
+**Frontend (minor):**
+- `selectWorkspace` no longer calls `tmux_switch_client` (now a no-op
+  on the backend). With one permanent control client per session, every
+  session is always attached at the right viewport — there's nothing to
+  switch.
+
+### Sharp edges (revisit later)
+
+- **Single-channel SSH error → full reconnect.** A transient channel
+  drop on one session today brings every session back through the
+  reconnect ladder. Could be smarter (respawn just the dead client) but
+  the current behavior is simple and correct; deferred.
+- **Pre-existing remote panes don't get integration.** Documented in
+  phase 4. Same constraint here — the user opens a new window to pick
+  it up.
+- **Slow `.zshrc` on remote.** Even parallelized, the wall time is
+  bounded by the slowest single shell init. Heavy oh-my-zsh setups can
+  push connect time to 3-5s. Future fix: a small `~/.helm/bin/helm-attach`
+  shim on the remote that uses `/bin/sh` instead of the user's login
+  shell; deferred.
+
+### Lessons learned
+
+- **`%output` is scoped to the attached session.** Spent two hours
+  diagnosing "cross-workspace notifications don't fire" before realizing
+  this is a fundamental tmux constraint. Empirically confirmed by
+  buffered burst-delivery on session switch — events fire at the right
+  *time* but tmux holds them until the control client comes back.
+  Multi-client is the only real fix; iTerm2 went through the same
+  architectural decision.
+
+- **Tabs in primary_id are lost over SSH PTY.** `display-message -p
+  '#{client_session}'` returns the session *name* (e.g. `"workspace 1"`),
+  not the *id* (`$3`). Earlier code used the name and dedupe-failed
+  against `list-sessions -F '#{session_id}'` results — opening a
+  *second* control client on the session our first one was already
+  attached to. Both then forwarded the same `%output` for every
+  keystroke, producing the "eeechhoo hheelllloo" double-character
+  artefact. Use `#{session_id}` exclusively for protocol-level
+  identifiers.
+
+- **Concurrent `refresh_pane_index` races wipe valid entries.** With
+  one client per session, every forwarder sees `%window-added` /
+  `%sessions-changed` and queues a refresh. N parallel `list-panes`
+  calls race their stale-cleanup steps — refresh A reads `alive={X,Y}`
+  just before pane Z is added; refresh B sees Z and writes it; A
+  processes its alive set, finds Z in `pane_runtime` but not in *its*
+  alive set, dismisses Z's notification + runtime entry. Manifests as
+  inbox rows with no breadcrumb (window_id was empty). Fixed with a
+  per-host serialization mutex on the refresh path + an empty-result
+  guard (skip stale cleanup if `list-panes` returned nothing — almost
+  always a transient state, not a real "all panes killed").
+
+- **Slow remote shell init compounds with serial attach.** Each
+  per-session attach channel pays the full `.zshrc` startup cost —
+  zsh in PTY mode is interactive (sshd allocates a PTY because tmux
+  needs one), so it sources rc files even though we're about to
+  `exec tmux`. Heavy configs hit 1-3s per session; opening 5 sessions
+  serially = 10-15s connect. Fixed by parallelizing per-session opens
+  via `tokio::spawn` + collecting via `join_all`-equivalent.
+
+- **`tmux set-environment` is per-server-and-per-session.** Tmux's
+  session env is snapshotted at session creation; our `export
+  HELM_INTEGRATION=1` in the connect shell only affects the bootstrap
+  session's first pane (and only because we set it before tmux's first
+  ever connect). Existing remote sessions need explicit
+  `set-environment -g` (server-globally) AND `set-environment -t $sess`
+  per existing session. Without the per-session line, new windows in
+  pre-existing workspaces miss the env entirely. Documented as a sharp
+  edge in phase 4.
+
+---
+
+## Phase 4H — Tool integration framework · **done**
+
+Generalized "ask the tool to bell at the right moments" framework on
+top of phase 4's bell detection. Bell stays the canonical attention
+signal — universal, every tool can emit it, our pipeline already
+handles it. Per-tool integration is then just *config that makes the
+tool ring at semantically meaningful moments*. v1 ships Claude Code as
+the first integration, but the framework is built so future
+integrations (pgcli, mosh, anything) drop in as a single trait impl.
+
+### Done
+
+**`ToolIntegration` trait + registry (`helm-app::tool_integrations`):**
+- Stable id + display name + description + post-install note + process
+  names (matched against `pane_current_command`).
+- `is_installed`, `install`, `uninstall` — all idempotent, async, take
+  a primary `TmuxClient` for integrations that need to query/write
+  remote state.
+- `pane_matches(current_command) → bool` with a default impl that
+  checks `process_names`. Override for tools that mutate their process
+  title (e.g. Claude Code reports its semver as the title).
+- `registry()` returns all integrations the binary ships.
+- `find(id)` for command lookup.
+
+**`ClaudeCodeIntegration`:**
+- Reads `~/.claude/settings.json`, idempotently merges
+  `Notification` + `Stop` hooks emitting `printf '\a' > /dev/tty
+  2>/dev/null || true`. Uninstall removes only entries matching our
+  exact command — preserves any other hooks the user authored.
+- Atomic write (sibling tmp file + rename).
+- `is_semver_like` heuristic for the process-title quirk: Claude Code
+  reports `"2.1.126"` as `pane_current_command` instead of `"claude"`,
+  so `pane_matches` accepts both the literal binary name AND any
+  string matching `^[\d.]+$` containing at least one dot. False
+  positives vanishingly rare; install is gated on a user click anyway.
+- v1 supports local hosts only (`host.port == 0`); remote returns an
+  error. Remote support is gated on adding a sync `SshSession::run_oneshot`
+  helper to `helm-ssh` for one-shot file ops.
+
+**Detection (`detect_and_suggest`):**
+- Three triggers:
+  1. **Connect.** `do_connect` runs the sweep after the first
+     `refresh_pane_index`.
+  2. **Window mutations.** Forwarder triggers a sweep on
+     `%window-added` / `%window-closed` / `%layout-changed` /
+     `%sessions-changed`.
+  3. **After-Enter.** `tmux_send_keys` checks for `\r`/`\n` in the
+     bytes; if present and any integration is still un-suggested,
+     schedules a sweep 400ms later (gives tmux time to update
+     `pane_current_command` after the new process starts). The third
+     trigger catches the common "user types `claude<enter>` in an
+     existing pane" case — tmux doesn't notify on foreground command
+     changes, so without this trigger detection waits until the next
+     window mutation.
+- Per-host dedup via `tool_integration_seen: DashMap<(HostId, String), ()>`.
+  Once an integration is suggested, installed, or dismissed for a host,
+  we don't sweep for it again this session.
+- Cheap fast-path: when all integrations are already seen for a host,
+  the trigger does a `HashMap.contains_key` check and skips the IPC
+  entirely.
+
+**Tauri commands + suggestion event:**
+- `tool_integrations_list(host_id)`, `tool_integration_install(host_id, id)`,
+  `tool_integration_uninstall(host_id, id)`, `tool_integration_dismiss(host_id, id)`.
+- `HostEvent::ToolIntegrationSuggested` carries id + name + description
+  + post-install note. Pushed by the backend, consumed by the frontend.
+
+**Frontend (`src/features/activity-feed/IntegrationSuggestionHost.tsx`):**
+- Sticky suggestion card bottom-right, separate from the regular Toast
+  stack. Two buttons: `Install` / `Not now`. After install: card flips
+  to "Restart Claude Code (close and reopen the session)" then
+  auto-dismisses after 4s.
+- `Install` calls `tool_integration_install`. `Not now` calls
+  `tool_integration_dismiss`. Both record the decision so we don't
+  re-prompt this session.
+
+### Sharp edges
+
+- **Process-title detection is heuristic.** Tools that mutate their
+  process name in unexpected ways won't be detected without an explicit
+  `pane_matches` override. Claude is the first instance; future
+  integrations may need similar special-casing.
+- **Remote integrations are local-only in v1.** Remote support requires
+  a sync `SshSession::run_oneshot` helper to read/write the remote
+  `~/.claude/settings.json`. Tracked for a follow-up.
+
+### Lessons learned
+
+- **Process titles are fair game.** Node CLIs commonly set
+  `process.title = version` as a debugging convenience. tmux's
+  `pane_current_command` returns whatever's in argv[0], including
+  these mutations. The default `process_names`-only matcher misses
+  these; teach the trait to allow per-integration custom matching
+  rather than relying on a static list.
+
+- **Frontend filter for `onData` is needed for click-doesn't-dismiss.**
+  When the user clicks an inbox row to jump to a Claude pane, helm
+  switches the visible pane and calls `term.focus()`. xterm with
+  focus tracking enabled (Claude does, via DECSET 1004) fires a
+  focus-in sequence (`\x1b[I`) back through `term.onData`. Without
+  filtering, this counts as a "user keystroke" and dismisses the
+  notification instantly — breaking peek-doesn't-dismiss. Added
+  `isUserKeystroke(data)` in `TmuxPane.tsx` that excludes focus
+  events, mouse events (DECSET 1006/1000), cursor-position responses,
+  bracketed-paste markers. Real keystrokes still dismiss; xterm's
+  background reports don't.
 
 ---
 

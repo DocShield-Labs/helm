@@ -4,12 +4,14 @@
 //! global app state, and exposes commands + channels to the frontend.
 
 mod commands;
+mod connection;
 mod integration;
 mod keychain;
 mod notifications;
 mod persistence;
 mod reachability;
 mod state;
+mod tool_integrations;
 
 use specta_typescript::{BigIntExportBehavior, Typescript};
 use tauri::Manager;
@@ -20,38 +22,42 @@ use tauri_specta::{collect_commands, Builder};
 /// drift out of sync with what the runtime actually exposes.
 fn specta_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new().commands(collect_commands![
-        commands::ping,
-        commands::host_list,
-        commands::host_local_id,
-        commands::host_save,
-        commands::host_delete,
-        commands::host_save_password,
-        commands::ssh_config_aliases,
-        commands::host_subscribe,
-        commands::host_connect,
-        commands::host_disconnect,
-        commands::host_key_prompt_response,
-        commands::tmux_send_keys,
-        commands::tmux_resize_pane,
-        commands::tmux_new_window,
-        commands::tmux_split_pane,
-        commands::tmux_kill_window,
-        commands::tmux_select_window,
-        commands::tmux_select_pane,
-        commands::tmux_rename_window,
-        commands::tmux_list_windows,
-        commands::tmux_list_panes,
-        commands::tmux_list_sessions,
-        commands::tmux_new_session,
-        commands::tmux_kill_session,
-        commands::tmux_rename_session,
-        commands::tmux_switch_client,
-        commands::tmux_capture_pane,
-        commands::tmux_resize_client,
-        commands::notifications_list,
-        commands::notification_dismiss,
-        commands::notification_dismiss_for_window,
-        commands::set_focus,
+        commands::host::ping,
+        commands::host::host_list,
+        commands::host::host_local_id,
+        commands::host::host_save,
+        commands::host::host_delete,
+        commands::host::host_save_password,
+        commands::host::ssh_config_aliases,
+        commands::host::host_subscribe,
+        commands::host::host_connect,
+        commands::host::host_disconnect,
+        commands::host::host_key_prompt_response,
+        commands::tmux::tmux_send_keys,
+        commands::tmux::tmux_resize_pane,
+        commands::tmux::tmux_new_window,
+        commands::tmux::tmux_split_pane,
+        commands::tmux::tmux_kill_window,
+        commands::tmux::tmux_select_window,
+        commands::tmux::tmux_select_pane,
+        commands::tmux::tmux_rename_window,
+        commands::tmux::tmux_list_windows,
+        commands::tmux::tmux_list_panes,
+        commands::tmux::tmux_list_sessions,
+        commands::tmux::tmux_new_session,
+        commands::tmux::tmux_kill_session,
+        commands::tmux::tmux_rename_session,
+        commands::tmux::tmux_switch_client,
+        commands::tmux::tmux_capture_pane,
+        commands::tmux::tmux_resize_client,
+        commands::notifications::notifications_list,
+        commands::notifications::notification_dismiss,
+        commands::notifications::notification_dismiss_for_window,
+        commands::notifications::set_focus,
+        commands::tools::tool_integrations_list,
+        commands::tools::tool_integration_install,
+        commands::tools::tool_integration_uninstall,
+        commands::tools::tool_integration_dismiss,
     ])
 }
 

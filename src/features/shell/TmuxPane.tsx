@@ -113,42 +113,50 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
       // Hidden panes ignore input — keystrokes belong to the visible pane.
       if (!visibleRef.current) return
 
-      // Dismiss-on-keystroke: any printable / control byte the user
-      // typed into THIS pane is a signal they're acting on whatever
-      // notifications were sitting for this window. Fire-and-forget
-      // dismiss so the inbox row disappears without round-tripping
-      // through React.
+      // Dismiss-on-keystroke: a real user keypress in THIS pane signals
+      // they're acting on whatever notifications were sitting for this
+      // window. Fire-and-forget dismiss so the inbox row disappears
+      // without round-tripping through React.
       //
-      // Note: pure modifier presses (Cmd, Shift alone) don't fire
-      // onData, so they're naturally excluded — only keys that
-      // produce bytes count, which matches the user's intuition for
-      // "actually typing."
-      const store = useStore.getState()
-      const hs = store.sessions.get(hostId)
-      let windowId: string | null = null
-      if (hs) {
-        for (const ws of hs.workspaces.values()) {
-          const pane = ws.panes.get(paneId)
-          if (pane) {
-            windowId = pane.windowId
-            break
+      // We filter out terminal-state byte sequences that xterm emits
+      // back to the host but which AREN'T user input — focus enter/exit
+      // (DECSET 1004), mouse events (DECSET 1006), cursor-position
+      // responses, bracketed-paste markers. Without this filter,
+      // simply clicking an inbox row dismisses the notification: the
+      // pane becomes visible → we call term.focus() → xterm fires a
+      // focus-in event → onData runs with `\x1b[I` → we'd treat that
+      // as a keystroke. The peek-doesn't-dismiss invariant breaks.
+      //
+      // Pure modifier presses (Cmd, Shift alone) don't fire onData
+      // so they're naturally excluded.
+      if (isUserKeystroke(data)) {
+        const store = useStore.getState()
+        const hs = store.sessions.get(hostId)
+        let windowId: string | null = null
+        if (hs) {
+          for (const ws of hs.workspaces.values()) {
+            const pane = ws.panes.get(paneId)
+            if (pane) {
+              windowId = pane.windowId
+              break
+            }
           }
         }
-      }
-      if (windowId) {
-        let hasNotif = false
-        for (const n of store.notifications.values()) {
-          if (n.host_id === hostId && n.window_id === windowId) {
-            hasNotif = true
-            break
+        if (windowId) {
+          let hasNotif = false
+          for (const n of store.notifications.values()) {
+            if (n.host_id === hostId && n.window_id === windowId) {
+              hasNotif = true
+              break
+            }
+            if (n.host_id === hostId && n.pane_id === paneId) {
+              hasNotif = true
+              break
+            }
           }
-          if (n.host_id === hostId && n.pane_id === paneId) {
-            hasNotif = true
-            break
+          if (hasNotif) {
+            void commands.notificationDismissForWindow(hostId, windowId)
           }
-        }
-        if (hasNotif) {
-          void commands.notificationDismissForWindow(hostId, windowId)
         }
       }
 
@@ -223,4 +231,32 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
       <div ref={hostRef} className="absolute inset-0 overflow-hidden px-3 py-2" />
     </div>
   )
+}
+
+/** True iff `data` represents real user input (typed character,
+ * pasted text, control key, arrow, etc.) and NOT a terminal-state
+ * report that xterm sends back to the host as a side-effect of
+ * rendering or focus changes.
+ *
+ * The set of "not user input" sequences is small and well-known:
+ *   - Focus enter/exit (DECSET 1004): `\x1b[I` / `\x1b[O`. Fires when
+ *     we call `term.focus()` after making the pane visible.
+ *   - Mouse events (DECSET 1006 SGR / DECSET 1000 X10): `\x1b[<...M`,
+ *     `\x1b[<...m`, `\x1b[M...`. Mouse clicks inside the pane area.
+ *   - Cursor-position reports (CPR / DSR): `\x1b[<row>;<col>R`. Sent
+ *     in response to an app-issued query, not a user keypress.
+ *
+ * Anything else — bytes that look like keystrokes — counts as user
+ * input. This keeps the dismiss-on-keystroke behaviour intuitive
+ * while letting the click-to-jump UX preserve the notification.
+ */
+function isUserKeystroke(data: string): boolean {
+  if (data === '\x1b[I' || data === '\x1b[O') return false
+  // SGR mouse: `ESC [ < flags ; col ; row M|m`
+  if (/^\x1b\[<\d+;\d+;\d+[Mm]/.test(data)) return false
+  // X10 mouse: `ESC [ M <byte><byte><byte>`
+  if (data.startsWith('\x1b[M') && data.length === 6) return false
+  // CPR / DSR response: `ESC [ row ; col R`
+  if (/^\x1b\[\d+;\d+R$/.test(data)) return false
+  return true
 }

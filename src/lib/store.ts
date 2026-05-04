@@ -214,6 +214,26 @@ interface HelmState {
    * disconnect/delete; this is belt-and-braces for the host_removed
    * event path. */
   dismissNotificationsForHost: (hostId: HostId) => void
+
+  // ---------- tool integration suggestions ----------
+  /** Sticky cards prompting the user to install a tool integration
+   * (e.g. Claude Code's bell hooks). Pushed by the backend when it
+   * detects a known tool running in a pane that doesn't have its
+   * integration installed yet. Cleared when the user clicks Install
+   * or Not now. Backend keys these (host, integration_id) so each
+   * pair fires at most once per app session. */
+  toolSuggestions: ToolIntegrationSuggestion[]
+  pushToolSuggestion: (s: ToolIntegrationSuggestion) => void
+  dismissToolSuggestion: (hostId: HostId, integrationId: string) => void
+}
+
+/** One pending tool-integration suggestion. */
+export interface ToolIntegrationSuggestion {
+  hostId: HostId
+  integrationId: string
+  name: string
+  description: string
+  postInstallNote: string
 }
 
 function withHostSessions(
@@ -512,6 +532,25 @@ export const useStore = create<HelmState>((set) => ({
         next.set(id, n)
       }
       return changed ? { notifications: next } : {}
+    }),
+
+  toolSuggestions: [],
+  pushToolSuggestion: (sug) =>
+    set((s) => {
+      // De-dupe per (host, integration). Backend gates this too, but
+      // a webview reload could push twice if the backend re-emits.
+      const existing = s.toolSuggestions.find(
+        (x) => x.hostId === sug.hostId && x.integrationId === sug.integrationId,
+      )
+      if (existing) return {}
+      return { toolSuggestions: [...s.toolSuggestions, sug] }
+    }),
+  dismissToolSuggestion: (hostId, integrationId) =>
+    set((s) => {
+      const next = s.toolSuggestions.filter(
+        (x) => !(x.hostId === hostId && x.integrationId === integrationId),
+      )
+      return next.length === s.toolSuggestions.length ? {} : { toolSuggestions: next }
     }),
 }))
 

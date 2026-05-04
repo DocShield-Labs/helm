@@ -25,6 +25,7 @@ import { connectHost, selectWorkspace, subscribeHostEvents } from '@lib/host'
 import { TmuxPane } from '@features/shell/TmuxPane'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
 import { HostKeyPromptModal } from '@features/host-key/HostKeyPromptModal'
+import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSuggestionHost'
 import { ReconnectingOverlay } from '@features/workspace/ReconnectingOverlay'
 import {
   Sidebar,
@@ -452,6 +453,7 @@ export function App() {
 
       <HostKeyPromptModal />
 
+      <IntegrationSuggestionHost />
       <ToastHost />
     </div>
   )
