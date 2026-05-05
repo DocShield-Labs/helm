@@ -977,7 +977,7 @@ async fn connect_remote_multi(
          export HELM_USER_ZDOTDIR=\"${{ZDOTDIR:-$HOME}}\"; \
          export ZDOTDIR=\"$HOME/.helm/integration/zsh\"; \
          if [ -z \"$(tmux list-sessions -F '#{{session_id}}' 2>/dev/null)\" ]; then \
-            tmux new-session -d -s '{workspace}' 2>/dev/null; \
+            tmux new-session -d -c \"$HOME\" -s '{workspace}' 2>/dev/null; \
          fi; \
          tmux set-environment -g HELM_INTEGRATION 1 2>/dev/null; \
          tmux set-environment -g HELM_USER_ZDOTDIR \"$HELM_USER_ZDOTDIR\" 2>/dev/null; \
