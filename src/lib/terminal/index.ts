@@ -87,11 +87,53 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   })
   term.loadAddon(links)
 
-  // Cmd-prefixed shortcuts are app shortcuts (new window, switch, palette,
-  // etc.); never forward them to the shell. xterm calls this before
-  // emitting onData / interpreting keys, so returning false vetoes its
-  // handling and the document-level keydown listener gets a clean shot.
+  // Translate a few macOS-standard editing chords into the bytes
+  // readline-style line editors (zsh, bash, most TUIs) actually
+  // understand:
+  //
+  //   Cmd+Left   → ^A   (go to beginning of line)
+  //   Cmd+Right  → ^E   (go to end of line)
+  //   Shift+Enter → LF  (literal newline; CRLF-aware CLIs treat the
+  //                       CR-less LF as multi-line input — matches
+  //                       iTerm2 / Terminal.app default)
+  //
+  // We have to fully claim these events: returning false from the
+  // xterm handler only stops xterm's own translation, the
+  // KeyboardEvent still propagates to the document and OS. Without
+  // preventDefault + stopPropagation, macOS (or the Tauri window
+  // chrome) will eat Cmd+Left as a window-management shortcut.
+  //
+  // Other Cmd-prefixed chords (palette, switcher, block actions)
+  // pass through to the document-level keymap unchanged — we only
+  // veto xterm's data emission for them.
   term.attachCustomKeyEventHandler((ev) => {
+    if (ev.type !== 'keydown') return true
+    const onlyMeta =
+      ev.metaKey && !ev.shiftKey && !ev.altKey && !ev.ctrlKey
+    if (onlyMeta && ev.key === 'ArrowLeft') {
+      ev.preventDefault()
+      ev.stopPropagation()
+      term.input('\x01', true)
+      return false
+    }
+    if (onlyMeta && ev.key === 'ArrowRight') {
+      ev.preventDefault()
+      ev.stopPropagation()
+      term.input('\x05', true)
+      return false
+    }
+    if (
+      ev.shiftKey &&
+      !ev.metaKey &&
+      !ev.altKey &&
+      !ev.ctrlKey &&
+      ev.key === 'Enter'
+    ) {
+      ev.preventDefault()
+      ev.stopPropagation()
+      term.input('\n', true)
+      return false
+    }
     if (ev.metaKey) return false
     return true
   })
