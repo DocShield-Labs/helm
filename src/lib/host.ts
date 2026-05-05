@@ -46,6 +46,21 @@ export async function subscribeHostEvents(): Promise<void> {
   if (subscribed) return
   const channel = new Channel<HostEvent>()
   channel.onmessage = (evt) => {
+    // host_added / host_removed are the only events that legitimately
+    // arrive for a host id we don't yet (or no longer) track. Every
+    // other event references a host that should already be in the
+    // store. Drop late-arriving events for deleted hosts so a stuck
+    // supervisor's tail-end emissions can't repopulate `statuses` /
+    // `notifications` / `toolSuggestions` for a host the user just
+    // removed.
+    if (
+      evt.kind !== 'host_added' &&
+      evt.kind !== 'host_removed' &&
+      'host_id' in evt &&
+      !useStore.getState().hosts.has(evt.host_id)
+    ) {
+      return
+    }
     if (evt.kind === 'status') {
       const store = useStore.getState()
       const prev = store.statuses.get(evt.host_id)

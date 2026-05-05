@@ -13,9 +13,10 @@ export interface PaletteProps {
   open: boolean
   query: string
   onQueryChange?: (q: string) => void
-  /** When set, a small chip is rendered between the ⌘ glyph and the input.
-   * Used by sub-modes (`@workspaces`, `#windows`, `$hosts`). */
-  chip?: string
+  /** Filter chips rendered between the ⌘ glyph and the input. Each entry
+   * is a sub-mode label (`@workspaces`, `#windows`, `$hosts`) or, when
+   * the user has drilled into a row, a single `↳ <parent>` breadcrumb. */
+  chips?: readonly string[]
   /** Body — rendered between the header and footer. Scrolls when long. */
   children?: ReactNode
   /** Optional footer content (the `↑↓ navigate · ↵ run · esc close` row). */
@@ -30,7 +31,7 @@ export function Palette({
   open,
   query,
   onQueryChange,
-  chip,
+  chips,
   children,
   footer,
   onClose,
@@ -51,13 +52,18 @@ export function Palette({
       >
         <div className="flex h-14 items-center gap-3 px-[18px]">
           <span className="font-mono text-[18px] text-text-tertiary">⌘</span>
-          {chip && (
-            <span
-              className="inline-flex items-center rounded-md border border-accent-border bg-accent-muted px-2 py-1 font-mono text-[12px] font-medium"
-              style={{ color: 'var(--accent-text)' }}
-            >
-              {chip}
-            </span>
+          {chips && chips.length > 0 && (
+            <div className="flex items-center gap-1">
+              {chips.map((c, i) => (
+                <span
+                  key={`${i}.${c}`}
+                  className="inline-flex items-center rounded-md border border-accent-border bg-accent-muted px-2 py-1 font-mono text-[12px] font-medium"
+                  style={{ color: 'var(--accent-text)' }}
+                >
+                  {c}
+                </span>
+              ))}
+            </div>
           )}
           <input
             autoFocus

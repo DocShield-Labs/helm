@@ -39,6 +39,7 @@ import {
   StatusBarSegment,
   StatusBarDivider,
   ToastHost,
+  ConfirmHost,
 } from '@ui'
 import type { Host, HostStatus } from '@bindings'
 
@@ -468,6 +469,7 @@ export function App() {
 
       <IntegrationSuggestionHost />
       <PaletteHost />
+      <ConfirmHost />
       <ToastHost />
     </div>
   )
@@ -476,13 +478,36 @@ export function App() {
 /** Remove a remote host from the registry. Disconnects (if connected),
  * clears its Keychain entry, and rewrites hosts.json. Confirmation
  * dialog because this is destructive — the user's saved password and
- * other host metadata are gone. */
+ * other host metadata are gone. The Rust side emits HostRemoved before
+ * persistence runs, so the UI updates either way; a toast surfaces the
+ * persistence error if the on-disk write failed. */
 async function deleteHost(host: Host): Promise<void> {
-  const ok = window.confirm(
-    `Delete host "${host.name}"? This removes it from your saved list and clears any stored password. tmux sessions on the remote machine are unaffected.`,
-  )
+  const ok = await useStore.getState().requestConfirm({
+    title: `Delete host "${host.name}"?`,
+    message:
+      'This removes it from your saved list and clears any stored password. tmux sessions on the remote machine are unaffected.',
+    confirmLabel: 'Delete',
+    destructive: true,
+  })
   if (!ok) return
-  await commands.hostDelete(host.id)
+  let res: Awaited<ReturnType<typeof commands.hostDelete>>
+  try {
+    res = await commands.hostDelete(host.id)
+  } catch (e) {
+    useStore.getState().pushToast({
+      id: `host-delete-error::${host.id}`,
+      message: `Delete threw: ${String(e)}`,
+      durationMs: 8_000,
+    })
+    return
+  }
+  if (res.status !== 'ok') {
+    useStore.getState().pushToast({
+      id: `host-delete-error::${host.id}`,
+      message: `Couldn't fully delete "${host.name}": ${res.error}`,
+      durationMs: 8_000,
+    })
+  }
 }
 
 /** Render a tmux-command round-trip latency for the connection segment.

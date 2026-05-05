@@ -117,23 +117,56 @@ pub async fn host_delete(state: State<'_, AppState>, host_id: HostId) -> Result<
     if host_id == state.local_host_id {
         return Err("cannot delete localhost".into());
     }
-    if let Some((_, entry)) = state.hosts.remove(&host_id) {
-        let mut guard = entry.lock().await;
-        guard.voluntary_disconnect = true;
-        if let Some(handle) = guard.supervisor.take() {
-            handle.abort();
-        }
-        guard.shutdown_clients();
-    }
-    persist_hosts(&state).await?;
+
+    // Drop from the in-memory registry FIRST. DashMap::remove is
+    // synchronous and never blocks on the entry's inner mutex, so this
+    // succeeds even if a stuck do_connect / supervise task has the
+    // mutex out for a slow SSH negotiation. We hand the Arc off to a
+    // detached cleanup task below; the user's intent ("host gone") is
+    // decoupled from the supervisor-abort latency.
+    let removed = state.hosts.remove(&host_id);
+
     // Best-effort Keychain cleanup. If the host wasn't using password
     // auth there's nothing to delete; the wrapper already swallows the
     // not-found error.
     let _ = crate::keychain::delete_password(host_id);
+
+    // Drop any pending host-key prompt sender. If the user deletes a
+    // host whose connect is parked waiting for their accept/reject,
+    // dropping the sender closes the oneshot — the receiver in helm-
+    // ssh's prompter callback resolves to RecvError, the prompter
+    // returns Reject, and connect_session bails out promptly instead
+    // of waiting for the 15s SSH timeout. The detached cleanup task
+    // below picks up afterward.
+    let _ = state.pending_host_key_prompts.remove(&host_id);
+
+    // Emit HostRemoved + dismiss notifications immediately. The
+    // frontend store removes the host on this event — independent of
+    // both the disk persist below and the detached supervisor cleanup.
     let event_tx = state.event_tx.lock().await.clone();
     let notif_ctx = state.notifications_ctx();
     notifications::dismiss_for_host(&notif_ctx, &event_tx, host_id);
     emit_event(&event_tx, HostEvent::HostRemoved { host_id });
+
+    // Detached cleanup: lock the entry, mark voluntary, abort the
+    // supervisor, drop clients. Not awaited — a stuck connect can
+    // hold the entry mutex indefinitely (and a supervisor mid-
+    // spawn_blocking SSH negotiation can't be aborted until the
+    // blocking call returns), so making the IPC wait would just
+    // re-introduce the original "delete does nothing" symptom for
+    // a different reason.
+    if let Some((_, entry)) = removed {
+        tokio::spawn(async move {
+            let mut guard = entry.lock().await;
+            guard.voluntary_disconnect = true;
+            if let Some(handle) = guard.supervisor.take() {
+                handle.abort();
+            }
+            guard.shutdown_clients();
+        });
+    }
+
+    persist_hosts(&state).await?;
     Ok(())
 }
 

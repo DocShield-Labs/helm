@@ -227,11 +227,34 @@ function hostSubActions(host: Host, display: HostDisplayStatus): Action[] {
       icon: '×',
       destructive: true,
       run: () => {
-        const ok = window.confirm(
-          `Delete host "${host.name}"? This removes it from your saved list and clears any stored password. tmux sessions on the remote machine are unaffected.`,
-        )
-        if (!ok) return
-        void commands.hostDelete(host.id)
+        void (async () => {
+          const ok = await useStore.getState().requestConfirm({
+            title: `Delete host "${host.name}"?`,
+            message:
+              'This removes it from your saved list and clears any stored password. tmux sessions on the remote machine are unaffected.',
+            confirmLabel: 'Delete',
+            destructive: true,
+          })
+          if (!ok) return
+          let res: Awaited<ReturnType<typeof commands.hostDelete>>
+          try {
+            res = await commands.hostDelete(host.id)
+          } catch (e) {
+            useStore.getState().pushToast({
+              id: `host-delete-error::${host.id}`,
+              message: `Delete threw: ${String(e)}`,
+              durationMs: 8_000,
+            })
+            return
+          }
+          if (res.status !== 'ok') {
+            useStore.getState().pushToast({
+              id: `host-delete-error::${host.id}`,
+              message: `Couldn't fully delete "${host.name}": ${res.error}`,
+              durationMs: 8_000,
+            })
+          }
+        })()
       },
     })
   }

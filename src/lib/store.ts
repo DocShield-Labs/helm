@@ -114,6 +114,25 @@ export interface PendingWorkspaceKill {
   workspace: TmuxWorkspace
 }
 
+/** Options accepted by `requestConfirm`. Mirrors a tiny subset of the
+ * native dialog: a heading, a body line, and a label for the
+ * affirmative button (defaults to "Confirm"). `destructive` styles the
+ * confirm button red. */
+export interface ConfirmOptions {
+  title: string
+  message: string
+  confirmLabel?: string
+  destructive?: boolean
+}
+
+/** Live confirmation request. `resolve` is invoked with the user's
+ * answer (true for confirm, false for cancel/close); `requestConfirm`
+ * keeps the matching Promise on the calling side. */
+export interface ConfirmPrompt extends ConfirmOptions {
+  id: number
+  resolve: (answer: boolean) => void
+}
+
 /** Transient notification, shown at the bottom-right of the window. May
  * carry a deferred action that fires after `durationMs` unless the toast
  * is dismissed first (used for "undo within 5s" patterns). */
@@ -169,14 +188,15 @@ interface HelmState {
   expandedHosts: Set<HostId>
   toggleHostExpanded: (host: HostId) => void
 
-  /** Command palette open state and which entry mode it was opened in.
-   * `actions` is the default Cmd+K view (recents + fuzzy actions);
-   * `switcher` is the Cmd+P view pre-mixing workspaces + windows.
-   * Sub-modes (@workspaces / #windows / $hosts) are derived from the
-   * input value, not stored — they're transient sigil prefixes. */
+  /** Command palette open state plus an optional initial query string
+   * the palette should boot with. Cmd+K passes nothing (empty palette);
+   * Cmd+P passes `'@#'` so the palette opens with the workspace + window
+   * filter chips already applied. Sub-modes (@workspaces / #windows /
+   * $hosts) are still derived from the input — `paletteInitialQuery`
+   * just seeds it. */
   paletteOpen: boolean
-  paletteMode: 'actions' | 'switcher'
-  openPalette: (mode?: 'actions' | 'switcher') => void
+  paletteInitialQuery: string
+  openPalette: (initialQuery?: string) => void
   closePalette: () => void
 
   // ---------- pinned windows ----------
@@ -301,6 +321,18 @@ interface HelmState {
   /** Drop every running entry for a host. Called on disconnect and
    * host removal so a stale spinner doesn't outlive its tmux server. */
   clearRunningForHost: (host: HostId) => void
+
+  // ---------- confirm dialog ----------
+  /** Pending confirmation request, or null when no dialog is open.
+   * `requestConfirm` parks a Promise here that resolves once the user
+   * picks Confirm or Cancel — Tauri 2 webviews no-op `window.confirm`,
+   * so we render an in-app Modal via `ConfirmHost` instead. At most
+   * one prompt at a time; a second request while one is in flight
+   * resolves the previous one as cancelled (fail-safe for double
+   * triggers). */
+  confirmPrompt: ConfirmPrompt | null
+  requestConfirm: (opts: ConfirmOptions) => Promise<boolean>
+  resolveConfirm: (answer: boolean) => void
 
   // ---------- toasts ----------
   toasts: Toast[]
@@ -543,8 +575,9 @@ export const useStore = create<HelmState>((set, get) => ({
     }),
 
   paletteOpen: false,
-  paletteMode: 'actions',
-  openPalette: (mode = 'actions') => set({ paletteOpen: true, paletteMode: mode }),
+  paletteInitialQuery: '',
+  openPalette: (initialQuery = '') =>
+    set({ paletteOpen: true, paletteInitialQuery: initialQuery }),
   closePalette: () => set({ paletteOpen: false }),
   addPinnedWindow: (pin) =>
     set((s) => {
@@ -594,7 +627,11 @@ export const useStore = create<HelmState>((set, get) => ({
 
   removeHost: (id) =>
     set((s) => {
-      if (!s.hosts.has(id)) return s
+      // Idempotent: a stale `host_removed` event (from a Cmd+R replay,
+      // or duplicate emit) just no-ops if the host is already gone.
+      // Without this we'd waste a render cycle rebuilding every map.
+      if (!s.hosts.has(id) && !s.statuses.has(id)) return {}
+
       const nextHosts = new Map(s.hosts)
       nextHosts.delete(id)
       const nextStatuses = new Map(s.statuses)
@@ -603,28 +640,51 @@ export const useStore = create<HelmState>((set, get) => ({
       nextSessions.delete(id)
       const nextErrors = new Map(s.hostErrors)
       nextErrors.delete(id)
+      const nextLatencies = new Map(s.hostLatencies)
+      nextLatencies.delete(id)
+      const nextHostKeyPrompts = new Map(s.hostKeyPrompts)
+      nextHostKeyPrompts.delete(id)
+      const nextExpanded = new Set(s.expandedHosts)
+      nextExpanded.delete(id)
+
+      // Notifications, pane captures, running panes, and tool
+      // suggestions are all keyed by string compounds that include
+      // the host id — walk each and drop matching entries. The
+      // hostId-prefixed key formats are documented at the field
+      // declarations above.
       const nextNotifications = new Map<NotificationId, Notification>()
       for (const [nid, n] of s.notifications) {
         if (n.host_id !== id) nextNotifications.set(nid, n)
       }
-      const runningPrefix = `${id}::`
-      let nextRunning = s.runningPanes
+      const prefix = `${id}::`
+      const nextRunning = new Map(s.runningPanes)
       for (const k of s.runningPanes.keys()) {
-        if (k.startsWith(runningPrefix)) {
-          nextRunning = new Map(s.runningPanes)
-          for (const k2 of s.runningPanes.keys()) {
-            if (k2.startsWith(runningPrefix)) nextRunning.delete(k2)
-          }
-          break
-        }
+        if (k.startsWith(prefix)) nextRunning.delete(k)
       }
+      const nextCaptures = new Map(s.paneCaptures)
+      for (const k of s.paneCaptures.keys()) {
+        if (k.startsWith(prefix)) nextCaptures.delete(k)
+      }
+      const nextSuggestions = s.toolSuggestions.filter((t) => t.hostId !== id)
+      const nextPinned = s.pinnedWindows.filter((p) => p.hostId !== id)
+      // Pinned windows persist to localStorage — keep on-disk state
+      // consistent with the in-memory list so the host doesn't
+      // resurrect its pins on next launch.
+      if (nextPinned.length !== s.pinnedWindows.length) writePinnedWindows(nextPinned)
+
       return {
         hosts: nextHosts,
         statuses: nextStatuses,
         sessions: nextSessions,
         hostErrors: nextErrors,
+        hostLatencies: nextLatencies,
+        hostKeyPrompts: nextHostKeyPrompts,
+        expandedHosts: nextExpanded,
         notifications: nextNotifications,
         runningPanes: nextRunning,
+        paneCaptures: nextCaptures,
+        toolSuggestions: nextSuggestions,
+        pinnedWindows: nextPinned,
         activeHostId: s.activeHostId === id ? null : s.activeHostId,
       }
     }),
@@ -1024,6 +1084,25 @@ export const useStore = create<HelmState>((set, get) => ({
         if (!k.startsWith(prefix)) next.set(k, v)
       }
       return next.size === s.runningPanes.size ? {} : { runningPanes: next }
+    }),
+
+  confirmPrompt: null,
+  requestConfirm: (opts) =>
+    new Promise<boolean>((resolve) => {
+      set((s) => {
+        // Fail-safe: any in-flight prompt is implicitly cancelled. The
+        // ConfirmHost only ever shows one at a time, so a stale
+        // resolver hanging around would otherwise leak.
+        s.confirmPrompt?.resolve(false)
+        const id = (s.confirmPrompt?.id ?? 0) + 1
+        return { confirmPrompt: { id, ...opts, resolve } }
+      })
+    }),
+  resolveConfirm: (answer) =>
+    set((s) => {
+      if (!s.confirmPrompt) return {}
+      s.confirmPrompt.resolve(answer)
+      return { confirmPrompt: null }
     }),
 
   toasts: [],

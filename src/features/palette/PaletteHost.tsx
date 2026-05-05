@@ -2,11 +2,20 @@
  * Command palette orchestrator.
  *
  * Owns transient input state (query, selected index, drilled-in object),
- * parses the leading `@` / `#` / `$` sigil into a sub-mode chip, picks a
- * result source (static actions, dynamic projection, or recents+actions
- * for the empty state), runs them through the fuzzy ranker, and
- * dispatches the chosen action. Open/close state lives in the store so
- * the keymap engine can flip it via the `palette.open` action.
+ * parses the run of leading `@` / `#` / `$` sigils into an ordered list
+ * of sub-mode chips, picks a result source (static actions, the union
+ * of the active projections, the drilled object's subActions, or
+ * recents+actions for the empty state), runs them through the fuzzy
+ * ranker, and dispatches the chosen action. Open/close state lives in
+ * the store so the keymap engine can flip it via `palette.open`. A
+ * paired `paletteInitialQuery` lets entry actions seed the input —
+ * Cmd+P opens with `'@#'` so the workspace + window chips are already
+ * applied.
+ *
+ * Esc walks back one navigation step at a time: drill-out if drilled
+ * in, otherwise peel the rightmost chip off. Once there's nothing
+ * left to pop, Esc closes the palette. Backspace-on-empty does the
+ * same step-pop (just doesn't close at the bottom).
  *
  * The renderer treats the matched list as a flat sequence of items
  * carrying optional section headers — that way ↑↓ navigation only ever
@@ -19,8 +28,6 @@ import { useStore } from '@lib/store'
 import { STATIC_ACTIONS, findActionById, type Action } from '@lib/actions'
 import {
   resolveSigil,
-  workspacesAsActions,
-  windowsAsActions,
   type Sigil,
   type SubModeResult,
 } from '@lib/actions/dynamic'
@@ -59,15 +66,34 @@ function rankActions(query: string, actions: readonly Action[]): ScoredAction[] 
   return out
 }
 
-function parseInput(raw: string): { sub: SubModeResult | null; residual: string } {
-  const first = raw[0] as Sigil | undefined
-  if (first && (SIGILS as readonly string[]).includes(first)) {
-    const sub = resolveSigil(first)
-    let residual = raw.slice(1)
-    if (residual.startsWith(' ')) residual = residual.slice(1)
-    return { sub, residual }
+/** Consume every leading sigil in `raw` into an ordered list of
+ * sub-mode projections. The query string remains the source of truth
+ * for which chips are active — `'@#term'` resolves to `[@workspaces,
+ * #windows]` + residual `'term'`. Repeats are deduped on character so
+ * `'@@foo'` doesn't render two identical chips. */
+function parseInput(raw: string): { subs: SubModeResult[]; residual: string } {
+  const subs: SubModeResult[] = []
+  const seen = new Set<string>()
+  let i = 0
+  while (i < raw.length && (SIGILS as readonly string[]).includes(raw[i])) {
+    const c = raw[i] as Sigil
+    if (!seen.has(c)) {
+      seen.add(c)
+      subs.push(resolveSigil(c))
+    }
+    i++
   }
-  return { sub: null, residual: raw }
+  let residual = raw.slice(i)
+  if (residual.startsWith(' ')) residual = residual.slice(1)
+  return { subs, residual }
+}
+
+/** Count the leading sigil characters (including duplicates) so
+ * Backspace can strip exactly one off the rightmost end of the query. */
+function leadingSigilCount(raw: string): number {
+  let i = 0
+  while (i < raw.length && (SIGILS as readonly string[]).includes(raw[i])) i++
+  return i
 }
 
 function renderBinding(binding: string | readonly string[] | undefined) {
@@ -93,8 +119,7 @@ function renderBinding(binding: string | readonly string[] | undefined) {
 
 interface ComputeEntriesArgs {
   drilled: Action | null
-  sub: SubModeResult | null
-  mode: 'actions' | 'switcher'
+  subs: readonly SubModeResult[]
   residual: string
   ranked: readonly ScoredAction[]
 }
@@ -102,18 +127,23 @@ interface ComputeEntriesArgs {
 /** Produce the rendered (header + item) sequence for the current
  * palette state. Pure: no React, no store reads. The caller wraps this
  * in `useMemo` with the appropriate dep array. */
-function computeEntries({ drilled, sub, mode, residual, ranked }: ComputeEntriesArgs): ListEntry[] {
+function computeEntries({ drilled, subs, residual, ranked }: ComputeEntriesArgs): ListEntry[] {
   // Drilled in: just the subActions list, no headers.
   if (drilled) {
     return ranked.map(({ action }) => ({ type: 'item', action }))
   }
 
-  // Sigil sub-mode with grouping (e.g. @workspaces, $hosts).
-  if (sub?.groups) {
+  // Single sigil sub-mode with grouping (e.g. @workspaces, $hosts).
+  // We only keep group headers when exactly one sub is active —
+  // mixing groups across two unrelated projections (e.g. workspaces
+  // grouped by host alongside ungrouped windows) tends to look noisy,
+  // so the multi-chip case falls through to a flat list.
+  if (subs.length === 1 && subs[0].groups) {
+    const groups = subs[0].groups
     const out: ListEntry[] = []
     let lastLabel: string | null = null
     for (const { action } of ranked) {
-      const group = sub.groups.get(action.id)
+      const group = groups.get(action.id)
       if (group && group.label !== lastLabel) {
         out.push({ type: 'header', label: group.label, count: group.count })
         lastLabel = group.label
@@ -123,8 +153,8 @@ function computeEntries({ drilled, sub, mode, residual, ranked }: ComputeEntries
     return out
   }
 
-  // Empty actions-mode → RECENTS section then ACTIONS.
-  if (!sub && mode === 'actions' && residual.length === 0) {
+  // Empty palette (no chips, no typed text) → RECENTS section then ACTIONS.
+  if (subs.length === 0 && residual.length === 0) {
     const recents: Action[] = []
     for (const id of getRecents()) {
       const a = findActionById(id)
@@ -153,42 +183,55 @@ function computeEntries({ drilled, sub, mode, residual, ranked }: ComputeEntries
 
 export function PaletteHost() {
   const open = useStore((s) => s.paletteOpen)
-  const mode = useStore((s) => s.paletteMode)
+  const initialQuery = useStore((s) => s.paletteInitialQuery)
   const close = useStore((s) => s.closePalette)
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)
   /** Object the user has drilled into (→ / Cmd+Enter on a result). The
-   * palette swaps its source list for `drilled.subActions()`; Esc and
-   * Backspace-on-empty pop back to the parent view. */
+   * palette swaps its source list for `drilled.subActions()`; Esc
+   * pops back to the parent view, and Backspace-on-empty does the
+   * same for keyboard-only navigation. */
   const [drilled, setDrilled] = useState<Action | null>(null)
 
+  // Seed the query from `paletteInitialQuery` on each open. Cmd+K
+  // passes empty; Cmd+P passes `'@#'` so the palette boots with the
+  // workspace + window chips already applied.
   useEffect(() => {
     if (open) {
-      setQuery('')
+      setQuery(initialQuery)
       setSelected(0)
       setDrilled(null)
     }
-  }, [open])
+  }, [open, initialQuery])
 
-  const { sub, residual } = useMemo(
-    () => (open ? parseInput(query) : { sub: null, residual: '' }),
+  const { subs, residual } = useMemo(
+    () => (open ? parseInput(query) : { subs: [] as SubModeResult[], residual: '' }),
     [open, query],
   )
 
   // Source list:
   //   - drill-in → the drilled object's subActions
-  //   - sigil chip → that sub-mode's projection
-  //   - switcher mode → workspaces ∪ windows (windows already carry
-  //     pin-aware weight/icon via `windowsAsActions`)
-  //   - actions mode → the static registry
+  //   - one or more sigil chips → union of those projections (deduped
+  //     by action id; first-seen wins so the chip order controls
+  //     iteration order — `@#` lists workspaces first, `#@` lists
+  //     windows first)
+  //   - otherwise → the static registry (default Cmd+K view)
   const sourceActions = useMemo<readonly Action[]>(() => {
     if (drilled?.subActions) return drilled.subActions()
-    if (sub) return sub.actions
-    if (mode === 'switcher') {
-      return [...workspacesAsActions().actions, ...windowsAsActions().actions]
+    if (subs.length > 0) {
+      const seen = new Set<string>()
+      const out: Action[] = []
+      for (const s of subs) {
+        for (const a of s.actions) {
+          if (seen.has(a.id)) continue
+          seen.add(a.id)
+          out.push(a)
+        }
+      }
+      return out
     }
     return STATIC_ACTIONS
-  }, [drilled, sub, mode])
+  }, [drilled, subs])
 
   const ranked = useMemo(
     () => (open ? rankActions(residual, sourceActions) : []),
@@ -196,8 +239,8 @@ export function PaletteHost() {
   )
 
   const entries = useMemo<ListEntry[]>(
-    () => (open ? computeEntries({ drilled, sub, mode, residual, ranked }) : []),
-    [open, drilled, sub, mode, residual, ranked],
+    () => (open ? computeEntries({ drilled, subs, residual, ranked }) : []),
+    [open, drilled, subs, residual, ranked],
   )
 
   // Index map: position in `entries` of the i-th item-row, used to map
@@ -244,24 +287,35 @@ export function PaletteHost() {
     setSelected(0)
   }
 
+  /** Pop one navigation step. Drilled view → its parent. Otherwise
+   * peel the rightmost chip off. Returns false when there's nothing
+   * left to pop (caller closes). */
+  const popOneStep = (): boolean => {
+    if (drilled) {
+      popDrill()
+      return true
+    }
+    const sigilCount = leadingSigilCount(query)
+    if (sigilCount > 0) {
+      const next = query.slice(0, sigilCount - 1) + query.slice(sigilCount)
+      setQuery(next)
+      return true
+    }
+    return false
+  }
+
   const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // Esc and Backspace-on-empty both step backwards through the
+    // nav stack: drill-out, then peel chips one at a time, then
+    // (Esc only) close once we hit the bottom.
     if (e.key === 'Escape') {
       e.preventDefault()
-      if (drilled) popDrill()
-      else close()
+      if (!popOneStep()) close()
       return
     }
     if (e.key === 'Backspace' && residual.length === 0) {
-      if (drilled) {
-        e.preventDefault()
-        popDrill()
-        return
-      }
-      if (sub) {
-        e.preventDefault()
-        setQuery('')
-        return
-      }
+      if (popOneStep()) e.preventDefault()
+      return
     }
     if (e.key === 'ArrowDown') {
       e.preventDefault()
@@ -324,24 +378,29 @@ export function PaletteHost() {
   }
 
   // Chip rules:
-  //   - drilled in → "↳ <parent label>", overrides any sigil chip
-  //   - sigil active → that sub-mode's chip
-  //   - otherwise → no chip
-  const chip = drilled ? `↳ ${drilled.label}` : sub?.chip
+  //   - drilled in → single "↳ <parent label>" breadcrumb chip,
+  //     overrides any sigil chips
+  //   - one or more sigils → one chip per active sub, in the order
+  //     they appear in the query
+  //   - otherwise → no chips
+  const chips = drilled ? [`↳ ${drilled.label}`] : subs.map((s) => s.chip)
+
+  // Reconstruct the query when the user types. The visible input
+  // value is just the residual; we have to re-prepend the sigil run
+  // so backing state stays consistent.
+  const sigilPrefix = drilled ? '' : query.slice(0, leadingSigilCount(query))
 
   return (
     <Palette
       open={open}
       query={residual}
       onQueryChange={(v) => {
-        // While drilled, query is a free-text fuzzy filter over the
-        // subActions — no sigil prefix to preserve.
         if (drilled) setQuery(v)
-        else setQuery(sub ? `${sub.chip[0]}${v}` : v)
+        else setQuery(sigilPrefix + v)
       }}
       onClose={close}
       onInputKeyDown={onInputKeyDown}
-      chip={chip}
+      chips={chips}
       footer={<Footer />}
     >
       {body}
