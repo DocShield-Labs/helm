@@ -81,7 +81,7 @@ async fn new_window_shows_in_list() {
     // Create the test window IN the test session; otherwise the global
     // -a listing might be picking up windows from the user's other sessions.
     client
-        .new_window(Some(&session), Some("api-server"))
+        .new_window(Some(&session), Some("api-server"), None)
         .await
         .expect("new-window");
 
@@ -109,7 +109,7 @@ async fn window_add_notification_fires() {
     while let Ok(_) = tokio::time::timeout(Duration::from_millis(100), events.recv()).await {}
 
     client
-        .new_window(Some(&session), Some("logs"))
+        .new_window(Some(&session), Some("logs"), None)
         .await
         .expect("new-window");
 

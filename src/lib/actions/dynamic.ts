@@ -23,6 +23,8 @@ import {
   STATUS_RANK,
   type HostDisplayStatus,
 } from '@lib/host-status'
+import { groupHostByFolder } from '@lib/folder-view'
+import { paneCwdFor, prettyCwd } from '@lib/path'
 import type { Host } from '@bindings'
 import type { Action } from './types'
 import { killWorkspace } from './workspace'
@@ -71,6 +73,10 @@ function workspaceSubActions(hostId: string, ws: TmuxWorkspace): Action[] {
 
 export function workspacesAsActions(): SubModeResult {
   const state = useStore.getState()
+  // Folder view re-projects this same `@` channel as folders. Same
+  // shape (Action[]), different identity scheme — running a folder
+  // jumps to its first window since folders aren't selectable units.
+  if (state.sidebarViewMode === 'folder') return foldersAsActions()
   const actions: Action[] = []
   const groups = new Map<string, GroupHeader>()
   for (const host of state.hosts.values()) {
@@ -97,6 +103,43 @@ export function workspacesAsActions(): SubModeResult {
     }
   }
   return { chip: '@workspaces', actions, groups }
+}
+
+// ---------- @folders (folder-view variant of @workspaces) ----------
+
+function foldersAsActions(): SubModeResult {
+  const state = useStore.getState()
+  const actions: Action[] = []
+  const groups = new Map<string, GroupHeader>()
+  for (const host of state.hosts.values()) {
+    const hs = state.sessions.get(host.id)
+    if (!hs) continue
+    const folderGroups = groupHostByFolder(hs)
+    const header: GroupHeader = { label: host.name.toUpperCase(), count: folderGroups.length }
+    for (const fg of folderGroups) {
+      const id = `folder.${host.id}.${fg.path}`
+      // Jump to the first window in the folder. Folders aren't a
+      // selectable tmux unit on their own, so "switching" means
+      // landing on a window inside it.
+      const first = fg.entries[0]
+      actions.push({
+        id,
+        kind: 'workspace',
+        label: fg.label,
+        sublabel: `· ${fg.entries.length} window${fg.entries.length === 1 ? '' : 's'}`,
+        icon: '▦',
+        run: () => {
+          if (!first) return
+          state.setActiveHost(host.id)
+          state.setActiveWindow(host.id, first.workspace.id, first.window.id)
+          void selectWorkspace(host.id, first.workspace.id)
+          void commands.tmuxSelectWindow(host.id, first.window.id)
+        },
+      })
+      groups.set(id, header)
+    }
+  }
+  return { chip: '@folders', actions, groups }
 }
 
 // ---------- #windows ----------
@@ -157,6 +200,7 @@ function windowSubActions(host: Host, ws: TmuxWorkspace, win: TmuxWindow): Actio
 
 export function windowsAsActions(): SubModeResult {
   const state = useStore.getState()
+  const folderMode = state.sidebarViewMode === 'folder'
   const actions: Action[] = []
   // Pre-resolve the pinned set so each row knows whether to bubble up
   // and render with a star icon. This used to be a post-process step
@@ -171,11 +215,21 @@ export function windowsAsActions(): SubModeResult {
         const isPinned = pins.some(
           (p) => p.hostId === host.id && p.workspaceName === ws.name && p.windowId === win.id,
         )
+        // Sublabel reflects current grouping: folder-of-cwd in folder
+        // view, workspace name in workspace view. The action's run is
+        // identical either way — selection still flips the underlying
+        // tmux session.
+        const tail = folderMode
+          ? (() => {
+              const cwd = paneCwdFor(win.id, ws)
+              return cwd === '' ? '(no cwd)' : prettyCwd(cwd)
+            })()
+          : ws.name
         actions.push({
           id: `window.${host.id}.${ws.id}.${win.id}`,
           kind: 'window',
           label: win.name,
-          sublabel: `· ${host.name} → ${ws.name}`,
+          sublabel: `· ${host.name} → ${tail}`,
           icon: isPinned ? '★' : '▢',
           weight: isPinned ? 5 : 0,
           run: () => {

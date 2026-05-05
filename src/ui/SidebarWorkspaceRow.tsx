@@ -4,7 +4,7 @@
  * (= rename-session); right-click triggers the parent's kill flow.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ActivityDot, type ActivityDotState } from './ActivityDot'
 
 export type SidebarWorkspaceRowState = 'rest' | 'hover' | 'active'
@@ -22,6 +22,14 @@ export interface SidebarWorkspaceRowProps {
   onKill?: () => void
   /** Hover-revealed + button — spawn a new window in this workspace. */
   onAddWindow?: () => void
+  /** Glyph or icon node rendered before the name. Defaults to the
+   * workspace glyph (◫); the folder-view variant passes a folder
+   * SVG instead. Accepts any ReactNode so callers aren't constrained
+   * to a single Unicode character. */
+  icon?: ReactNode
+  /** Hover title for the icon/label — used by the folder variant to
+   * surface the full cwd path on hover. */
+  title?: string
 }
 
 export function SidebarWorkspaceRow({
@@ -34,6 +42,8 @@ export function SidebarWorkspaceRow({
   onRename,
   onKill,
   onAddWindow,
+  icon = '◫',
+  title,
 }: SidebarWorkspaceRowProps) {
   const isActive = state === 'active'
   // Workspaces get the lightest tier (5%) so a selected workspace
@@ -64,6 +74,7 @@ export function SidebarWorkspaceRow({
   return (
     <button
       type="button"
+      title={title}
       onClick={() => {
         if (!editing) onClick?.()
       }}
@@ -100,7 +111,7 @@ export function SidebarWorkspaceRow({
         className="font-mono text-[11px]"
         style={{ color: isActive ? 'var(--accent-text)' : 'var(--text-secondary)' }}
       >
-        ◫
+        {icon}
       </span>
       {editing ? (
         <input

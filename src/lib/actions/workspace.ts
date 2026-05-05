@@ -51,7 +51,7 @@ export async function createWorkspace(hostId: HostId): Promise<void> {
     }
   }
   if (!workspaceId) {
-    const res = await commands.tmuxNewSession(hostId, name)
+    const res = await commands.tmuxNewSession(hostId, name, HOME_START_DIR)
     if (res.status !== 'ok') {
       console.error('new-session failed:', res.error)
       return
@@ -59,6 +59,88 @@ export async function createWorkspace(hostId: HostId): Promise<void> {
     workspaceId = res.data
   }
   await selectWorkspace(hostId, workspaceId)
+}
+
+/** tmux format string that resolves to the user's HOME on the server
+ * side, regardless of whether the host is local or SSH. Tmux expands
+ * `#{E:VAR}` from its own environment at command time, so we don't
+ * have to query/cache the remote home path ourselves. Used as the
+ * default start dir for new windows and sessions so they land in `~`
+ * the way a fresh Terminal.app window would. */
+export const HOME_START_DIR = '#{E:HOME}'
+
+/** Folder-view's "+ window" path. Folder view hides workspaces, so
+ * a new window can't pick a workspace from the UI — instead we route
+ * every folder-view-created window into a single per-host workspace
+ * named `folders`, lazily created on first use. When the user later
+ * flips back to workspace view, those windows appear grouped under
+ * that workspace, conveying "these were created in folder mode".
+ *
+ * Caveat: if the user renames the `folders` workspace from within
+ * workspace view, this helper won't find it by name and will create
+ * another. v1 accepts that — a follow-up could persist the workspace
+ * id in localStorage if it matters in practice. */
+export async function createFolderWindow(hostId: HostId): Promise<void> {
+  const FOLDERS_NAME = 'folders'
+  const state = useStore.getState()
+  const hs = state.sessions.get(hostId)
+
+  let workspaceId: string | undefined
+  if (hs) {
+    for (const w of hs.workspaces.values()) {
+      if (w.name === FOLDERS_NAME) {
+        workspaceId = w.id
+        break
+      }
+    }
+  }
+
+  // Track whether the workspace already existed before this call.
+  // Tmux's `new-session` always ships the session with a default
+  // window — if we just created the session, that default window IS
+  // our new window and we must skip the explicit `tmuxNewWindow`
+  // (which would otherwise produce a phantom second window).
+  const preExisting = workspaceId !== undefined
+
+  if (!workspaceId) {
+    // Same bootstrap path as createWorkspace — pass the intended name
+    // to connectHost so a fresh server doesn't get a stray `main`
+    // session before our `folders` shows up.
+    const status = state.statuses.get(hostId)
+    if (status !== 'connected' && status !== 'idle') {
+      try {
+        await connectHost(hostId, FOLDERS_NAME)
+      } catch (e) {
+        console.error('connect failed:', e)
+        return
+      }
+    }
+    const post = useStore.getState().sessions.get(hostId)
+    if (post) {
+      for (const w of post.workspaces.values()) {
+        if (w.name === FOLDERS_NAME) {
+          workspaceId = w.id
+          break
+        }
+      }
+    }
+    if (!workspaceId) {
+      const res = await commands.tmuxNewSession(hostId, FOLDERS_NAME, HOME_START_DIR)
+      if (res.status !== 'ok') {
+        console.error('new-session failed:', res.error)
+        return
+      }
+      workspaceId = res.data
+    }
+  }
+
+  await selectWorkspace(hostId, workspaceId)
+  if (preExisting) {
+    const winRes = await commands.tmuxNewWindow(hostId, workspaceId, null, HOME_START_DIR)
+    if (winRes.status !== 'ok') {
+      console.error('new-window failed:', winRes.error)
+    }
+  }
 }
 
 /** Optimistic workspace kill with a 5s undo. Mirrors the `killWindow`

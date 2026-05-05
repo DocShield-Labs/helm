@@ -8,6 +8,7 @@
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
+import { commands } from '@lib/ipc'
 import '@xterm/xterm/css/xterm.css'
 
 // We deliberately don't load `@xterm/addon-webgl`. Browsers cap WebGL
@@ -66,6 +67,12 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     // every line drifts right by the previous line's length.
     convertEol: true,
     scrollback: 10_000,
+    // When a TUI like Claude Code or vim turns on mouse capture
+    // (DECSET 1000/1006), xterm forwards every click to the app and
+    // link clicks no longer fire. Enabling this lets the user hold
+    // Option (Alt) and click to force-select / activate a link
+    // anyway — matching iTerm2 / Terminal.app's behaviour.
+    macOptionClickForcesSelection: true,
   })
 
   const fit = new FitAddon()
@@ -75,15 +82,31 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // Phase 4F polish: a custom matcher for `path:line` references is
   // layered on top in the consuming pane (TmuxPane) so we keep this
   // wrapper generic.
+  //
+  // The default handler routes through the Rust `open_url` command —
+  // Tauri's webview blocks `window.open`, so without this, clicking
+  // a link in the terminal would silently no-op. Callers can override
+  // by passing `onLinkClick`.
+  //
+  // Inside TUIs that capture mouse (Claude Code, vim, htop) plain
+  // clicks are forwarded to the app and never reach this handler —
+  // see `macOptionClickForcesSelection` above; user holds Option and
+  // clicks to bypass.
   const links = new WebLinksAddon((_event, uri) => {
     if (opts.onLinkClick) {
       opts.onLinkClick(uri)
       return
     }
-    // No handler supplied — best-effort fallback. Tauri webview blocks
-    // window.open for unknown protocols, so this is a no-op there but
-    // works in dev / web previews.
-    window.open(uri, '_blank', 'noopener,noreferrer')
+    commands.openUrl(uri).then(
+      (res) => {
+        if (res.status !== 'ok') {
+          console.error('[helm] open_url rejected:', res.error)
+        }
+      },
+      (err) => {
+        console.error('[helm] open_url threw:', err)
+      },
+    )
   })
   term.loadAddon(links)
 

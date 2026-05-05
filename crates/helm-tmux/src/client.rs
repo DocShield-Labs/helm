@@ -357,15 +357,24 @@ impl TmuxClient {
     /// created *in that session* (`-t $X`); otherwise tmux uses the control
     /// client's current session. Multi-workspace callers should always
     /// pass an explicit target so the new window doesn't surprise them.
+    ///
+    /// `start_dir` becomes the new window's `-c` argument — accepts both
+    /// literal paths and tmux format strings like `#{E:HOME}`, which
+    /// tmux expands server-side from its environment.
     pub async fn new_window(
         &self,
         session_id: Option<&str>,
         name: Option<&str>,
+        start_dir: Option<&str>,
     ) -> Result<(), TmuxError> {
         let mut parts = vec!["new-window".to_string()];
         if let Some(s) = session_id {
             parts.push("-t".to_string());
             parts.push(s.to_string());
+        }
+        if let Some(c) = start_dir {
+            parts.push("-c".to_string());
+            parts.push(quote_arg(c));
         }
         if let Some(n) = name {
             parts.push("-n".to_string());
@@ -440,15 +449,27 @@ impl TmuxClient {
     /// otherwise we pass `-s <name>`. `-d` keeps it from yanking our
     /// control client's current session. `-P -F #{session_id}` echoes the
     /// new session id so the caller can target it immediately.
-    pub async fn new_session(&self, name: Option<&str>) -> Result<String, TmuxError> {
-        let cmd = match name {
-            Some(n) => format!(
-                "new-session -d -P -F '#{{session_id}}' -s {}",
-                quote_arg(n)
-            ),
-            None => "new-session -d -P -F '#{session_id}'".to_string(),
-        };
-        let out = self.send_command(cmd).await?;
+    pub async fn new_session(
+        &self,
+        name: Option<&str>,
+        start_dir: Option<&str>,
+    ) -> Result<String, TmuxError> {
+        let mut parts: Vec<String> = vec![
+            "new-session".to_string(),
+            "-d".to_string(),
+            "-P".to_string(),
+            "-F".to_string(),
+            "'#{session_id}'".to_string(),
+        ];
+        if let Some(c) = start_dir {
+            parts.push("-c".to_string());
+            parts.push(quote_arg(c));
+        }
+        if let Some(n) = name {
+            parts.push("-s".to_string());
+            parts.push(quote_arg(n));
+        }
+        let out = self.send_command(parts.join(" ")).await?;
         Ok(out.trim().to_string())
     }
 

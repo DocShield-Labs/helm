@@ -19,12 +19,15 @@ import {
   pinnedKey,
   useStore,
   type HostSessions,
+  type TmuxWindow,
   type TmuxWorkspace,
 } from '@lib/store'
 import { connectHost, selectWorkspace } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
-import { prettyCwd } from '@lib/path'
+import { paneCwdFor, prettyCwd } from '@lib/path'
+import { groupHostByFolder, type FolderGroup } from '@lib/folder-view'
 import { killWindow } from '@lib/actions/window'
+import { createFolderWindow, HOME_START_DIR } from '@lib/actions/workspace'
 import type { Host, HostId } from '@bindings'
 import { StatusDot } from './StatusDot'
 import { SidebarHostRow } from './SidebarHostRow'
@@ -103,6 +106,7 @@ function ExpandedSidebar({
   const notifications = useStore((s) => s.notifications)
   const runningPanes = useStore((s) => s.runningPanes)
   const toggleWorkspaceCollapsed = useStore((s) => s.toggleWorkspaceCollapsed)
+  const toggleFolderCollapsed = useStore((s) => s.toggleFolderCollapsed)
   const expandedHosts = useStore((s) => s.expandedHosts)
   const toggleHostExpanded = useStore((s) => s.toggleHostExpanded)
   const pinnedWindows = useStore((s) => s.pinnedWindows)
@@ -112,6 +116,7 @@ function ExpandedSidebar({
   const setPinnedSectionCollapsed = useStore((s) => s.setPinnedSectionCollapsed)
   const hostsSectionCollapsed = useStore((s) => s.hostsSectionCollapsed)
   const setHostsSectionCollapsed = useStore((s) => s.setHostsSectionCollapsed)
+  const sidebarViewMode = useStore((s) => s.sidebarViewMode)
 
   return (
     <>
@@ -154,8 +159,61 @@ function ExpandedSidebar({
         const isActive = activeHostId === h.id
         const hostExpanded = expandedHosts.has(h.id)
         const hostNotifs = notificationsForHost(notifications, h.id)
+
+        // Render a single window row. Identical between workspace and
+        // folder mode — selection still flips the underlying tmux
+        // session (entry.workspace) regardless of which header it
+        // sits beneath.
+        const renderWindow = (w: TmuxWorkspace, win: TmuxWindow) => {
+          const isActiveWs = isActive && hs?.activeWorkspaceId === w.id
+          const isFocused = isActive && isActiveWs && win.active
+          const winNotifs = notificationsForWindow(notifications, hs, h.id, win.id)
+          return (
+            <SidebarWindowRow
+              key={`${w.id}:${win.id}`}
+              name={win.name}
+              // In folder mode the parent header already shows the
+              // cwd — repeating it on each row is just noise.
+              label={sidebarViewMode === 'folder' ? '' : prettyCwd(paneCwdFor(win.id, w))}
+              activity={activityFor(winNotifs, isWindowRunning(runningPanes, h.id, w, win.id))}
+              state={isFocused ? 'focused' : 'rest'}
+              isPinned={pinnedWindows.some(
+                p => p.hostId === h.id && p.workspaceName === w.name && p.windowId === win.id,
+              )}
+              onPin={() => {
+                addPinnedWindow({
+                  hostId: h.id,
+                  workspaceName: w.name,
+                  windowId: win.id,
+                  hostName: h.name,
+                  windowName: win.name,
+                })
+              }}
+              onUnpin={() => {
+                removePinnedWindow(`${h.id}::${w.name}::${win.id}`)
+              }}
+              onClick={() => {
+                const store = useStore.getState()
+                store.setActiveHost(h.id)
+                store.setActiveWindow(h.id, w.id, win.id)
+                void selectWorkspace(h.id, w.id)
+                void commands.tmuxSelectWindow(h.id, win.id)
+              }}
+              onRename={(newName) => {
+                if (newName && newName !== win.name) {
+                  void commands.tmuxRenameWindow(h.id, win.id, newName)
+                }
+              }}
+              onKill={() => killWindow(h.id, w.id, win)}
+            />
+          )
+        }
+
         const workspaceList = hs
           ? [...hs.workspaces.values()].sort((a, b) => a.name.localeCompare(b.name))
+          : []
+        const folderGroups: FolderGroup[] = hs && sidebarViewMode === 'folder'
+          ? groupHostByFolder(hs)
           : []
         return (
           <div key={h.id} className="flex flex-col gap-1">
@@ -182,7 +240,7 @@ function ExpandedSidebar({
               onEdit={h.port === 0 ? undefined : () => onEditHost(h)}
               onContextMenu={h.port === 0 ? undefined : () => onDeleteHost(h)}
             />
-            {hostExpanded &&
+            {hostExpanded && sidebarViewMode === 'workspace' &&
               workspaceList.map((w) => {
                 const isActiveWs = isActive && hs?.activeWorkspaceId === w.id
                 const expanded = !(hs?.collapsedWorkspaces.has(w.id) ?? false)
@@ -215,7 +273,7 @@ function ExpandedSidebar({
                         // workspace and pin selection on it.
                         useStore.getState().setActiveHost(h.id)
                         void selectWorkspace(h.id, w.id)
-                        void commands.tmuxNewWindow(h.id, w.id, null)
+                        void commands.tmuxNewWindow(h.id, w.id, null, HOME_START_DIR)
                       }}
                     />
                     {expanded && (
@@ -225,64 +283,51 @@ function ExpandedSidebar({
                             no windows
                           </div>
                         ) : (
-                          winsForWs.map((win) => {
-                            const isFocused =
-                              activeHostId === h.id && isActiveWs && win.active
-                            const winNotifs = notificationsForWindow(
-                              notifications,
-                              hs,
-                              h.id,
-                              win.id,
-                            )
-                            return (
-                              <SidebarWindowRow
-                                key={win.id}
-                                name={win.name}
-                                label={prettyCwd(paneCwdFor(win.id, w))}
-                                // Dot folds notifications + the live
-                                // spinner: a running pane in this
-                                // window outranks a stale "completed"
-                                // dot, but failed/bell still win.
-                                activity={activityFor(winNotifs, isWindowRunning(runningPanes, h.id, w, win.id))}
-                                state={isFocused ? 'focused' : 'rest'}
-                                isPinned={pinnedWindows.some(
-                                  p => p.hostId === h.id && p.workspaceName === w.name && p.windowId === win.id,
-                                )}
-                                onPin={() => {
-                                  addPinnedWindow({
-                                    hostId: h.id,
-                                    workspaceName: w.name,
-                                    windowId: win.id,
-                                    hostName: h.name,
-                                    windowName: win.name,
-                                  })
-                                }}
-                                onUnpin={() => {
-                                  removePinnedWindow(`${h.id}::${w.name}::${win.id}`)
-                                }}
-                                onClick={() => {
-                                  const store = useStore.getState()
-                                  store.setActiveHost(h.id)
-                                  store.setActiveWindow(h.id, w.id, win.id)
-                                  void selectWorkspace(h.id, w.id)
-                                  void commands.tmuxSelectWindow(h.id, win.id)
-                                }}
-                                onRename={(newName) => {
-                                  if (newName && newName !== win.name) {
-                                    void commands.tmuxRenameWindow(h.id, win.id, newName)
-                                  }
-                                }}
-                                onKill={() => killWindow(h.id, w.id, win)}
-                              />
-                            )
-                          })
+                          winsForWs.map((win) => renderWindow(w, win))
                         )}
                       </>
                     )}
                   </div>
                 )
               })}
-            {hostExpanded && (
+            {hostExpanded && sidebarViewMode === 'folder' && folderGroups.map((fg) => {
+              const expanded = !(hs?.collapsedFolders.has(fg.path) ?? false)
+              // Roll up activity across every entry: any failed/bell
+              // notification or running pane bubbles up to the folder
+              // header dot. activityFor picks the highest-priority
+              // signal so the user sees `failed > attention > running >
+              // completed > none` even when entries disagree.
+              const allNotifs: ReturnType<typeof notificationsForWindow> = []
+              let anyRunning = false
+              for (const e of fg.entries) {
+                const ns = notificationsForWindow(notifications, hs, h.id, e.window.id)
+                for (const n of ns) allNotifs.push(n)
+                if (isWindowRunning(runningPanes, h.id, e.workspace, e.window.id)) {
+                  anyRunning = true
+                }
+              }
+              const folderActive = isActive &&
+                fg.entries.some((e) =>
+                  hs?.activeWorkspaceId === e.workspace.id && e.window.active,
+                )
+              return (
+                <div key={fg.path || '(no-cwd)'} className="flex flex-col gap-1">
+                  <SidebarWorkspaceRow
+                    name={fg.label}
+                    icon={<FolderIcon />}
+                    title={fg.path || undefined}
+                    activity={activityFor(allNotifs, anyRunning)}
+                    state={folderActive ? 'active' : 'rest'}
+                    expanded={expanded}
+                    onClick={() => toggleFolderCollapsed(h.id, fg.path)}
+                    onToggleExpand={() => toggleFolderCollapsed(h.id, fg.path)}
+                    // Folders are synthetic — no rename, no kill.
+                  />
+                  {expanded && fg.entries.map((e) => renderWindow(e.workspace, e.window))}
+                </div>
+              )
+            })}
+            {hostExpanded && sidebarViewMode === 'workspace' && (
               <button
                 type="button"
                 className="rounded-md px-2 py-1 text-left font-mono text-[11px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
@@ -290,6 +335,19 @@ function ExpandedSidebar({
                 title="Cmd+Shift+T"
               >
                 + workspace
+              </button>
+            )}
+            {hostExpanded && sidebarViewMode === 'folder' && (
+              <button
+                type="button"
+                className="rounded-md px-2 py-1 text-left font-mono text-[11px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+                onClick={() => {
+                  setActiveHost(h.id)
+                  void createFolderWindow(h.id)
+                }}
+                title="Cmd+T"
+              >
+                + window
               </button>
             )}
           </div>
@@ -552,6 +610,7 @@ function HostPeekPopover({
 }: HostPeekPopoverProps) {
   const setActiveHost = useStore((s) => s.setActiveHost)
   const statuses = useStore((s) => s.statuses)
+  const sidebarViewMode = useStore((s) => s.sidebarViewMode)
   const status = statuses.get(host.id) ?? 'disconnected'
   const displayed = displayedHostStatus(host, status, hs?.detachedReason ?? null)
 
@@ -559,6 +618,11 @@ function HostPeekPopover({
     if (!hs) return []
     return [...hs.workspaces.values()].sort((a, b) => a.name.localeCompare(b.name))
   }, [hs])
+
+  const folderGroups = useMemo<FolderGroup[]>(
+    () => (hs && sidebarViewMode === 'folder' ? groupHostByFolder(hs) : []),
+    [hs, sidebarViewMode],
+  )
 
   const totalWindows = useMemo(
     () => workspaceList.reduce((sum, w) => sum + w.windows.size, 0),
@@ -621,9 +685,9 @@ function HostPeekPopover({
           </div>
         ) : workspaceList.length === 0 ? (
           <div className="px-3 py-3 font-mono text-[11px] text-text-tertiary">
-            no workspaces
+            {sidebarViewMode === 'folder' ? 'no folders' : 'no workspaces'}
           </div>
-        ) : (
+        ) : sidebarViewMode === 'workspace' ? (
           workspaceList.map((w) => {
             const winsForWs = [...w.windows.values()].sort((a, b) =>
               a.id.localeCompare(b.id),
@@ -648,75 +712,156 @@ function HostPeekPopover({
                   </span>
                 </div>
                 {winsForWs.length === 0 ? null : (
-                  winsForWs.map((win) => {
-                    const isFocused =
-                      activeHostId === host.id &&
-                      hs?.activeWorkspaceId === w.id &&
-                      win.active
-                    return (
-                      <button
-                        key={win.id}
-                        type="button"
-                        onClick={() => {
-                          const store = useStore.getState()
-                          store.setActiveHost(host.id)
-                          store.setActiveWindow(host.id, w.id, win.id)
-                          void selectWorkspace(host.id, w.id)
-                          void commands.tmuxSelectWindow(host.id, win.id)
-                          onClose()
-                        }}
-                        className={`flex h-7 w-full items-center gap-2 px-3 ${
-                          isFocused ? 'bg-accent-muted' : 'hover:bg-white/[0.04]'
-                        }`}
-                      >
-                        <span
-                          className="font-mono text-[11px] leading-none"
-                          style={{
-                            color: isFocused
-                              ? 'var(--accent-text)'
-                              : 'var(--text-tertiary)',
-                          }}
-                        >
-                          ▢
-                        </span>
-                        <span
-                          className={`text-[12px] ${
-                            isFocused
-                              ? 'font-medium text-text-primary'
-                              : 'text-text-secondary'
-                          }`}
-                        >
-                          {win.name}
-                        </span>
-                        <span
-                          className="flex-1 truncate text-left font-mono text-[10px] text-text-tertiary"
-                          title={paneCwdFor(win.id, w) || undefined}
-                        >
-                          {prettyCwd(paneCwdFor(win.id, w))}
-                        </span>
-                      </button>
-                    )
-                  })
+                  winsForWs.map((win) => (
+                    <PeekWindowButton
+                      key={win.id}
+                      hostId={host.id}
+                      ws={w}
+                      win={win}
+                      isFocused={
+                        activeHostId === host.id &&
+                        hs?.activeWorkspaceId === w.id &&
+                        win.active
+                      }
+                      onClose={onClose}
+                    />
+                  ))
                 )}
               </div>
             )
           })
+        ) : (
+          // Folder view — same window-row presentation, header swapped
+          // for the folder label. Folders aren't kill-able (synthetic).
+          folderGroups.map((fg) => (
+            <div key={fg.path || '(no-cwd)'} className="pb-1">
+              <div
+                className="flex items-center gap-2 px-3 pt-2 pb-1 text-[10px] font-medium tracking-[0.08em] text-text-tertiary"
+                title={fg.path || undefined}
+              >
+                <FolderIcon size={11} />
+                <span className="truncate uppercase">{fg.label}</span>
+                <span className="opacity-60">·</span>
+                <span className="opacity-60">
+                  {fg.entries.length === 1 ? '1 window' : `${fg.entries.length} windows`}
+                </span>
+              </div>
+              {fg.entries.map((e) => (
+                <PeekWindowButton
+                  key={`${e.workspace.id}:${e.window.id}`}
+                  hostId={host.id}
+                  ws={e.workspace}
+                  win={e.window}
+                  isFocused={
+                    activeHostId === host.id &&
+                    hs?.activeWorkspaceId === e.workspace.id &&
+                    e.window.active
+                  }
+                  onClose={onClose}
+                />
+              ))}
+            </div>
+          ))
         )}
         {!offline && !connecting && (
           <button
             type="button"
             onClick={() => {
               setActiveHost(host.id)
-              onCreateWorkspace()
+              if (sidebarViewMode === 'folder') {
+                void createFolderWindow(host.id)
+              } else {
+                onCreateWorkspace()
+              }
             }}
             className="flex h-7 w-full items-center px-3 font-mono text-[11px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
-            title="Cmd+Shift+T"
+            title={sidebarViewMode === 'folder' ? 'Cmd+T' : 'Cmd+Shift+T'}
           >
-            + workspace
+            {sidebarViewMode === 'folder' ? '+ window' : '+ workspace'}
           </button>
         )}
       </div>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Folder glyph — Lucide's `folder` outline at the same visual weight
+// as the surrounding text glyphs (◫, ▢, ⏵). Inlined rather than
+// pulling in lucide-react for one icon. currentColor so the parent
+// can set active/rest tint via inline style like the other glyphs.
+function FolderIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+    </svg>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Hover-peek window button — shared between the workspace and folder
+// branches of HostPeekPopover. Kept local since the click semantics
+// pin selection on the underlying tmux session regardless of which
+// header it sat under.
+function PeekWindowButton({
+  hostId,
+  ws,
+  win,
+  isFocused,
+  onClose,
+}: {
+  hostId: HostId
+  ws: TmuxWorkspace
+  win: TmuxWindow
+  isFocused: boolean
+  onClose: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        const store = useStore.getState()
+        store.setActiveHost(hostId)
+        store.setActiveWindow(hostId, ws.id, win.id)
+        void selectWorkspace(hostId, ws.id)
+        void commands.tmuxSelectWindow(hostId, win.id)
+        onClose()
+      }}
+      className={`flex h-7 w-full items-center gap-2 px-3 ${
+        isFocused ? 'bg-accent-muted' : 'hover:bg-white/[0.04]'
+      }`}
+    >
+      <span
+        className="font-mono text-[11px] leading-none"
+        style={{ color: isFocused ? 'var(--accent-text)' : 'var(--text-tertiary)' }}
+      >
+        ▢
+      </span>
+      <span
+        className={`text-[12px] ${
+          isFocused ? 'font-medium text-text-primary' : 'text-text-secondary'
+        }`}
+      >
+        {win.name}
+      </span>
+      <span
+        className="flex-1 truncate text-left font-mono text-[10px] text-text-tertiary"
+        title={paneCwdFor(win.id, ws) || undefined}
+      >
+        {prettyCwd(paneCwdFor(win.id, ws))}
+      </span>
+    </button>
   )
 }
 
@@ -736,13 +881,6 @@ function useSortedHosts(): Host[] {
     [hosts],
   )
 }
-
-function paneCwdFor(windowId: string, w: TmuxWorkspace): string {
-  const inWindow = [...w.panes.values()].filter((p) => p.windowId === windowId)
-  const active = inWindow.find((p) => p.active) ?? inWindow[0]
-  return active?.cwd ?? ''
-}
-
 
 // Inbox count + tone badge that sits at the top of the collapsed
 // rail. Visible only when there are pending notifications. Click

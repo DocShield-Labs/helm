@@ -170,12 +170,16 @@ export async function subscribeHostEvents(): Promise<void> {
         // same markers in-pane for block chrome — both readers run
         // independently. We walk in marker order so a chunk containing
         // `D` followed by a fresh `B` (one prompt cycle ending, the
-        // next command starting) settles to "running".
+        // next command starting) settles to "running". The `A`
+        // (prompt_start) marker also carries the post-cd cwd, which we
+        // push into the pane so folder-view grouping updates live.
         for (const m of n.markers) {
           if (m.marker.kind === 'command_start') {
             store.markPaneRunning(host_id, n.pane_id, m.marker.command)
           } else if (m.marker.kind === 'command_done') {
             store.markPaneIdle(host_id, n.pane_id)
+          } else if (m.marker.kind === 'prompt_start' && m.marker.cwd !== null) {
+            store.updatePaneCwd(host_id, n.pane_id, m.marker.cwd, m.marker.branch ?? '')
           }
         }
         deliverOutput(host_id, n.pane_id, n.bytes, n.markers)

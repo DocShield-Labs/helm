@@ -95,10 +95,11 @@ pub async fn tmux_new_window(
     host_id: HostId,
     session_id: Option<String>,
     name: Option<String>,
+    start_dir: Option<String>,
 ) -> Result<(), String> {
     tmux_for(&state, host_id)
         .await?
-        .new_window(session_id.as_deref(), name.as_deref())
+        .new_window(session_id.as_deref(), name.as_deref(), start_dir.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -228,10 +229,11 @@ pub async fn tmux_new_session(
     state: State<'_, AppState>,
     host_id: HostId,
     name: Option<String>,
+    start_dir: Option<String>,
 ) -> Result<String, String> {
     tmux_for(&state, host_id)
         .await?
-        .new_session(name.as_deref())
+        .new_session(name.as_deref(), start_dir.as_deref())
         .await
         .map_err(|e| e.to_string())
 }

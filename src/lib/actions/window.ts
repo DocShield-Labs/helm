@@ -9,9 +9,10 @@
 import { commands } from '@lib/ipc'
 import { selectWorkspace } from '@lib/host'
 import { useStore, pinnedKey, sortById, type TmuxWindow, type TmuxWorkspace } from '@lib/store'
+import { groupHostByFolder } from '@lib/folder-view'
 import type { Action } from './types'
 import type { HostId } from '@bindings'
-import { activeHostId, activeWorkspace } from './workspace'
+import { activeHostId, activeWorkspace, createFolderWindow, HOME_START_DIR } from './workspace'
 
 function activeWindow(): TmuxWindow | undefined {
   const ws = activeWorkspace()
@@ -104,7 +105,13 @@ export function killWindow(hostId: HostId, workspaceId: string, window: TmuxWind
  * to the neighbour window inside the same workspace. The active
  * window's pin-membership is the natural signal now that the sidebar
  * has no Pinned/Hosts tab — the user is "in pinned mode" exactly when
- * they're sitting on a pinned row. */
+ * they're sitting on a pinned row.
+ *
+ * In folder view we cycle within the active folder instead — folder
+ * grouping is what the user actually sees in the sidebar, and stepping
+ * across the underlying workspace would jump them to siblings that
+ * aren't visible. Crossing workspace boundaries is fine because the
+ * window-click path already handles `selectWorkspace` + `tmuxSelectWindow`. */
 async function stepWindow(direction: 1 | -1): Promise<void> {
   const state = useStore.getState()
   const hostId = state.activeHostId
@@ -119,7 +126,28 @@ async function stepWindow(direction: 1 | -1): Promise<void> {
     await cyclePinnedWindow(direction)
     return
   }
-  if (!hostId || !ws) return
+  if (!hostId) return
+
+  if (state.sidebarViewMode === 'folder' && win) {
+    const hs = state.sessions.get(hostId)
+    if (!hs) return
+    const groups = groupHostByFolder(hs)
+    const group = groups.find((g) => g.entries.some((e) => e.window.id === win.id))
+    if (!group || group.entries.length < 2) return
+    const idx = group.entries.findIndex((e) => e.window.id === win.id)
+    if (idx < 0) return
+    const next = group.entries[(idx + direction + group.entries.length) % group.entries.length]
+    state.setActiveHost(hostId)
+    state.setActiveWindow(hostId, next.workspace.id, next.window.id)
+    await selectWorkspace(hostId, next.workspace.id)
+    const res = await commands.tmuxSelectWindow(hostId, next.window.id)
+    if (res.status !== 'ok') {
+      console.warn('tmux_select_window failed:', res.error)
+    }
+    return
+  }
+
+  if (!ws) return
   const next = neighbourWindowId(ws, win?.id, direction)
   if (!next) return
   const res = await commands.tmuxSelectWindow(hostId, next)
@@ -135,11 +163,24 @@ export const windowActions: Action[] = [
     label: 'New window',
     icon: '▢',
     keybinding: 'Cmd+T',
-    canRun: () => activeHostId() !== null && activeWorkspace() !== undefined,
+    canRun: () => {
+      const state = useStore.getState()
+      if (state.activeHostId === null) return false
+      // Folder view doesn't need an active workspace — the helper
+      // lazily creates the synthetic `folders` workspace if missing.
+      if (state.sidebarViewMode === 'folder') return true
+      return activeWorkspace() !== undefined
+    },
     run: () => {
-      const hostId = activeHostId()
+      const state = useStore.getState()
+      const hostId = state.activeHostId
+      if (!hostId) return
+      if (state.sidebarViewMode === 'folder') {
+        void createFolderWindow(hostId)
+        return
+      }
       const ws = activeWorkspace()
-      if (hostId && ws) void commands.tmuxNewWindow(hostId, ws.id, null)
+      if (ws) void commands.tmuxNewWindow(hostId, ws.id, null, HOME_START_DIR)
     },
   },
   {

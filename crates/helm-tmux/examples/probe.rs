@@ -46,11 +46,11 @@ async fn main() {
     drain("initial", 500, &mut events).await;
 
     println!("[2] new-window -n test1");
-    let _ = client.new_window(None, Some("test1")).await;
+    let _ = client.new_window(None, Some("test1"), None).await;
     drain("after new-window test1", 500, &mut events).await;
 
     println!("[3] new-window -n test2");
-    let _ = client.new_window(None, Some("test2")).await;
+    let _ = client.new_window(None, Some("test2"), None).await;
     drain("after new-window test2", 500, &mut events).await;
 
     println!("[4] select-window -t @0  (back to first)");

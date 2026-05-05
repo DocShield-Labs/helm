@@ -62,6 +62,11 @@ export interface HostSessions {
    * the set tracks opt-out so newly-discovered workspaces appear with
    * windows visible without us having to backfill anything. */
   collapsedWorkspaces: Set<string>
+  /** Folders the user has explicitly collapsed in folder-view mode.
+   * Keyed by full cwd path (the synthetic grouping key). Mirrors the
+   * opt-out semantics of collapsedWorkspaces — newly-observed folders
+   * appear expanded by default. In-memory only. */
+  collapsedFolders: Set<string>
   /** Populated from a tmux `%exit` notification — null while live. */
   detachedReason: string | null
 }
@@ -70,6 +75,7 @@ export const emptyHostSessions = (): HostSessions => ({
   workspaces: new Map(),
   activeWorkspaceId: null,
   collapsedWorkspaces: new Set(),
+  collapsedFolders: new Set(),
   detachedReason: null,
 })
 
@@ -169,6 +175,15 @@ interface HelmState {
   sidebarCollapsed: boolean
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
+
+  /** How the sidebar groups windows: by their parent workspace (the
+   * default — what tmux sessions actually are), or by the folder of
+   * each window's cwd (synthetic labels derived at render time). The
+   * choice is purely presentational; switching modes never mutates
+   * underlying tmux state. Persisted via localStorage. */
+  sidebarViewMode: 'workspace' | 'folder'
+  setSidebarViewMode: (v: 'workspace' | 'folder') => void
+  toggleSidebarViewMode: () => void
 
   /** Whether the Pinned section in the expanded sidebar is collapsed.
    * Persisted via localStorage so the preference survives restarts.
@@ -279,8 +294,16 @@ interface HelmState {
   setActiveWindow: (host: HostId, workspaceId: string, windowId: string) => void
   /** Flag the active pane within a window; demote others in that window. */
   setActivePane: (host: HostId, workspaceId: string, windowId: string, paneId: string) => void
+  /** Update a single pane's cwd (and branch) in place. Driven by the
+   * OSC 133 `prompt_start` marker stream so the sidebar's folder
+   * grouping reflects user `cd`s without waiting for the next tree
+   * refetch. No-op when the pane isn't in the tree yet — a marker
+   * arriving before the next setWorkspaces refetch is a benign race. */
+  updatePaneCwd: (host: HostId, paneId: string, cwd: string, branch: string) => void
   /** Toggle whether a workspace's window list is visible. */
   toggleWorkspaceCollapsed: (host: HostId, workspaceId: string) => void
+  /** Toggle whether a folder's window list is visible (folder view). */
+  toggleFolderCollapsed: (host: HostId, folderPath: string) => void
   markDetached: (host: HostId, reason: string | null) => void
 
   // ---------- pending window kills (5s undo) ----------
@@ -509,6 +532,22 @@ const writeCollapsed = (v: boolean) => {
   }
 }
 
+const SIDEBAR_VIEW_MODE_KEY = 'helm.sidebarViewMode'
+const readViewMode = (): 'workspace' | 'folder' => {
+  try {
+    return localStorage.getItem(SIDEBAR_VIEW_MODE_KEY) === 'folder' ? 'folder' : 'workspace'
+  } catch {
+    return 'workspace'
+  }
+}
+const writeViewMode = (v: 'workspace' | 'folder') => {
+  try {
+    localStorage.setItem(SIDEBAR_VIEW_MODE_KEY, v)
+  } catch {
+    /* localStorage unavailable — preference is in-memory only */
+  }
+}
+
 const PINNED_WINDOWS_KEY = 'helm.pinnedWindows'
 const isPinnedWindow = (p: unknown): p is PinnedWindow =>
   typeof p === 'object' &&
@@ -550,6 +589,19 @@ export const useStore = create<HelmState>((set, get) => ({
       const next = !s.sidebarCollapsed
       writeCollapsed(next)
       return { sidebarCollapsed: next }
+    }),
+
+  sidebarViewMode: readViewMode(),
+  setSidebarViewMode: (v) => {
+    writeViewMode(v)
+    set({ sidebarViewMode: v })
+  },
+  toggleSidebarViewMode: () =>
+    set((s) => {
+      const next: 'workspace' | 'folder' =
+        s.sidebarViewMode === 'workspace' ? 'folder' : 'workspace'
+      writeViewMode(next)
+      return { sidebarViewMode: next }
     }),
 
   pinnedWindows: readPinnedWindows(),
@@ -869,6 +921,43 @@ export const useStore = create<HelmState>((set, get) => ({
       ),
     })),
 
+  updatePaneCwd: (host, paneId, cwd, branch) =>
+    set((s) => {
+      const hs = s.sessions.get(host)
+      if (!hs) return {}
+      // Find the workspace owning this pane. We don't index by paneId
+      // globally — pane sets per workspace are small (single digits to
+      // low tens), so this scan is cheap relative to the cost of a
+      // re-render. Bail if the pane isn't in the tree yet (race with
+      // tree refetch).
+      let targetWsId: string | undefined
+      let prev: TmuxPane | undefined
+      for (const ws of hs.workspaces.values()) {
+        const p = ws.panes.get(paneId)
+        if (p) {
+          targetWsId = ws.id
+          prev = p
+          break
+        }
+      }
+      if (!targetWsId || !prev) return {}
+      // Skip the re-render if nothing actually changed — `prompt_start`
+      // fires on every prompt redraw, so the same cwd+branch arrives
+      // many times in a row inside one folder.
+      if (prev.cwd === cwd && prev.branch === branch) return {}
+      return {
+        sessions: withHostSessions(s.sessions, host, (cur) =>
+          withWorkspace(cur, targetWsId!, (w) => {
+            const next = new Map(w.panes)
+            const p = next.get(paneId)
+            if (!p) return w
+            next.set(paneId, { ...p, cwd, branch })
+            return { ...w, panes: next }
+          }),
+        ),
+      }
+    }),
+
   toggleWorkspaceCollapsed: (host, workspaceId) =>
     set((s) => ({
       sessions: withHostSessions(s.sessions, host, (cur) => {
@@ -876,6 +965,16 @@ export const useStore = create<HelmState>((set, get) => ({
         if (next.has(workspaceId)) next.delete(workspaceId)
         else next.add(workspaceId)
         return { ...cur, collapsedWorkspaces: next }
+      }),
+    })),
+
+  toggleFolderCollapsed: (host, folderPath) =>
+    set((s) => ({
+      sessions: withHostSessions(s.sessions, host, (cur) => {
+        const next = new Set(cur.collapsedFolders)
+        if (next.has(folderPath)) next.delete(folderPath)
+        else next.add(folderPath)
+        return { ...cur, collapsedFolders: next }
       }),
     })),
 

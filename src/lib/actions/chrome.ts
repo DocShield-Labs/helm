@@ -17,6 +17,19 @@ export const chromeActions: Action[] = [
       useStore.getState().toggleSidebar()
     },
   },
+  // Single toggle so the keybinding dispatch (which is first-match-wins
+  // on a single combo) doesn't have to pick between two canRun-gated
+  // entries. Static label avoids re-keying the row in the palette.
+  {
+    id: 'chrome.toggle-sidebar-view',
+    kind: 'action',
+    label: 'Toggle sidebar grouping (workspaces ↔ folders)',
+    icon: '▦',
+    keybinding: 'Cmd+Shift+\\',
+    run: () => {
+      useStore.getState().toggleSidebarViewMode()
+    },
+  },
   {
     id: 'chrome.undo',
     kind: 'action',
