@@ -79,4 +79,16 @@ export interface Action {
   /** When provided, drilling in (→ / Cmd+Enter) on this row opens an
    * inline list of these actions instead of running the primary. */
   subActions?: () => Action[]
+  /** Treat plain Enter as drill-in. By default Enter runs the primary
+   * action; set this true on actions whose primary purpose IS the
+   * sub-list (e.g. the theme picker — there's nothing to "run" at
+   * the top level, only a list to choose from). */
+  drillOnEnter?: boolean
+  /** Fires when this row becomes the highlighted one in the palette
+   * (via ↑↓ or mouse hover). Used for live previews — e.g. the theme
+   * picker applies a transient theme as you scroll through rows so
+   * you see what you're picking before committing. The palette clears
+   * any preview state on close, so this hook only needs to push
+   * forward; it doesn't have to manage rollback. */
+  onHighlight?: () => void
 }

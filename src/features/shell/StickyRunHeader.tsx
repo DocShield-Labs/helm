@@ -53,15 +53,15 @@ export function StickyRunHeader({ term, blocks, onJumpTo }: Props) {
     <button
       type="button"
       onClick={() => onJumpTo(running.startLine)}
-      className="absolute left-0 right-0 top-0 z-10 flex h-6 items-center gap-2 border-b border-white/[0.06] bg-[#14171b]/90 px-4 font-mono text-[11px] text-[#9da4ad] backdrop-blur transition-colors hover:bg-[#14171b]"
+      className="absolute left-0 right-0 top-0 z-10 flex h-6 items-center gap-2 border-b border-[var(--terminal-fg-06)] bg-[var(--terminal-chip-bg)] px-4 font-mono text-[11px] text-[var(--terminal-fg-60)] backdrop-blur transition-colors hover:bg-[var(--terminal-chip-bg-hover)]"
       title="Jump back to running block"
     >
       <span
-        className="size-1.5 rounded-full bg-[#5cb97d]"
-        style={{ boxShadow: '0 0 6px rgba(92,185,125,0.7)' }}
+        className="size-1.5 rounded-full bg-[var(--terminal-success)]"
+        style={{ boxShadow: '0 0 6px var(--terminal-success)' }}
       />
-      <span className="font-medium text-[#ecedee]">{command}</span>
-      <span className="text-[#6b7380]">· {elapsed}</span>
+      <span className="font-medium text-[var(--terminal-fg)]">{command}</span>
+      <span className="text-[var(--terminal-fg-30)]">· {elapsed}</span>
     </button>
   )
 }

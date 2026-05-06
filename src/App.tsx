@@ -25,6 +25,11 @@ import {
 import { connectHost, subscribeHostEvents } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
 import { useGlobalKeymap } from '@lib/keymap-engine'
+import {
+  applyThemeCssVars,
+  getTheme,
+  setThemeForAllTerminals,
+} from '@lib/terminal'
 import { createWorkspace, killWorkspace } from '@lib/actions/workspace'
 import { TmuxPane } from '@features/shell/TmuxPane'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
@@ -195,6 +200,18 @@ export function App() {
   // the terminal layer (terminal/index.ts:69-71) so global combos
   // always reach us.
   useGlobalKeymap()
+
+  // Single subscriber: push the active palette into the chrome CSS
+  // variables and fan out to every attached xterm. `previewThemeName`
+  // wins so the picker can show live previews; the palette clears it
+  // on close (Esc reverts, Enter persists).
+  const themeName = useStore((s) => s.themeName)
+  const previewThemeName = useStore((s) => s.previewThemeName)
+  useEffect(() => {
+    const theme = getTheme(previewThemeName ?? themeName)
+    applyThemeCssVars(theme)
+    setThemeForAllTerminals(theme)
+  }, [themeName, previewThemeName])
 
   // ---------- active-window focus reporting ----------
   // Tell the backend which (host, window) the user is looking at, so

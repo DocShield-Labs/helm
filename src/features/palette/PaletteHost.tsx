@@ -268,6 +268,37 @@ export function PaletteHost() {
     return e.type === 'item' ? e.action : undefined
   }
 
+  // Live preview hook. When the highlighted row changes, fire its
+  // `onHighlight` callback. Used by the theme picker to apply a
+  // transient theme as the user scrolls through rows. When NO row is
+  // highlighted (filter empties the list, etc.), drop any pending
+  // preview — otherwise typing a non-matching query while a theme is
+  // previewed would leave the preview stuck until palette close.
+  const highlightedAction = itemAt(selected)
+  useEffect(() => {
+    if (!open) return
+    if (highlightedAction) {
+      highlightedAction.onHighlight?.()
+    } else {
+      useStore.getState().setPreviewThemeName(null)
+    }
+    // Depending only on the action id keeps the effect quiet during
+    // unrelated re-renders. The eslint warning would have us depend
+    // on `highlightedAction` directly, but action objects are
+    // re-created every ranking pass even when the row is the same.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, highlightedAction?.id])
+
+  // Clear any transient preview state when the palette closes (Esc,
+  // outside-click, after running an action). The theme picker relies
+  // on this — Esc reverts to the persisted theme; Enter persists via
+  // the action's `run`, then close fires here and the redundant
+  // preview is wiped. Other onHighlight users get the same lifecycle.
+  useEffect(() => {
+    if (open) return
+    useStore.getState().setPreviewThemeName(null)
+  }, [open])
+
   const run = (action: Action) => {
     pushRecent(action.id)
     close()
@@ -327,7 +358,10 @@ export function PaletteHost() {
       setSelected((s) => Math.max(0, s - 1))
       return
     }
-    // → and Cmd+Enter drill into the highlighted object.
+    // → and Cmd+Enter always drill into a result with subActions.
+    // Plain Enter normally runs the primary, but actions whose whole
+    // purpose is the sub-list (e.g. the theme picker) opt into
+    // drill-on-enter so users don't have to learn Cmd+Enter for them.
     if (e.key === 'ArrowRight' || (e.key === 'Enter' && e.metaKey)) {
       const target = itemAt(selected)
       if (target?.subActions) {
@@ -338,8 +372,11 @@ export function PaletteHost() {
     }
     if (e.key === 'Enter') {
       const target = itemAt(selected)
-      if (target) {
-        e.preventDefault()
+      if (!target) return
+      e.preventDefault()
+      if (target.subActions && target.drillOnEnter) {
+        drillInto(target)
+      } else {
         run(target)
       }
     }

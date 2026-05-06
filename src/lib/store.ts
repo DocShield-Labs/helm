@@ -11,6 +11,7 @@
  */
 
 import { create } from 'zustand'
+import { DEFAULT_THEME_NAME } from '@lib/terminal'
 import type {
   Host,
   HostId,
@@ -184,6 +185,19 @@ interface HelmState {
   sidebarViewMode: 'workspace' | 'folder'
   setSidebarViewMode: (v: 'workspace' | 'folder') => void
   toggleSidebarViewMode: () => void
+
+  /** Active terminal theme name. Drives both xterm's palette and the
+   * `--terminal-*` CSS variables the pane chrome reads. Persisted
+   * via localStorage. */
+  themeName: string
+  setThemeName: (name: string) => void
+  /** Transient theme override applied while the user is cycling
+   * through the theme picker. Subscribers prefer this when set. The
+   * palette clears it on close — Esc reverts, Enter persists by
+   * calling `setThemeName()` and then closing (which clears the
+   * preview without changing what's effectively rendered). */
+  previewThemeName: string | null
+  setPreviewThemeName: (name: string | null) => void
 
   /** Whether the Pinned section in the expanded sidebar is collapsed.
    * Persisted via localStorage so the preference survives restarts.
@@ -516,37 +530,36 @@ function withWorkspace(
   return { ...hs, workspaces: next }
 }
 
-const SIDEBAR_COLLAPSED_KEY = 'helm.sidebarCollapsed'
-const readCollapsed = (): boolean => {
+/** Generic string-pref read/write. Falls back to `fallback` on any
+ * localStorage failure (Safari private mode, quota, etc.) and on
+ * `validate` rejection. Used for sidebar mode, theme name, and any
+ * future enum-shaped preference. Boolean prefs use `readBoolPref`
+ * below; JSON-shaped prefs use `readJson`/`writeJson` above. */
+const readStringPref = <T extends string>(
+  key: string,
+  fallback: T,
+  validate?: (v: string) => v is T,
+): T => {
   try {
-    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
+    const v = localStorage.getItem(key)
+    if (v === null) return fallback
+    if (validate && !validate(v)) return fallback
+    return v as T
   } catch {
-    return false
+    return fallback
   }
 }
-const writeCollapsed = (v: boolean) => {
+const writeStringPref = (key: string, v: string) => {
   try {
-    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, v ? '1' : '0')
+    localStorage.setItem(key, v)
   } catch {
     /* localStorage unavailable — preference is in-memory only */
   }
 }
 
+const SIDEBAR_COLLAPSED_KEY = 'helm.sidebarCollapsed'
 const SIDEBAR_VIEW_MODE_KEY = 'helm.sidebarViewMode'
-const readViewMode = (): 'workspace' | 'folder' => {
-  try {
-    return localStorage.getItem(SIDEBAR_VIEW_MODE_KEY) === 'folder' ? 'folder' : 'workspace'
-  } catch {
-    return 'workspace'
-  }
-}
-const writeViewMode = (v: 'workspace' | 'folder') => {
-  try {
-    localStorage.setItem(SIDEBAR_VIEW_MODE_KEY, v)
-  } catch {
-    /* localStorage unavailable — preference is in-memory only */
-  }
-}
+const THEME_NAME_KEY = 'helm.themeName'
 
 const PINNED_WINDOWS_KEY = 'helm.pinnedWindows'
 const isPinnedWindow = (p: unknown): p is PinnedWindow =>
@@ -579,30 +592,42 @@ export const useStore = create<HelmState>((set, get) => ({
   bootstrap: { ready: false, message: '' },
   setBootstrap: (b) => set({ bootstrap: b }),
 
-  sidebarCollapsed: readCollapsed(),
+  sidebarCollapsed: readBoolPref(SIDEBAR_COLLAPSED_KEY, false),
   setSidebarCollapsed: (v) => {
-    writeCollapsed(v)
+    writeBoolPref(SIDEBAR_COLLAPSED_KEY, v)
     set({ sidebarCollapsed: v })
   },
   toggleSidebar: () =>
     set((s) => {
       const next = !s.sidebarCollapsed
-      writeCollapsed(next)
+      writeBoolPref(SIDEBAR_COLLAPSED_KEY, next)
       return { sidebarCollapsed: next }
     }),
 
-  sidebarViewMode: readViewMode(),
+  sidebarViewMode: readStringPref<'workspace' | 'folder'>(
+    SIDEBAR_VIEW_MODE_KEY,
+    'workspace',
+    (v): v is 'workspace' | 'folder' => v === 'workspace' || v === 'folder',
+  ),
   setSidebarViewMode: (v) => {
-    writeViewMode(v)
+    writeStringPref(SIDEBAR_VIEW_MODE_KEY, v)
     set({ sidebarViewMode: v })
   },
   toggleSidebarViewMode: () =>
     set((s) => {
       const next: 'workspace' | 'folder' =
         s.sidebarViewMode === 'workspace' ? 'folder' : 'workspace'
-      writeViewMode(next)
+      writeStringPref(SIDEBAR_VIEW_MODE_KEY, next)
       return { sidebarViewMode: next }
     }),
+
+  themeName: readStringPref(THEME_NAME_KEY, DEFAULT_THEME_NAME),
+  setThemeName: (v) => {
+    writeStringPref(THEME_NAME_KEY, v)
+    set({ themeName: v })
+  },
+  previewThemeName: null,
+  setPreviewThemeName: (v) => set({ previewThemeName: v }),
 
   pinnedWindows: readPinnedWindows(),
 

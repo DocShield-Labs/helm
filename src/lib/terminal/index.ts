@@ -10,7 +10,11 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { commands } from '@lib/ipc'
+import { getTheme, xtermThemeFor, type Theme } from './themes'
 import '@xterm/xterm/css/xterm.css'
+
+export { THEMES, DEFAULT_THEME_NAME, applyThemeCssVars, getTheme } from './themes'
+export type { Theme } from './themes'
 
 // WebGL renderer with `onContextLoss` fallback. The atlas-cached glyphs
 // look noticeably crisper than the DOM renderer, especially at small
@@ -29,6 +33,9 @@ export interface HelmTerminal {
    * by the internal ResizeObserver — single source of truth shared
    * between the wheel handler, the block overlay, and hover hit-tests. */
   getCellSize(): { width: number; height: number }
+  /** Live-swap the xterm theme. Mutates `term.options.theme`, which
+   * triggers a redraw with the new palette (no reload, no remount). */
+  setTheme(theme: Theme): void
   dispose: () => void
 }
 
@@ -36,6 +43,11 @@ export interface AttachOptions {
   fontSize?: number
   lineHeight?: number
   fontFamily?: string
+  /** Initial theme. The new terminal also auto-registers for
+   * `setThemeForAllTerminals` — pass the current store value here for
+   * first paint, then a single subscriber at the app level handles
+   * subsequent swaps. */
+  theme?: Theme
   /** Click handler for URLs / file:line links rendered by xterm. Receives
    * the matched URI; resolution to a real file (or `open` invocation) is
    * left to the caller. Falls back to `window.open` for full URLs when
@@ -43,7 +55,21 @@ export interface AttachOptions {
   onLinkClick?: (uri: string) => void
 }
 
+/** Registry of every currently-attached terminal. The theme picker
+ * fans out via `setThemeForAllTerminals` so we don't need each pane
+ * to maintain its own store subscription — relevant when many panes
+ * are mounted at once and the user is rapidly cycling preview themes
+ * (one xterm atlas rebuild per pane per keypress otherwise). */
+const attached = new Set<HelmTerminal>()
+
+/** Push a theme into every live xterm. Safe to call from anywhere;
+ * disposed terminals deregister themselves. */
+export function setThemeForAllTerminals(theme: Theme): void {
+  for (const helm of attached) helm.setTheme(theme)
+}
+
 export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): HelmTerminal {
+  const initialTheme = opts.theme ?? getTheme(undefined)
   const term = new Terminal({
     // Lifted from Warp's defaults (app/src/settings/font.rs:11-13):
     //   font: Hack, size: 13, line-height ratio: 1.2.
@@ -58,21 +84,11 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     fontWeight: 400,
     fontWeightBold: 600,
     cursorBlink: true,
-    cursorStyle: 'block',
+    cursorStyle: 'bar',
+    cursorInactiveStyle: 'outline',
+    cursorWidth: 2,
     rescaleOverlappingGlyphs: true,
-    // Phenomenon palette from Warp's source
-    // (app/src/themes/default_themes.rs:411-422). Warmer near-black bg,
-    // off-white fg, and a softer ANSI light-blue for the cursor / running
-    // accent — much less aggressive than the saturated Tokyo-Night blue
-    // we were using.
-    theme: {
-      background: '#121212',
-      foreground: '#FAF9F6',
-      cursor: '#A5D5FE',
-      cursorAccent: '#121212',
-      selectionBackground: 'rgba(165, 213, 254, 0.22)',
-      selectionForeground: '#FAF9F6',
-    },
+    theme: xtermThemeFor(initialTheme),
     allowProposedApi: true,
     // tmux's protocol output uses bare LF, not CRLF — xterm needs to translate
     // so the cursor returns to column 0 on each newline. Disable this and
@@ -281,11 +297,15 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     firstRender = null
   })
 
-  return {
+  const helm: HelmTerminal = {
     term,
     fit,
     getCellSize: () => ({ width: cachedCellW, height: cachedCellH }),
+    setTheme: (theme: Theme) => {
+      term.options.theme = xtermThemeFor(theme)
+    },
     dispose: () => {
+      attached.delete(helm)
       host.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions)
       ro.disconnect()
       firstRender?.dispose()
@@ -293,4 +313,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       term.dispose()
     },
   }
+  attached.add(helm)
+  return helm
 }

@@ -10,6 +10,7 @@ import { paletteActions } from './palette'
 import { workspaceActions } from './workspace'
 import { windowActions } from './window'
 import { inboxActions } from './inbox'
+import { themeActions } from './theme'
 
 export type { Action, ActionContext, ActionKind, ActionSource } from './types'
 
@@ -19,6 +20,7 @@ export const STATIC_ACTIONS: Action[] = [
   ...workspaceActions,
   ...windowActions,
   ...inboxActions,
+  ...themeActions,
 ]
 
 export function findActionById(id: string): Action | undefined {

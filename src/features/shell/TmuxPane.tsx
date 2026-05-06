@@ -24,7 +24,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { commands } from '@lib/ipc'
-import { attachTerminal } from '@lib/terminal'
+import { attachTerminal, getTheme } from '@lib/terminal'
 import { subscribePaneOutput } from '@lib/host'
 import { useStore } from '@lib/store'
 import type { HostId } from '@bindings'
@@ -89,7 +89,10 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
     const ac = new AbortController()
     const aborted = () => ac.signal.aborted
     const encoder = new TextEncoder()
-    const attached = attachTerminal(host)
+    const { previewThemeName, themeName } = useStore.getState()
+    const attached = attachTerminal(host, {
+      theme: getTheme(previewThemeName ?? themeName),
+    })
     const { term, fit, dispose } = attached
     termRef.current = attached
 
@@ -218,6 +221,9 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
       trackerRef.current = null
     }
   }, [hostId, paneId, paneKey])
+
+  // (Theme changes fan out via App.tsx's single subscriber and the
+  // attached-terminals registry — no per-pane subscription needed.)
 
   // When the pane becomes visible after being hidden, the container has
   // gone from 0×0 (display:none) to its real dimensions. ResizeObserver
@@ -389,7 +395,7 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
   return (
     <div
       ref={wrapperRef}
-      className="relative h-full w-full overflow-hidden bg-[#121212]"
+      className="relative h-full w-full overflow-hidden bg-[var(--terminal-bg)]"
       onMouseMove={handleMouseMove}
       onMouseLeave={handleMouseLeave}
     >

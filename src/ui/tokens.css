@@ -1,80 +1,80 @@
 /*
  * Helm — design tokens.
  *
- * 1:1 with the Figma variables in /📐 Foundations.
- * Re-skin the entire system by changing values here; no component file
- * should ever hardcode a color or spacing value.
+ * Theme-driven. The whole app palette is derived from a small set of
+ * "base" variables (--terminal-bg, --terminal-fg, --terminal-accent,
+ * --terminal-failed/success/warning) which the theme picker pushes
+ * onto :root via JS. Everything else — surface tiers, text tiers,
+ * accent variants, status colours — is computed from those bases via
+ * `color-mix`, so swapping the theme re-skins every surface in the
+ * app at once.
+ *
+ * The default values below approximate Warp's "Phenomenon" theme so
+ * the first paint (before App.tsx's theme effect fires) looks right.
+ *
+ * Surfaces lighten as you go up the elevation stack on DARK themes;
+ * they darken on LIGHT themes. JS sets `data-theme-mode="dark|light"`
+ * on the document root from the theme's bg luminance; the conditional
+ * blocks below flip the mix direction to match.
  */
 
 :root {
-  /* ---------- Surfaces ---------- */
-  --bg-canvas: #0B0C0E;
-  --bg-sidebar: #0E1013;
-  --bg-elevated: #14171B;
-  --bg-overlay: #1A1E23;
-  --bg-hover: #1F2329;
-  --bg-active: #252A31;
+  /* ---------- Theme bases (overridden by JS at runtime) ---------- */
+  --terminal-bg:      #121212;
+  --terminal-fg:      #faf9f6;
+  --terminal-accent:  #3780e9;
+  --terminal-failed:  #d22d1e;
+  --terminal-success: #1ca05a;
+  --terminal-warning: #e5a01a;
+
+  /* ---------- Text (universal — opacity tiers on the theme fg) ---------- */
+  --text-primary:   var(--terminal-fg);
+  --text-secondary: color-mix(in srgb, var(--terminal-fg) 70%, transparent);
+  --text-tertiary:  color-mix(in srgb, var(--terminal-fg) 50%, transparent);
+  --text-disabled:  color-mix(in srgb, var(--terminal-fg) 28%, transparent);
+  --text-inverse:   var(--terminal-bg);
 
   /* ---------- Strokes ---------- */
-  --stroke-subtle:  rgba(255, 255, 255, 0.04);
-  --stroke-default: rgba(255, 255, 255, 0.08);
-  --stroke-strong:  rgba(255, 255, 255, 0.14);
-  --stroke-inverse: rgba(0, 0, 0, 0.40);
+  --stroke-subtle:  color-mix(in srgb, var(--terminal-fg) 5%, transparent);
+  --stroke-default: color-mix(in srgb, var(--terminal-fg) 9%, transparent);
+  --stroke-strong:  color-mix(in srgb, var(--terminal-fg) 16%, transparent);
+  --stroke-inverse: color-mix(in srgb, var(--terminal-bg) 40%, transparent);
 
-  /* ---------- Text ---------- */
-  --text-primary:   #ECEDEE;
-  --text-secondary: #9DA4AD;
-  --text-tertiary:  #6B7280;
-  --text-disabled:  #404853;
-  --text-inverse:   #0B0C0E;
-
-  /* ---------- Accent (Tokyo Night blue) ----------
-   * The three muted variants give selected rows a clear visual
-   * hierarchy in the sidebar tree:
-   *   - hosts at 6%     (the broadest container, lightest fill)
-   *   - workspaces at 5% (one level in, even lighter so it doesn't
-   *                       compete with a selected host above it)
+  /* ---------- Accent (theme.accent — saturation untouched, depths via opacity) ----------
+   * The three muted variants give selected rows a clear visual hierarchy
+   * in the sidebar tree:
+   *   - hosts at 6%      (the broadest container, lightest fill)
+   *   - workspaces at 5% (one level in, even lighter)
    *   - windows / pins at 10% (the actionable leaves — strongest)
    */
-  --accent-default: #7AA2F7;
-  --accent-hover:   #94B4F9;
-  --accent-muted:           rgba(122, 162, 247, 0.10);
-  --accent-muted-host:      rgba(122, 162, 247, 0.06);
-  --accent-muted-workspace: rgba(122, 162, 247, 0.05);
-  --accent-border:  rgba(122, 162, 247, 0.30);
-  --accent-text:    #B7CDFF;
+  --accent-default:         var(--terminal-accent);
+  --accent-hover:           color-mix(in srgb, var(--terminal-accent) 82%, white 18%);
+  --accent-muted:           color-mix(in srgb, var(--terminal-accent) 10%, transparent);
+  --accent-muted-host:      color-mix(in srgb, var(--terminal-accent) 6%,  transparent);
+  --accent-muted-workspace: color-mix(in srgb, var(--terminal-accent) 5%,  transparent);
+  --accent-border:          color-mix(in srgb, var(--terminal-accent) 30%, transparent);
+  --accent-text:            color-mix(in srgb, var(--terminal-accent) 75%, white 25%);
 
-  /* ---------- Status (semantic — never decorative) ---------- */
-  --status-connected:    #3FCF8E;
-  --status-connecting:   #E8B339;
-  --status-disconnected: #E5484D;
-  --status-idle:         #6B7280;
-  --status-error:        #F2555A;
+  /* ---------- Status / Activity (semantic, sourced from ANSI) ---------- */
+  --status-connected:    var(--terminal-success);
+  --status-connecting:   var(--terminal-warning);
+  --status-disconnected: var(--terminal-failed);
+  --status-error:        var(--terminal-failed);
+  --status-idle:         color-mix(in srgb, var(--terminal-fg) 50%, transparent);
 
-  /* ---------- Activity ---------- */
-  --activity-running:   #5B8DEF;
-  --activity-attention: #E8B339;
-  --activity-failed:    #E5484D;
-  --activity-idle:      #6B7280;
+  --activity-running:   var(--terminal-accent);
+  --activity-attention: var(--terminal-warning);
+  --activity-failed:    var(--terminal-failed);
+  --activity-idle:      color-mix(in srgb, var(--terminal-fg) 50%, transparent);
 
-  /* ---------- Terminal pane (Warp Phenomenon palette) ----------
-   * Used inside the xterm pane only — the surrounding chrome stays on
-   * the Tokyo-Night accent above so the terminal pane reads as its own
-   * surface. fg-XX variants are the foreground at fractional opacity
-   * for tiered text (sub-text, hints, separators); see Warp's
-   * `DARKER_DETAILS` table for the equivalent. */
-  --terminal-bg:        #121212;
-  --terminal-fg:        #FAF9F6;
-  --terminal-fg-30:     rgba(250, 249, 246, 0.30);
-  --terminal-fg-60:     rgba(250, 249, 246, 0.60);
-  --terminal-fg-06:     rgba(250, 249, 246, 0.06);
-  --terminal-divider:   rgba(250, 249, 246, 0.10);
-  --terminal-accent:    #A5D5FE;
-  --terminal-accent-18: rgba(165, 213, 254, 0.18);
-  --terminal-accent-22: rgba(165, 213, 254, 0.22);
-  --terminal-failed:    #FF8272;
-  --terminal-failed-10: rgba(255, 130, 114, 0.10);
-  --terminal-chip-bg:   rgba(20, 23, 27, 0.92);
+  /* ---------- Terminal pane chrome (block dividers, status chips) ---------- */
+  --terminal-fg-30:     color-mix(in srgb, var(--terminal-fg) 30%, transparent);
+  --terminal-fg-60:     color-mix(in srgb, var(--terminal-fg) 60%, transparent);
+  --terminal-fg-06:     color-mix(in srgb, var(--terminal-fg) 6%,  transparent);
+  --terminal-divider:   color-mix(in srgb, var(--terminal-fg) 10%, transparent);
+  --terminal-accent-18: color-mix(in srgb, var(--terminal-accent) 18%, transparent);
+  --terminal-accent-22: color-mix(in srgb, var(--terminal-accent) 22%, transparent);
+  --terminal-failed-10: color-mix(in srgb, var(--terminal-failed) 10%, transparent);
 
   /* ---------- Spacing scale ---------- */
   --space-0:  0px;
@@ -98,16 +98,13 @@
   --radius-xl:   12px;
   --radius-pill: 999px;
 
-  /* ---------- Type families ----------
-   * Chrome: SF Pro on device, Inter as the universal fallback.
-   * Mono:   Berkeley Mono on device, JetBrains Mono fallback.
-   */
+  /* ---------- Type families ---------- */
   --font-chrome: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro",
                   Inter, system-ui, sans-serif;
-  --font-mono:   "Berkeley Mono", "JetBrains Mono", "SF Mono", ui-monospace,
-                  Menlo, Consolas, monospace;
+  --font-mono:   "Hack", "Berkeley Mono", "JetBrains Mono", "SF Mono",
+                  ui-monospace, Menlo, Consolas, monospace;
 
-  /* ---------- Type ramp (size / line-height / weight / tracking) ---------- */
+  /* ---------- Type ramp ---------- */
   --type-display-lg-size: 40px; --type-display-lg-line: 48px; --type-display-lg-weight: 600; --type-display-lg-track: -0.03em;
   --type-title-lg-size:   22px; --type-title-lg-line:   30px; --type-title-lg-weight:   600; --type-title-lg-track:   -0.02em;
   --type-title-md-size:   15px; --type-title-md-line:   22px; --type-title-md-weight:   600; --type-title-md-track:   -0.01em;
@@ -129,6 +126,35 @@
   --elevation-1: 0 1px 2px rgba(0, 0, 0, 0.20);
   --elevation-2: 0 16px 48px rgba(0, 0, 0, 0.50), 0 0 0 1px rgba(255, 255, 255, 0.06);
   --elevation-3: 0 24px 64px rgba(0, 0, 0, 0.60), 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* ---------- Surfaces — direction-aware mixes ----------
+ * On a DARK theme each step mixes a touch more white into the bg so
+ * elevated surfaces read as raised. On a LIGHT theme we mix toward
+ * black instead so the same hierarchy holds visually. The default
+ * (no `data-theme-mode` set yet) follows the dark recipe so first
+ * paint matches Phenomenon. */
+:root,
+[data-theme-mode='dark'] {
+  --bg-canvas:   var(--terminal-bg);
+  --bg-sidebar:  color-mix(in srgb, var(--terminal-bg) 95%, white 5%);
+  --bg-elevated: color-mix(in srgb, var(--terminal-bg) 88%, white 12%);
+  --bg-overlay:  color-mix(in srgb, var(--terminal-bg) 84%, white 16%);
+  --bg-hover:    color-mix(in srgb, var(--terminal-bg) 91%, white 9%);
+  --bg-active:   color-mix(in srgb, var(--terminal-bg) 87%, white 13%);
+  --terminal-chip-bg:       color-mix(in srgb, var(--terminal-bg) 88%, white 12%);
+  --terminal-chip-bg-hover: color-mix(in srgb, var(--terminal-bg) 82%, white 18%);
+}
+
+[data-theme-mode='light'] {
+  --bg-canvas:   var(--terminal-bg);
+  --bg-sidebar:  color-mix(in srgb, var(--terminal-bg) 96%, black 4%);
+  --bg-elevated: color-mix(in srgb, var(--terminal-bg) 92%, black 8%);
+  --bg-overlay:  color-mix(in srgb, var(--terminal-bg) 88%, black 12%);
+  --bg-hover:    color-mix(in srgb, var(--terminal-bg) 94%, black 6%);
+  --bg-active:   color-mix(in srgb, var(--terminal-bg) 90%, black 10%);
+  --terminal-chip-bg:       color-mix(in srgb, var(--terminal-bg) 92%, black 8%);
+  --terminal-chip-bg-hover: color-mix(in srgb, var(--terminal-bg) 86%, black 14%);
 }
 
 /* ---------- Globals ---------- */
