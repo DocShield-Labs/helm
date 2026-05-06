@@ -54,11 +54,11 @@ __helm_command_started=0
 # Warp-style block list looks right out of the box. Set HELM_KEEP_PROMPT=1
 # to opt out and keep your real prompt + skip the header.
 if [[ -z "$HELM_KEEP_PROMPT" ]]; then
-    # Bright blue chevron — the shell's prompt is the canonical place
-    # to type (we don't ship a separate React input). RPROMPT cleared
-    # so the prompt row stays minimal; helm's block chrome supplies
-    # cwd/branch/status as a printed header line above the prompt.
-    PROMPT='%F{75}❯%f '
+    # Empty PROMPT — Warp-style "single clean pane." The cwd · branch
+    # header printed by precmd above the prompt already tells you
+    # where you are; the blinking cursor tells you where you'll type.
+    # No leading chevron, no decoration on the input row.
+    PROMPT=''
     RPROMPT=''
 fi
 
@@ -102,13 +102,15 @@ __helm_precmd() {
     local cwd_b64 branch_b64
     cwd_b64=$(__helm_b64 "$cwd")
     branch_b64=$(__helm_b64 "$branch")
-    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
-
-    # Top padding of the new block: leave the A-marker's row blank by
-    # advancing the cursor before printing the header. For the very
-    # first prompt (no preceding D) this gives a single blank row at
-    # the top of the first block too — symmetric.
+    # Two blank rows of breathing room ABOVE A — they sit in the gap
+    # between blocks (no block "owns" them). Putting them BEFORE A means
+    # A captures the row where the cwd · branch header is about to
+    # print, so the block's startLine == its visible header row. This
+    # makes BlockOverlay's chip + divider math anchor off a single
+    # row (no "blank top-pad row inside the block" to count past).
     print
+    print
+    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
     __helm_emit_block_header
 }
 

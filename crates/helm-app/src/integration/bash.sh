@@ -51,10 +51,15 @@ __helm_precmd() {
     local cwd_b64 branch_b64
     cwd_b64=$(__helm_b64 "$cwd")
     branch_b64=$(__helm_b64 "$branch")
-    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
-
-    # Top pad: keep A's row blank, push header onto the next row.
+    # Two blank rows of breathing room ABOVE A so they sit in the gap
+    # between blocks (no block owns them). Putting them BEFORE A means
+    # A captures the row where the cwd · branch header is about to
+    # print, so the block's startLine == its visible header row. See
+    # zsh.zshrc for the rationale — keeps BlockOverlay's chip + divider
+    # math single-row anchored.
     echo
+    echo
+    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
     if [ -z "$HELM_KEEP_PROMPT" ]; then
         local cwd_pretty="${PWD/#$HOME/~}"
         if [ -n "$branch" ]; then
@@ -94,9 +99,11 @@ __helm_preexec() {
 # \[ \] to hint readline about non-printing escapes — keeps cursor
 # math correct.
 if [ -z "$HELM_KEEP_PROMPT" ]; then
-    # Bright blue chevron — the shell prompt is the canonical place
-    # to type. Helm's block chrome above renders cwd/branch/status.
-    PS1='\[\033[38;5;75m\]❯\[\033[0m\] '
+    # Empty PS1 — Warp-style "single clean pane." The cwd · branch
+    # header printed by precmd above tells you where you are; the
+    # cursor itself shows where you'll type. Continuation prompt
+    # stays a faint ellipsis so multi-line input is still readable.
+    PS1=''
     PS2='\[\033[38;5;244m\]…\[\033[0m\] '
 fi
 

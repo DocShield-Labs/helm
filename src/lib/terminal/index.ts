@@ -8,23 +8,27 @@
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
+import { WebglAddon } from '@xterm/addon-webgl'
 import { commands } from '@lib/ipc'
 import '@xterm/xterm/css/xterm.css'
 
-// We deliberately don't load `@xterm/addon-webgl`. Browsers cap WebGL
-// contexts per page (Chromium ~16, Safari similar) and contexts release
-// on GC, not synchronously on `dispose()`. With multiple workspaces +
-// rapid window switching + React strict-mode's double-mount in dev, we
-// blow past the cap, see "too many active WebGL contexts" errors, and
-// xterm starts throwing `_renderer.value.dimensions is undefined` as
-// the GPU process evicts old contexts. The built-in canvas renderer
-// has no such cap, doesn't crash under churn, and the perf delta for
-// our usage (typing + reading output, not full-screen 60fps redraws)
-// is invisible. Phase 5 can revisit if profiling shows it matters.
+// WebGL renderer with `onContextLoss` fallback. The atlas-cached glyphs
+// look noticeably crisper than the DOM renderer, especially at small
+// font sizes. The historical concern was browser per-page context
+// caps (Chromium ~16) blowing up under workspace churn — fixed here by
+// disposing the addon when a context is lost, which makes xterm fall
+// back to its built-in DOM renderer for the affected pane. Construction
+// is wrapped in try/catch so headless or no-GPU environments degrade
+// silently instead of throwing.
 
 export interface HelmTerminal {
   term: Terminal
   fit: FitAddon
+  /** Pixel size of one xterm cell, measured from `.xterm-screen / rows`
+   * to bypass CSS line-height rounding. Returns the latest value cached
+   * by the internal ResizeObserver — single source of truth shared
+   * between the wheel handler, the block overlay, and hover hit-tests. */
+  getCellSize(): { width: number; height: number }
   dispose: () => void
 }
 
@@ -41,25 +45,33 @@ export interface AttachOptions {
 
 export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): HelmTerminal {
   const term = new Terminal({
+    // Lifted from Warp's defaults (app/src/settings/font.rs:11-13):
+    //   font: Hack, size: 13, line-height ratio: 1.2.
+    // We prefer Hack first, fall back to Berkeley Mono / JetBrains Mono
+    // / SF Mono so the look is right when Hack isn't installed.
     fontFamily:
       opts.fontFamily ??
-      '"Berkeley Mono", "JetBrains Mono", "SF Mono", ui-monospace, monospace',
-    fontSize: opts.fontSize ?? 12,
+      '"Hack", "Berkeley Mono", "JetBrains Mono", "SF Mono", ui-monospace, monospace',
+    fontSize: opts.fontSize ?? 13,
     lineHeight: opts.lineHeight ?? 1.2,
+    letterSpacing: 0,
+    fontWeight: 400,
+    fontWeightBold: 600,
     cursorBlink: true,
     cursorStyle: 'block',
-    // Helps Powerlevel10k / starship chevrons render at the correct width
-    // instead of overlapping the next column.
     rescaleOverlappingGlyphs: true,
+    // Phenomenon palette from Warp's source
+    // (app/src/themes/default_themes.rs:411-422). Warmer near-black bg,
+    // off-white fg, and a softer ANSI light-blue for the cursor / running
+    // accent — much less aggressive than the saturated Tokyo-Night blue
+    // we were using.
     theme: {
-      background: '#0A0B0D',
-      foreground: '#ECEDEE',
-      cursor: '#7AA2F7',
-      cursorAccent: '#0A0B0D',
-      // Selection: same accent blue as the cursor / chevron / running
-      // chip, at the alpha that gives a clear-but-not-loud highlight.
-      selectionBackground: 'rgba(122, 162, 247, 0.28)',
-      selectionForeground: '#ECEDEE',
+      background: '#121212',
+      foreground: '#FAF9F6',
+      cursor: '#A5D5FE',
+      cursorAccent: '#121212',
+      selectionBackground: 'rgba(165, 213, 254, 0.22)',
+      selectionForeground: '#FAF9F6',
     },
     allowProposedApi: true,
     // tmux's protocol output uses bare LF, not CRLF — xterm needs to translate
@@ -162,6 +174,20 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   })
 
   term.open(host)
+  // WebGL renderer must be loaded *after* `term.open` so it can read
+  // the host's dimensions. If construction fails (no WebGL2, blocked
+  // context) or the context is lost later (GPU process churn,
+  // browser-cap eviction), we dispose the addon and xterm reverts to
+  // its built-in DOM renderer for this pane. No reload, no crash.
+  let webgl: WebglAddon | null = null
+  try {
+    const addon = new WebglAddon()
+    addon.onContextLoss(() => addon.dispose())
+    term.loadAddon(addon)
+    webgl = addon
+  } catch {
+    /* no WebGL2 — xterm falls back to its DOM renderer automatically */
+  }
   try {
     fit.fit()
   } catch {
@@ -188,15 +214,29 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   //     a full row instead of being rounded away.
   //   - Cmd / Ctrl + wheel are left to the browser (zoom).
   let scrollAccum = 0
+  // Cached cell dimensions in pixels. Measure from `.xterm-screen / rows`
+  // (and cols) — that's xterm's internal layout, not CSS line-height,
+  // so we sidestep rounding drift between the two. The wheel handler,
+  // the block overlay, and the hover hit-test all read from this cache
+  // so they can't disagree about row positions.
   let cachedCellH = 17
-  const measureCellHeight = () => {
+  let cachedCellW = 8
+  const measureCellSize = () => {
+    const screen = host.querySelector('.xterm-screen') as HTMLElement | null
+    if (screen && term.rows > 0 && term.cols > 0) {
+      const rect = screen.getBoundingClientRect()
+      if (rect.height > 0) cachedCellH = rect.height / term.rows
+      if (rect.width > 0) cachedCellW = rect.width / term.cols
+      if (rect.height > 0) return
+    }
     const row = host.querySelector('.xterm-rows > div') as HTMLElement | null
     if (row) {
-      const h = row.getBoundingClientRect().height
-      if (h > 0) cachedCellH = h
+      const rect = row.getBoundingClientRect()
+      if (rect.height > 0) cachedCellH = rect.height
+      if (rect.width > 0 && term.cols > 0) cachedCellW = rect.width / term.cols
     }
   }
-  measureCellHeight()
+  measureCellSize()
   const onWheel = (e: WheelEvent) => {
     if (e.ctrlKey || e.metaKey) return
     e.preventDefault()
@@ -228,18 +268,28 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // element) fires first and we'd double-scroll.
   host.addEventListener('wheel', onWheel, { capture: true, passive: false })
 
-  // Re-measure cell height when the host resizes (font-size or DPR
-  // changes). Cheap; wheel handler reads from the cached value so the
-  // hot path stays free of layout thrash.
-  const ro = new ResizeObserver(measureCellHeight)
+  // Re-measure on host resize (font-size or DPR changes) and once on
+  // the first xterm render (covers the WebGL post-init race where the
+  // screen element settles to its final dimensions a tick after
+  // `term.open`). Both feed the same cache so all consumers stay in
+  // sync; no measurement happens on the wheel/hover/render hot paths.
+  const ro = new ResizeObserver(measureCellSize)
   ro.observe(host)
+  let firstRender: { dispose(): void } | null = term.onRender(() => {
+    measureCellSize()
+    firstRender?.dispose()
+    firstRender = null
+  })
 
   return {
     term,
     fit,
+    getCellSize: () => ({ width: cachedCellW, height: cachedCellH }),
     dispose: () => {
       host.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions)
       ro.disconnect()
+      firstRender?.dispose()
+      webgl?.dispose()
       term.dispose()
     },
   }

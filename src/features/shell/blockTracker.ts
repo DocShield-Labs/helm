@@ -20,6 +20,62 @@
 import type { IMarker, Terminal } from '@xterm/xterm'
 import type { MarkerAt } from '@bindings'
 
+/** xterm host padding (`pl-6 pr-2 py-2` on the host element). Block
+ * chrome and hover hit-tests both need to convert between row index
+ * and pane-local pixel coordinates, so the offsets live next to
+ * `clipBlockToViewport` for both consumers (`BlockOverlay`, `TmuxPane`)
+ * to import. */
+export const HOST_PADDING_TOP = 8
+export const HOST_PADDING_LEFT = 24
+
+/** How far down to scan from `block.startLine` for the first non-blank
+ * row (the cwd · branch header). The integration prints ≤2 blank rows
+ * above the header; we allow a couple extra in case a theme hook
+ * inserts noise. */
+const MAX_HEADER_SCAN_ROWS = 4
+
+// ---------- diagnostic logging ----------
+//
+// Enable in the browser console:    localStorage.helmDebugBlocks = '1'
+// Disable:                           localStorage.removeItem('helmDebugBlocks')
+//
+// `fmtBytes` shows control characters as escape literals so the dump is
+// safe to paste into a bug report. All logging is gated through
+// `isDebug()` and the expensive `fmtBytes` calls only run inside that
+// guard — when the flag is off there's no per-chunk allocation cost.
+
+function isDebug(): boolean {
+  try {
+    return (
+      typeof localStorage !== 'undefined' &&
+      localStorage.getItem('helmDebugBlocks') === '1'
+    )
+  } catch {
+    return false
+  }
+}
+
+function dlog(...args: unknown[]): void {
+  console.log('[helm-blocks]', ...args)
+}
+
+function fmtBytes(bytes: Uint8Array | ArrayLike<number>): string {
+  let s = ''
+  const max = Math.min(bytes.length, 200)
+  for (let i = 0; i < max; i++) {
+    const b = bytes[i]
+    if (b === 0x1b) s += '\\e'
+    else if (b === 0x07) s += '\\a'
+    else if (b === 0x0a) s += '\\n'
+    else if (b === 0x0d) s += '\\r'
+    else if (b === 0x09) s += '\\t'
+    else if (b >= 0x20 && b < 0x7f) s += String.fromCharCode(b)
+    else s += `\\x${b.toString(16).padStart(2, '0')}`
+  }
+  if (bytes.length > max) s += `…(+${bytes.length - max}b)`
+  return s
+}
+
 /**
  * Block lifecycle:
  *   - `pending`  : `A` fired, block opened. The header line + prompt
@@ -55,6 +111,14 @@ export interface BlockRecord {
    * still in `pending`. */
   commandStartedAt: number | null
   endedAt: number | null
+  /** Cached cwd · branch row, found by scanning forward from
+   * `startMarker.line` for the first non-blank row. Null until the
+   * header has actually printed (between A and the first `print -P`
+   * output). Once found, stays valid because IMarker tracks the row. */
+  headerRow: number | null
+  /** Cached cwd · branch text. Co-stored with `headerRow` so consumers
+   * don't reach back into the xterm buffer. */
+  headerText: string | null
 }
 
 /** Plain snapshot pushed to React. `startLine` / `endLine` are sampled
@@ -64,6 +128,14 @@ export interface BlockSnapshot {
   id: string
   startLine: number
   endLine: number | null
+  /** First non-blank row at or below `startLine` — the cwd · branch
+   * header rendered by the integration. -1 until the header has
+   * actually printed (or if the block has fallen out of scrollback). */
+  headerRow: number
+  /** Trimmed text content of the header row. Used by the chip-position
+   * math in BlockOverlay so it can land the inline duration chip
+   * immediately after the cwd · branch text. Empty until found. */
+  headerText: string
   command: string | null
   status: BlockStatus
   exitCode: number | null
@@ -116,7 +188,11 @@ export class BlockTracker {
    * belongs to. */
   ingest(bytes: Uint8Array, markers: MarkerAt[]): void {
     if (this.disposed) return
+    const debug = isDebug()
     if (markers.length === 0) {
+      if (debug && bytes.length > 0) {
+        dlog('ingest no-markers', { len: bytes.length, bytes: fmtBytes(bytes) })
+      }
       this.term.write(bytes)
       // Even with no markers, the alt-screen state can flip if the
       // chunk contained `\x1b[?1049h` / `1049l`. Sample once.
@@ -124,21 +200,45 @@ export class BlockTracker {
       return
     }
 
+    if (debug) {
+      dlog('ingest', {
+        len: bytes.length,
+        bytes: fmtBytes(bytes),
+        markers: markers.map((m) => ({ kind: m.marker.kind, offset: m.offset })),
+      })
+    }
+
     let cursor = 0
     for (const m of markers) {
       const offset = Math.min(m.offset, bytes.length)
       if (offset > cursor) {
-        // Write up to (but not including) the marker's offset, then
-        // process the marker once xterm has parsed those bytes. The
-        // callback form of `term.write` fires after the parse pass
-        // finishes, so cursor reads are accurate.
         const slice = bytes.subarray(cursor, offset)
-        this.term.write(slice, () => this.applyMarker(m))
+        this.term.write(slice, () => {
+          if (debug) {
+            const buf = this.term.buffer.active
+            dlog('  pre-marker', {
+              slice: fmtBytes(slice),
+              kind: m.marker.kind,
+              offset,
+              cursorAbsY: buf.baseY + buf.cursorY,
+              cursorY: buf.cursorY,
+              baseY: buf.baseY,
+            })
+          }
+          this.applyMarker(m)
+        })
       } else {
-        // Marker sits at the very start of the chunk (or coincides
-        // with the previous marker's offset). Fire it directly —
-        // there are no bytes to flush first.
-        this.term.write(new Uint8Array(0), () => this.applyMarker(m))
+        this.term.write(new Uint8Array(0), () => {
+          if (debug) {
+            const buf = this.term.buffer.active
+            dlog('  marker-no-slice', {
+              kind: m.marker.kind,
+              offset,
+              cursorAbsY: buf.baseY + buf.cursorY,
+            })
+          }
+          this.applyMarker(m)
+        })
       }
       cursor = offset
     }
@@ -176,25 +276,21 @@ export class BlockTracker {
         break
 
       case 'prompt_start': {
-        // The row that A fires on is where precmd is about to print
-        // the cwd · branch header line, then zsh draws the prompt,
-        // then the user types, then the command runs. The entire
-        // cycle stays inside this single block — that's why the
-        // border can run uninterrupted from header to last output line.
-        //
-        // Defensive: if we still have a "current" block that never saw
-        // `D` (shell entered a TUI then dropped out without a clean
-        // exit code), close it now.
         if (this.current && !this.current.endMarker) {
           this.current.endMarker = this.term.registerMarker(0)
           this.current.status = 'unknown'
           this.current.endedAt = Date.now()
+          dlog('A: closed lingering block as unknown', {
+            id: this.current.id,
+            endLine: this.current.endMarker?.line,
+          })
           this.current = null
         }
 
+        const startMarker = this.term.registerMarker(0)
         const block: BlockRecord = {
           id: `${this.paneKey}#${this.nextId++}`,
-          startMarker: this.term.registerMarker(0),
+          startMarker,
           endMarker: null,
           command: null,
           status: 'pending',
@@ -202,9 +298,22 @@ export class BlockTracker {
           openedAt: Date.now(),
           commandStartedAt: null,
           endedAt: null,
+          headerRow: null,
+          headerText: null,
         }
         this.blocks.push(block)
         this.current = block
+
+        if (isDebug()) {
+          const buf = this.term.buffer.active
+          dlog('A prompt_start: NEW BLOCK', {
+            id: block.id,
+            startLine: startMarker?.line,
+            cursorAbsY: buf.baseY + buf.cursorY,
+            cursorY: buf.cursorY,
+            baseY: buf.baseY,
+          })
+        }
 
         this.state = { ...this.state, atPrompt: !this.state.altScreen }
         this.notifyPromptState()
@@ -213,6 +322,15 @@ export class BlockTracker {
       }
 
       case 'command_start': {
+        if (isDebug()) {
+          const buf = this.term.buffer.active
+          dlog('B command_start', {
+            id: this.current?.id,
+            command: m.marker.command,
+            cursorAbsY: buf.baseY + buf.cursorY,
+            currentStartLine: this.current?.startMarker?.line,
+          })
+        }
         // The user submitted a command. The block was already created
         // at A; here we fill in the cmdline + flip status to running.
         if (this.current && this.current.status === 'pending') {
@@ -233,6 +351,8 @@ export class BlockTracker {
             openedAt: Date.now(),
             commandStartedAt: Date.now(),
             endedAt: null,
+            headerRow: null,
+            headerText: null,
           }
           this.blocks.push(block)
           this.current = block
@@ -258,6 +378,8 @@ export class BlockTracker {
             openedAt: Date.now(),
             commandStartedAt: Date.now(),
             endedAt: null,
+            headerRow: null,
+            headerText: null,
           }
           this.blocks.push(block)
           this.current = block
@@ -271,28 +393,46 @@ export class BlockTracker {
       case 'command_done': {
         const exitCode = m.marker.exit_code ?? null
         if (this.current) {
-          // Most commands end with `\n`, which leaves the cursor on a
-          // fresh blank row when precmd fires. Registering at offset 0
-          // would capture *that* blank row — and the very next `A`
-          // (firing at the same cursor) would claim the same row as
-          // its start, so two adjacent blocks would both tint it.
-          // Detect the trailing-blank case and back the end-marker up
-          // one row so the blank cleanly belongs to the next block
-          // alone (its top pad).
-          //
-          // For commands that didn't end with `\n` (rare: `printf 'x'`)
-          // the cursor row has content; we close at offset 0 normally.
           const buf = this.term.buffer.active
           const cursorAbsY = buf.baseY + buf.cursorY
           const cursorLine = buf.getLine(cursorAbsY)
+          const cursorLineText =
+            cursorLine?.translateToString(true) ?? '<no line>'
           const cursorRowBlank =
-            !cursorLine || cursorLine.translateToString(true).trim() === ''
+            !cursorLine || cursorLineText.trim() === ''
           const offset = cursorRowBlank && cursorAbsY > 0 ? -1 : 0
-          this.current.endMarker = this.term.registerMarker(offset)
+          const endMarker = this.term.registerMarker(offset)
+          this.current.endMarker = endMarker
           this.current.exitCode = exitCode
           this.current.status =
             exitCode === null ? 'unknown' : exitCode === 0 ? 'ok' : 'failed'
           this.current.endedAt = Date.now()
+
+          if (isDebug()) {
+            dlog('D command_done', {
+              id: this.current.id,
+              exitCode,
+              cursorAbsY,
+              cursorY: buf.cursorY,
+              baseY: buf.baseY,
+              cursorLineText: JSON.stringify(cursorLineText),
+              cursorRowBlank,
+              offset,
+              endLine: endMarker?.line,
+              startLine: this.current.startMarker?.line,
+            })
+            // Sample a few rows around the end so we can verify what
+            // actually rendered there.
+            const samples: Record<string, string> = {}
+            for (let r = Math.max(0, cursorAbsY - 3); r <= cursorAbsY + 1; r++) {
+              const ln = buf.getLine(r)
+              samples[`r${r}`] = JSON.stringify(
+                ln?.translateToString(true) ?? '<missing>',
+              )
+            }
+            dlog('  rows around D', samples)
+          }
+
           this.current = null
         }
         this.notifyBlocks()
@@ -316,10 +456,33 @@ export class BlockTracker {
   }
 
   private snapshot(b: BlockRecord): BlockSnapshot {
+    const startLine = b.startMarker?.line ?? -1
+
+    // Locate the cwd · branch header row by scanning forward from
+    // `startLine` for the first non-blank row. Cache on the record so
+    // we only do this work until the row is found — IMarker tracks the
+    // row across scrollback growth, so once we've got it we're done.
+    if (b.headerRow === null && startLine >= 0) {
+      const buf = this.term.buffer.active
+      const max = startLine + MAX_HEADER_SCAN_ROWS
+      for (let row = startLine; row <= max; row++) {
+        const line = buf.getLine(row)
+        if (!line) continue
+        const text = line.translateToString(true)
+        if (text.trim().length > 0) {
+          b.headerRow = row
+          b.headerText = text.replace(/\s+$/, '')
+          break
+        }
+      }
+    }
+
     return {
       id: b.id,
-      startLine: b.startMarker?.line ?? -1,
+      startLine,
       endLine: b.endMarker?.line ?? null,
+      headerRow: startLine < 0 ? -1 : b.headerRow ?? -1,
+      headerText: startLine < 0 ? '' : b.headerText ?? '',
       command: b.command,
       status: b.status,
       exitCode: b.exitCode,

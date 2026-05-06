@@ -57,6 +57,25 @@
   --activity-failed:    #E5484D;
   --activity-idle:      #6B7280;
 
+  /* ---------- Terminal pane (Warp Phenomenon palette) ----------
+   * Used inside the xterm pane only — the surrounding chrome stays on
+   * the Tokyo-Night accent above so the terminal pane reads as its own
+   * surface. fg-XX variants are the foreground at fractional opacity
+   * for tiered text (sub-text, hints, separators); see Warp's
+   * `DARKER_DETAILS` table for the equivalent. */
+  --terminal-bg:        #121212;
+  --terminal-fg:        #FAF9F6;
+  --terminal-fg-30:     rgba(250, 249, 246, 0.30);
+  --terminal-fg-60:     rgba(250, 249, 246, 0.60);
+  --terminal-fg-06:     rgba(250, 249, 246, 0.06);
+  --terminal-divider:   rgba(250, 249, 246, 0.10);
+  --terminal-accent:    #A5D5FE;
+  --terminal-accent-18: rgba(165, 213, 254, 0.18);
+  --terminal-accent-22: rgba(165, 213, 254, 0.22);
+  --terminal-failed:    #FF8272;
+  --terminal-failed-10: rgba(255, 130, 114, 0.10);
+  --terminal-chip-bg:   rgba(20, 23, 27, 0.92);
+
   /* ---------- Spacing scale ---------- */
   --space-0:  0px;
   --space-1:  2px;

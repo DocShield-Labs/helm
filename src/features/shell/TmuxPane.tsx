@@ -31,6 +31,7 @@ import type { HostId } from '@bindings'
 import {
   BlockTracker,
   clipBlockToViewport,
+  HOST_PADDING_TOP,
   type BlockSnapshot,
   type PromptState,
 } from './blockTracker'
@@ -38,7 +39,11 @@ import { BlockOverlay } from './BlockOverlay'
 import { StickyRunHeader } from './StickyRunHeader'
 import { TerminalScrollbar } from './TerminalScrollbar'
 
-const HOST_PADDING_TOP = 8
+/** Number of gap rows on each side of a block that should still register
+ * as hovering it. Visually each block extends from one divider to the
+ * next; the integration leaves 2 gap rows between blocks with the
+ * divider on the boundary, so each block claims one row on each side. */
+const HOVER_GAP_ROWS = 1
 
 interface TmuxPaneProps {
   hostId: HostId
@@ -241,23 +246,22 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
   // path so the two stay agreed on which blocks are interactive.
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const wrapper = wrapperRef.current
-    const term = termRef.current?.term
-    const host = hostRef.current
-    if (!wrapper || !term || !host) return
+    const helm = termRef.current
+    if (!wrapper || !helm) return
+    const term = helm.term
     const rect = wrapper.getBoundingClientRect()
     const y = e.clientY - rect.top - HOST_PADDING_TOP
-
-    const row = host.querySelector('.xterm-rows > div') as HTMLElement | null
-    const cellH = row ? row.getBoundingClientRect().height || 17 : 17
+    const cellH = helm.getCellSize().height
     const viewportY = term.buffer.active.viewportY
 
     let next: string | null = null
     for (const block of blocksRef.current) {
       const clipped = clipBlockToViewport(block.startLine, block.endLine, term)
       if (!clipped) continue
-      const top = (clipped.visibleTop - viewportY) * cellH
-      const heightPx = (clipped.visibleBottom - clipped.visibleTop + 1) * cellH
-      if (y >= top && y < top + heightPx) {
+      const top = (clipped.visibleTop - HOVER_GAP_ROWS - viewportY) * cellH
+      const rowSpan =
+        clipped.visibleBottom - clipped.visibleTop + 1 + 2 * HOVER_GAP_ROWS
+      if (y >= top && y < top + rowSpan * cellH) {
         next = block.id
         break
       }
@@ -385,7 +389,7 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
   return (
     <div
       ref={wrapperRef}
-      className="relative h-full w-full overflow-hidden bg-[#0A0B0D]"
+      className="relative h-full w-full overflow-hidden bg-[#121212]"
       onMouseMove={handleMouseMove}
       onMouseLeave={handleMouseLeave}
     >
@@ -403,10 +407,9 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
         ref={hostRef}
         className="absolute inset-0 overflow-hidden pl-6 pr-2 py-2"
       />
-      {termRef.current && hostRef.current && (
+      {termRef.current && (
         <BlockOverlay
-          term={termRef.current.term}
-          hostElement={hostRef.current}
+          helm={termRef.current}
           blocks={blocks}
           selectedId={selectedId}
           hoveredId={hoveredId}

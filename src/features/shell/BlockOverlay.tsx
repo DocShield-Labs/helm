@@ -1,71 +1,61 @@
 /**
  * BlockOverlay — block chrome rendered as React absolutes over xterm.
  *
- * Pointer-events policy: this whole overlay is `pointer-events: none`
- * end-to-end so wheel events scroll xterm naturally and clicks select
- * text. The action chip card is the only interactive surface and
- * re-enables `pointer-events: auto` for itself.
+ * Pointer-events: the overlay is `pointer-events: none` end-to-end so
+ * wheel and click pass through to xterm. Only the action-chip card
+ * re-enables interactivity for itself. Hover tracking lives in TmuxPane
+ * because these divs can't fire mouseEnter under `pointer-events: none`.
  *
- * Hover detection lives in the parent (TmuxPane) — it tracks the
- * cursor's Y position over the pane wrapper and computes which block
- * the cursor is over from the row ranges. The result is passed in as
- * `hoveredId`. We can't use mouseEnter on these block divs because
- * they're pointer-events: none.
- *
- * What lives here:
- *   - 2px coloured left border per block, drawn in the host's left
- *     padding gap so glyphs can't ever cover it.
- *   - Subtle background tint over the block's row range while hovered
- *     or selected, plus a faint persistent wash on failed blocks.
- *   - Inline status chip (running · 14s, exit 1 · 2s, plain duration)
- *     positioned at the end of the shell-printed cwd · branch text by
- *     measuring xterm cell width.
- *   - Hover-revealed action chips (cmd / output / re-run / jump-to).
- *
- * Re-render cadence: ticks on `term.onScroll` and `term.onRender` (so
- * running blocks' borders/backgrounds grow live with output) plus a
- * 1-second wall-clock interval so the running chip's elapsed advances.
+ * Visual model (lifted from Warp's `block_list_element.rs`):
+ *   - Blocks are flat — no card, no border, no rounded corners.
+ *   - The only structural separator is a 1-px hairline between blocks
+ *     at fg @ 10%, painted in the gap rows the integration script
+ *     reserves between adjacent blocks.
+ *   - State signals via full-bleed low-opacity overlays:
+ *       failed   → red wash @ 10% + 5-px red flag pole on the left.
+ *       selected → accent wash @ 18% + 2-px accent outline (suppresses
+ *                  the failed flag pole).
+ *       hover    → no row fill; only the action-chip card fades in.
+ *   - Inline duration chip on the cwd row carries the live status cue.
  */
 
-import { useEffect, useRef, useState } from 'react'
-import type { Terminal } from '@xterm/xterm'
+import { useEffect, useState } from 'react'
 import { commands } from '@lib/ipc'
 import { formatDuration } from '@lib/format'
 import type { HostId } from '@bindings'
-import { clipBlockToViewport, type BlockSnapshot } from './blockTracker'
+import {
+  clipBlockToViewport,
+  HOST_PADDING_LEFT,
+  HOST_PADDING_TOP,
+  type BlockSnapshot,
+} from './blockTracker'
+import type { HelmTerminal } from '@lib/terminal'
 
 interface Props {
-  term: Terminal
-  hostElement: HTMLElement
+  helm: HelmTerminal
   blocks: BlockSnapshot[]
   selectedId: string | null
   hoveredId: string | null
   hostId: HostId
   paneId: string
-  /** Whether the parent considers the input atPrompt — re-run is
-   * gated on this so we don't dispatch a command into the middle of a
-   * running command. */
+  /** Whether the parent considers the input atPrompt — re-run is gated
+   * on this so we don't dispatch into the middle of a running command. */
   canDispatch: boolean
-  /** Called when the user wants to scroll the pane to a particular
-   * block. Used by the chip's "jump to" affordance. */
+  /** Scroll the pane to a particular block (used by the chip's "jump
+   * to" affordance). */
   onJumpTo: (line: number) => void
 }
 
-/** xterm host has `pl-6 pr-2 py-2`. Coordinates here are
- * relative to the OUTER pane wrapper (the same parent xterm sits in),
- * so we offset by the host's padding to line up with rendered rows. */
-const HOST_PADDING_TOP = 8
-const HOST_PADDING_LEFT = 24
-/** Distance from the screen edge to the centre of the left border.
- * Sits inside the xterm padding gap so it can't be occluded by glyphs. */
-const BORDER_LEFT = 10
-/** Gap between the end of the shell-printed header text and the
- * inline running/exit chip. */
+/** Width of the failed-block left stripe. From Warp's
+ * `LEFT_STRIPE_WIDTH = 5.0` in `app/src/terminal/warpify/render.rs`. */
+const FLAG_POLE_WIDTH = 5
+
+/** Cells of horizontal gap between the cwd · branch text and the
+ * inline status chip. */
 const HEADER_CHIP_GAP_CELLS = 2
 
 export function BlockOverlay({
-  term,
-  hostElement,
+  helm,
   blocks,
   selectedId,
   hoveredId,
@@ -74,41 +64,31 @@ export function BlockOverlay({
   canDispatch,
   onJumpTo,
 }: Props) {
+  const term = helm.term
   const [, setTick] = useState(0)
-  const cellHeightRef = useRef(17)
-  const cellWidthRef = useRef(8)
 
+  // Re-render on viewport scroll. We deliberately do NOT subscribe to
+  // `term.onRender` here — that fires on every paint while output
+  // streams (30–60 Hz under build / log-tail), which would cost a full
+  // overlay reconciliation per frame for no visual benefit. Block
+  // positions only change on scroll or when the block list itself
+  // changes, both of which already trigger re-renders.
   useEffect(() => {
-    const force = () => setTick((t) => t + 1)
-    const scrollDisp = term.onScroll(force)
-    const renderDisp = term.onRender(force)
-    const id = window.setInterval(force, 1000)
-    return () => {
-      scrollDisp.dispose()
-      renderDisp.dispose()
-      window.clearInterval(id)
-    }
+    const dispose = term.onScroll(() => setTick((t) => t + 1))
+    return () => dispose.dispose()
   }, [term])
 
+  // 1-Hz tick so the running-block duration chip advances. Only
+  // schedule when there's actually a running block — idle terminals
+  // do zero work.
+  const hasRunning = blocks.some((b) => b.status === 'running')
   useEffect(() => {
-    const measure = () => {
-      const row = hostElement.querySelector('.xterm-rows > div') as HTMLElement | null
-      if (row) {
-        const rect = row.getBoundingClientRect()
-        if (rect.height > 0) cellHeightRef.current = rect.height
-        if (rect.width > 0 && term.cols > 0) {
-          cellWidthRef.current = rect.width / term.cols
-        }
-      }
-    }
-    measure()
-    const ro = new ResizeObserver(measure)
-    ro.observe(hostElement)
-    return () => ro.disconnect()
-  }, [hostElement, term])
+    if (!hasRunning) return
+    const id = window.setInterval(() => setTick((t) => t + 1), 1000)
+    return () => window.clearInterval(id)
+  }, [hasRunning])
 
-  const cellH = cellHeightRef.current
-  const cellW = cellWidthRef.current
+  const { width: cellW, height: cellH } = helm.getCellSize()
 
   return (
     <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden">
@@ -125,54 +105,34 @@ export function BlockOverlay({
 
         const startTop = (visibleTop - viewportY) * cellH
         const heightPx = (visibleBottom - visibleTop + 1) * cellH
-        // Distance from the *clipped* top down to the original start
-        // row. Used to figure out where on the still-visible portion
-        // the inline chip lives — when the start row scrolls past the
-        // viewport, the chip is hidden because its row (start + 1) is
-        // outside the visible intersection.
-        const startRowOffsetPx = (block.startLine - visibleTop) * cellH
 
         const isSelected = block.id === selectedId
         const isHovered = block.id === hoveredId
         const isPending = block.status === 'pending'
-        const isRunning = block.status === 'running'
         const isFailed = block.status === 'failed'
         const showChips = (isHovered || isSelected) && !isPending
 
-        const borderColor = isFailed
-          ? '#f7768e'
-          : isRunning
-            ? '#7aa2f7'
-            : isSelected
-              ? 'rgba(122,162,247,0.55)'
-              : isHovered
-                ? 'rgba(255,255,255,0.10)'
-                : 'transparent'
-
-        const tintColor = isFailed
-          ? 'rgba(247,118,142,0.04)'
-          : isHovered || isSelected
-            ? 'rgba(255,255,255,0.025)'
+        const tintColor = isSelected
+          ? 'var(--terminal-accent-18)'
+          : isFailed
+            ? 'var(--terminal-failed-10)'
             : 'transparent'
 
-        // The block's first row (`startLine`) is the blank top-pad
-        // row that the integration script reserves; the cwd · branch
-        // header text is one row below that. Measure the header row
-        // length to land the inline chip immediately after the text.
-        const headerRow = block.startLine + 1
-        const headerLine = term.buffer.active.getLine(headerRow)
-        const headerText =
-          headerLine?.translateToString(true).replace(/\s+$/, '') ?? ''
+        const showFlagPole = isFailed && !isSelected
+
+        // Chip + divider both anchor at the cwd row. `headerRow` is
+        // -1 until BlockTracker has actually seen the header text
+        // print (between A and the first `print -P` output), at which
+        // point it stays valid because IMarker tracks the row.
+        const headerRow = block.headerRow
+        const chipVisible =
+          headerRow >= 0 &&
+          headerRow >= viewportY &&
+          headerRow <= viewportEnd
+        const headerOffsetPx = (headerRow - block.startLine) * cellH
         const chipLeft =
           HOST_PADDING_LEFT +
-          headerText.length * cellW +
-          HEADER_CHIP_GAP_CELLS * cellW
-        // Chip sits on the header row (one cell-height below the block
-        // start). When the block has scrolled so the header row is
-        // above the visible top, the chip would land at a negative
-        // offset within our clipped wrapper — hide it in that case.
-        const chipTop = cellH + startRowOffsetPx
-        const chipVisible = headerRow >= viewportY && headerRow <= viewportEnd
+          (block.headerText.length + HEADER_CHIP_GAP_CELLS) * cellW
 
         return (
           <div
@@ -183,120 +143,193 @@ export function BlockOverlay({
               left: 0,
               right: 0,
               height: heightPx,
-              // Clip overflow so the chip / chips card don't leak
-              // into a sibling block's territory when the header row
-              // is hidden by the clip.
+              // Clips the action-chip card so it can't bleed into a
+              // sibling block when the header row is partially scrolled
+              // off. Dividers are rendered outside the wrapper (see the
+              // separate pass below) so they aren't affected.
               overflow: 'hidden',
             }}
           >
-            <div
-              className="absolute inset-0 transition-colors duration-100"
-              style={{ background: tintColor }}
-            />
-            <div
-              className="absolute top-0 bottom-0 transition-all duration-100"
-              style={{
-                left: BORDER_LEFT,
-                width: isSelected ? 3 : 2,
-                background: borderColor,
-                borderRadius: 1,
-              }}
-            />
+            {tintColor !== 'transparent' && (
+              <div
+                className="absolute inset-0 transition-colors duration-100"
+                style={{ background: tintColor }}
+              />
+            )}
+            {showFlagPole && (
+              <div
+                className="absolute top-0 bottom-0 left-0"
+                style={{
+                  width: FLAG_POLE_WIDTH,
+                  background: 'var(--terminal-failed)',
+                }}
+              />
+            )}
+            {isSelected && (
+              <div
+                className="pointer-events-none absolute inset-0"
+                style={{
+                  outline: '2px solid var(--terminal-accent)',
+                  outlineOffset: -2,
+                }}
+              />
+            )}
 
-            {chipVisible && isRunning && block.commandStartedAt !== null && (
-              <div
-                className="absolute select-none flex items-center gap-1.5 font-mono text-[12px]"
-                style={{ top: chipTop, left: chipLeft, height: cellH }}
-              >
-                <span className="text-[#404853]">·</span>
-                {/* Accent blue, matches the cursor / prompt chevron —
-                    a quiet "this one is live" indicator. */}
-                <span className="text-[#7aa2f7]">
-                  {formatDuration(Date.now() - block.commandStartedAt)}
-                </span>
-              </div>
+            {chipVisible && (
+              <StatusChip
+                top={headerOffsetPx}
+                left={chipLeft}
+                height={cellH}
+                block={block}
+              />
             )}
-            {chipVisible && isFailed && (
-              <div
-                className="absolute select-none flex items-center gap-1.5 font-mono text-[12px]"
-                style={{ top: chipTop, left: chipLeft, height: cellH }}
-              >
-                <span className="text-[#404853]">·</span>
-                <span className="text-[#f7768e]">
-                  exit {block.exitCode ?? '?'}
-                </span>
-                {block.endedAt && block.commandStartedAt && (
-                  <>
-                    <span className="text-[#404853]">·</span>
-                    <span className="text-[#6b7380]">
-                      {formatDuration(block.endedAt - block.commandStartedAt)}
-                    </span>
-                  </>
-                )}
-              </div>
-            )}
-            {chipVisible &&
-              block.status === 'ok' &&
-              block.endedAt &&
-              block.commandStartedAt && (
-                <div
-                  className="absolute select-none flex items-center gap-1.5 font-mono text-[12px] text-[#6b7380]"
-                  style={{ top: chipTop, left: chipLeft, height: cellH }}
-                >
-                  <span className="text-[#404853]">·</span>
-                  <span>{formatDuration(block.endedAt - block.commandStartedAt)}</span>
-                </div>
-              )}
 
             <div
-              className={`pointer-events-auto absolute right-3 z-20 flex items-center gap-1 rounded-md border border-white/[0.06] bg-[#14171b]/95 px-1.5 py-1 text-[10px] font-medium tracking-tight text-[#9da4ad] shadow-md backdrop-blur transition-opacity duration-100 ${
+              className={`pointer-events-auto absolute right-3 z-20 flex items-center gap-0.5 rounded-md px-1.5 py-1 text-[10px] font-medium tracking-tight shadow-md backdrop-blur transition-opacity duration-100 ${
                 showChips ? 'opacity-100' : 'pointer-events-none opacity-0'
               }`}
-              style={{ top: cellH + 4 }}
+              style={{
+                top: cellH + 4,
+                background: 'var(--terminal-chip-bg)',
+                border: '1px solid var(--terminal-fg-06)',
+                color: 'var(--terminal-fg-60)',
+              }}
               data-block-chip
             >
               {block.command && (
-                <button
-                  type="button"
-                  className="rounded px-1.5 py-0.5 hover:bg-white/[0.06] hover:text-[#ecedee]"
+                <ActionButton
                   onClick={() => copyToClipboard(block.command ?? '')}
                   title="Copy command (⌘⇧C)"
                 >
                   cmd
-                </button>
+                </ActionButton>
               )}
-              <button
-                type="button"
-                className="rounded px-1.5 py-0.5 hover:bg-white/[0.06] hover:text-[#ecedee]"
+              <ActionButton
                 onClick={() => copyOutputToClipboard(term, block)}
                 title="Copy output (⌘C)"
               >
                 output
-              </button>
+              </ActionButton>
               {block.command && (
-                <button
-                  type="button"
+                <ActionButton
                   disabled={!canDispatch}
-                  className="rounded px-1.5 py-0.5 enabled:hover:bg-white/[0.06] enabled:hover:text-[#ecedee] disabled:opacity-40"
                   onClick={() => rerunBlock(hostId, paneId, block.command!)}
                   title="Re-run (⌘R)"
                 >
                   ↻
-                </button>
+                </ActionButton>
               )}
-              <button
-                type="button"
-                className="rounded px-1.5 py-0.5 hover:bg-white/[0.06] hover:text-[#ecedee]"
+              <ActionButton
                 onClick={() => onJumpTo(block.startLine)}
                 title="Scroll to block"
               >
                 ↑
-              </button>
+              </ActionButton>
             </div>
           </div>
         )
       })}
+
+      {/* Hairlines, one per block boundary, painted in the gap row
+          between blocks. Rendered outside the per-block wrapper so the
+          wrapper's `overflow: hidden` (kept for the action-chip card)
+          doesn't clip them. */}
+      {blocks.map((block, idx) => {
+        if (idx === 0 || block.startLine <= 0) return null
+        const viewportY = term.buffer.active.viewportY
+        const viewportEnd = viewportY + term.rows - 1
+        const dividerRow = block.startLine - 1
+        if (dividerRow < viewportY || dividerRow > viewportEnd) return null
+        const dividerY = HOST_PADDING_TOP + (dividerRow - viewportY) * cellH
+        return (
+          <div
+            key={`d-${block.id}`}
+            className="pointer-events-none absolute left-0 right-0 h-px"
+            style={{ top: dividerY, background: 'var(--terminal-divider)' }}
+          />
+        )
+      })}
     </div>
+  )
+}
+
+/** Inline status chip on the cwd row — running shows live elapsed,
+ * failed shows exit + duration, ok shows duration. Rendered as a
+ * single element so the styling stays consistent across statuses. */
+function StatusChip({
+  top,
+  left,
+  height,
+  block,
+}: {
+  top: number
+  left: number
+  height: number
+  block: BlockSnapshot
+}) {
+  const duration =
+    block.commandStartedAt !== null && block.endedAt !== null
+      ? formatDuration(block.endedAt - block.commandStartedAt)
+      : null
+  const elapsed =
+    block.commandStartedAt !== null && block.endedAt === null
+      ? formatDuration(Date.now() - block.commandStartedAt)
+      : null
+
+  let body: React.ReactNode = null
+  if (block.status === 'running' && elapsed !== null) {
+    body = <span style={{ color: 'var(--terminal-accent)' }}>{elapsed}</span>
+  } else if (block.status === 'failed') {
+    body = (
+      <>
+        <span style={{ color: 'var(--terminal-failed)' }}>
+          exit {block.exitCode ?? '?'}
+        </span>
+        {duration !== null && (
+          <>
+            <span style={{ color: 'var(--terminal-fg-30)' }}>·</span>
+            <span style={{ color: 'var(--terminal-fg-60)' }}>{duration}</span>
+          </>
+        )}
+      </>
+    )
+  } else if (block.status === 'ok' && duration !== null) {
+    body = <span style={{ color: 'var(--terminal-fg-60)' }}>{duration}</span>
+  }
+  if (body === null) return null
+
+  return (
+    <div
+      className="absolute select-none flex items-center gap-1.5 font-mono text-[12px]"
+      style={{ top, left, height }}
+    >
+      <span style={{ color: 'var(--terminal-fg-30)' }}>·</span>
+      {body}
+    </div>
+  )
+}
+
+function ActionButton({
+  onClick,
+  title,
+  disabled,
+  children,
+}: {
+  onClick: () => void
+  title: string
+  disabled?: boolean
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      title={title}
+      className="rounded px-1.5 py-0.5 enabled:hover:bg-white/[0.06] enabled:hover:text-[var(--terminal-fg)] disabled:opacity-40"
+    >
+      {children}
+    </button>
   )
 }
 
@@ -308,14 +341,16 @@ async function copyToClipboard(text: string): Promise<void> {
   }
 }
 
-async function copyOutputToClipboard(term: Terminal, block: BlockSnapshot): Promise<void> {
+async function copyOutputToClipboard(
+  term: HelmTerminal['term'],
+  block: BlockSnapshot,
+): Promise<void> {
   if (block.startLine < 0) return
   const end = block.endLine ?? term.buffer.active.baseY + term.buffer.active.cursorY
   const lines: string[] = []
-  // Skip the first 2 rows (top-pad blank + cwd · branch header) — the
-  // copied output starts at the prompt row's command (which we'll
-  // include) and runs through the last output line.
-  for (let row = block.startLine + 2; row <= end; row++) {
+  // Skip the cwd · branch header row — copied output starts at the
+  // command itself and runs through the last output line.
+  for (let row = block.startLine + 1; row <= end; row++) {
     const line = term.buffer.active.getLine(row)
     if (!line) continue
     lines.push(line.translateToString(true).replace(/\s+$/, ''))
@@ -323,7 +358,11 @@ async function copyOutputToClipboard(term: Terminal, block: BlockSnapshot): Prom
   await copyToClipboard(lines.join('\n'))
 }
 
-async function rerunBlock(hostId: HostId, paneId: string, command: string): Promise<void> {
+async function rerunBlock(
+  hostId: HostId,
+  paneId: string,
+  command: string,
+): Promise<void> {
   const encoder = new TextEncoder()
   const bytes = Array.from(encoder.encode(command + '\r'))
   await commands.tmuxSendKeys(hostId, paneId, bytes)
