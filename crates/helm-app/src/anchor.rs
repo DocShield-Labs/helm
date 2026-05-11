@@ -293,9 +293,22 @@ async fn handle_request(
             *events = Some(state.anchor_event_tx.subscribe());
             let notifications = state.db.list_notifications().unwrap_or_default();
             let schedules = state.db.list_schedules().unwrap_or_default();
+            // Send every host EXCEPT this machine's own localhost.
+            // The subscriber already has its own representation of
+            // the anchor (its remote-host entry whose `is_anchor` is
+            // true); shipping our localhost here would either
+            // duplicate or overwrite that with anchor-side metadata.
+            let hosts: Vec<helm_domain::Host> = state
+                .db
+                .list_hosts()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|h| h.id != helm_domain::HostId::local())
+                .collect();
             Ok(RpcResult::Subscribed {
                 notifications,
                 schedules,
+                hosts,
             })
         }
         RpcOp::ListNotifications => {

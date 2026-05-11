@@ -470,9 +470,25 @@ fn spawn_bridge(
             Ok(helm_domain::RpcResult::Subscribed {
                 mut notifications,
                 mut schedules,
+                hosts,
             }) => {
                 if let Some(tx) = &event_tx {
                     let anchor_local = helm_domain::HostId::local();
+                    // Hosts first: the inbox renders host names via
+                    // store.hosts lookup, so the host list needs to
+                    // be present before notifications referencing
+                    // those ids arrive.
+                    for host in hosts {
+                        // Defensive — anchor's snapshot already
+                        // filters out its own localhost, but if a
+                        // future build sends it through we still
+                        // skip rather than overwrite the subscriber's
+                        // own anchor-host entry.
+                        if host.id == anchor_local {
+                            continue;
+                        }
+                        let _ = tx.send(helm_domain::HostEvent::HostAdded { host });
+                    }
                     for notification in &mut notifications {
                         if notification.host_id == anchor_local {
                             notification.host_id = anchor_host_id;
@@ -505,16 +521,20 @@ fn spawn_bridge(
         loop {
             match events.recv().await {
                 Ok(evt) => {
-                    // Drop anchor host-list events — subscribers keep
-                    // their own host registry in v1; forwarding the
-                    // anchor's would pollute it with ids the
-                    // subscriber doesn't understand.
-                    if matches!(
-                        evt,
-                        helm_domain::AnchorEvent::HostUpserted { .. }
-                            | helm_domain::AnchorEvent::HostRemoved { .. }
-                    ) {
-                        continue;
+                    // Skip anchor host-list events that reference the
+                    // anchor's own localhost — the subscriber's
+                    // existing entry for the anchor is canonical on
+                    // this machine and shouldn't get clobbered with
+                    // anchor-side metadata.
+                    if let helm_domain::AnchorEvent::HostUpserted { host } = &evt {
+                        if host.id == helm_domain::HostId::local() {
+                            continue;
+                        }
+                    }
+                    if let helm_domain::AnchorEvent::HostRemoved { host_id } = &evt {
+                        if *host_id == helm_domain::HostId::local() {
+                            continue;
+                        }
                     }
                     let evt = remap_anchor_local(evt, anchor_host_id);
                     let host_event = helm_domain::anchor_event_to_host_event(evt);

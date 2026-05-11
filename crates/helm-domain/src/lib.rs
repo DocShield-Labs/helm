@@ -802,13 +802,16 @@ pub enum RpcResult {
     Hello {
         version: String,
     },
-    /// Initial snapshot. Subscribers use these to prime their local
-    /// projections before processing the event stream. Hosts are
-    /// intentionally absent in v1 — subscribers keep their own local
-    /// host registry; hosts-on-anchor sync is a later sub-phase.
+    /// Initial snapshot. Subscribers prime their local projections
+    /// from these before processing the event stream. `hosts` is the
+    /// anchor's host registry minus its own localhost — subscribers
+    /// already represent the anchor itself as their `anchor_host_id`
+    /// remote, and including localhost here would clobber the
+    /// subscriber's own entry with anchor-side metadata.
     Subscribed {
         notifications: Vec<Notification>,
         schedules: Vec<Schedule>,
+        hosts: Vec<Host>,
     },
     Notifications {
         notifications: Vec<Notification>,
