@@ -281,7 +281,12 @@ pub async fn host_set_anchor(
                 "anchor host is not connected — call host_connect first".to_string()
             })?;
             let frontend_tx = state.event_tx.lock().await.clone();
-            match crate::subscriber::open_anchor_bridge(app.clone(), session, frontend_tx) {
+            match crate::subscriber::open_anchor_bridge(
+                app.clone(),
+                session,
+                frontend_tx,
+                target_id,
+            ) {
                 Ok(handle) => {
                     *state.subscriber.lock() = Some(handle);
                     // Flip the flag *after* the handle is in place so

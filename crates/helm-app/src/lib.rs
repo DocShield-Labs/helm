@@ -88,9 +88,35 @@ pub fn anchor_rpc_main() -> i32 {
 /// notifications + schedules without manual intervention. Soft-fails
 /// — any error logs and the user can recover by re-setting the
 /// anchor from the palette.
+///
+/// Waits for the frontend to register its event channel before doing
+/// any real work. `connect_host_impl` and the bridge both capture
+/// `event_tx` at call time; running them before `host_subscribe`
+/// fires would mean every status update, tmux notification, and
+/// pushed anchor event from that connect goes into a None sender and
+/// is silently dropped. The host appears disconnected and live
+/// dismiss events never propagate until the next app restart.
 async fn bootstrap_remote_anchor(app: tauri::AppHandle, anchor_id: helm_domain::HostId) {
     use tauri::Manager;
     let state = app.state::<state::AppState>();
+
+    // Poll for the frontend to subscribe. Typical latency is ~200ms in
+    // dev; cap at 30s so a broken frontend doesn't keep this task
+    // alive forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if state.event_tx.lock().await.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "subscriber bootstrap: timed out waiting for frontend subscribe"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     if let Err(e) = commands::host::connect_host_impl(&state, anchor_id, None).await {
         tracing::warn!("subscriber bootstrap: connect failed: {e}");
         return;
@@ -110,7 +136,7 @@ async fn bootstrap_remote_anchor(app: tauri::AppHandle, anchor_id: helm_domain::
         return;
     };
     let frontend_tx = state.event_tx.lock().await.clone();
-    match subscriber::open_anchor_bridge(app.clone(), session, frontend_tx) {
+    match subscriber::open_anchor_bridge(app.clone(), session, frontend_tx, anchor_id) {
         Ok(handle) => {
             *state.subscriber.lock() = Some(handle);
             state

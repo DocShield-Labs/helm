@@ -351,20 +351,113 @@ impl TransportGuard for ChildGuard {}
 /// waiting for the next inbound event. Snapshot rows are forwarded as
 /// individual `HostEvent::Notification` upserts, matching how the UI
 /// already handles delta events.
+///
+/// `anchor_host_id` is the subscriber's own id for the anchor host
+/// (the remote host entry the user designated). The anchor refers to
+/// itself internally as `HostId::local()` — a constant that on the
+/// subscriber means "this very machine's localhost." Without
+/// remapping, every notification the anchor captures on its own
+/// localhost would be misattributed to the subscriber's localhost
+/// (wrong host, broken window/pane lookups, raw `@N` ids in the UI).
+/// We rewrite those ids at the bridge boundary so the frontend sees
+/// the anchor's localhost as the user's anchor host entry — which is
+/// also the host the subscriber's own SSH session is attached to, so
+/// the workspace tree resolves window names correctly.
 pub fn open_anchor_bridge(
     app: tauri::AppHandle,
     session: Arc<SshSession>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<helm_domain::HostEvent>>,
+    anchor_host_id: helm_domain::HostId,
 ) -> Result<SubscriberHandle, String> {
     let client = open_ssh(session)?;
-    let bridge = spawn_bridge(app, client.clone(), event_tx);
+    let bridge = spawn_bridge(app, client.clone(), event_tx, anchor_host_id);
     Ok(SubscriberHandle { client, bridge })
+}
+
+/// Rewrite anchor's `HostId::local()` to `anchor_host_id` on a
+/// notification fetched directly via RPC (not through the event
+/// stream). Used by `notifications_list` when subscriber mode is on.
+pub fn remap_notification(
+    notification: &mut helm_domain::Notification,
+    anchor_host_id: helm_domain::HostId,
+) {
+    if notification.host_id == helm_domain::HostId::local() {
+        notification.host_id = anchor_host_id;
+    }
+}
+
+/// Same idea for a fetched schedule.
+pub fn remap_schedule(
+    schedule: &mut helm_domain::Schedule,
+    anchor_host_id: helm_domain::HostId,
+) {
+    if schedule.host_id == helm_domain::HostId::local() {
+        schedule.host_id = anchor_host_id;
+    }
+}
+
+/// Look up the host id designated as the current subscriber's anchor
+/// (the *remote* host with `is_anchor=true`). Returns None when this
+/// helm isn't in subscriber mode. Caller uses this to remap fetched
+/// data; see `remap_notification` / `remap_schedule`.
+pub fn current_anchor_host_id(
+    hosts: &dashmap::DashMap<helm_domain::HostId, crate::state::SharedHostEntry>,
+    local_id: helm_domain::HostId,
+) -> Option<helm_domain::HostId> {
+    for entry in hosts.iter() {
+        if *entry.key() == local_id {
+            continue;
+        }
+        if let Ok(guard) = entry.value().try_lock() {
+            if guard.host.is_anchor {
+                return Some(guard.host.id);
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite any `HostId::local()` reference in `evt` to `anchor_host_id`.
+/// See `open_anchor_bridge` for why. Total: walks every variant that
+/// carries a host_id (directly or nested in a Notification/Schedule)
+/// and replaces matches.
+fn remap_anchor_local(
+    mut evt: helm_domain::AnchorEvent,
+    anchor_host_id: helm_domain::HostId,
+) -> helm_domain::AnchorEvent {
+    let anchor_local = helm_domain::HostId::local();
+    let remap = |id: &mut helm_domain::HostId| {
+        if *id == anchor_local {
+            *id = anchor_host_id;
+        }
+    };
+    match &mut evt {
+        helm_domain::AnchorEvent::Notification {
+            host_id,
+            notification,
+        } => {
+            remap(host_id);
+            remap(&mut notification.host_id);
+        }
+        helm_domain::AnchorEvent::NotificationDismissed { host_id, .. } => {
+            remap(host_id);
+        }
+        helm_domain::AnchorEvent::ScheduleUpserted { schedule } => {
+            remap(&mut schedule.host_id);
+        }
+        helm_domain::AnchorEvent::ScheduleRemoved { .. }
+        | helm_domain::AnchorEvent::ScheduleFired { .. }
+        | helm_domain::AnchorEvent::HostUpserted { .. }
+        | helm_domain::AnchorEvent::HostRemoved { .. } => {}
+    }
+    evt
 }
 
 fn spawn_bridge(
     _app: tauri::AppHandle,
     client: SubscriberClient,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<helm_domain::HostEvent>>,
+    anchor_host_id: helm_domain::HostId,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         // Subscribe to the anchor's push stream BEFORE snapshotting so
@@ -375,15 +468,26 @@ fn spawn_bridge(
         let mut events = client.events();
         match client.request(helm_domain::RpcOp::Subscribe).await {
             Ok(helm_domain::RpcResult::Subscribed {
-                notifications,
-                schedules,
+                mut notifications,
+                mut schedules,
             }) => {
                 if let Some(tx) = &event_tx {
+                    let anchor_local = helm_domain::HostId::local();
+                    for notification in &mut notifications {
+                        if notification.host_id == anchor_local {
+                            notification.host_id = anchor_host_id;
+                        }
+                    }
                     for notification in notifications {
                         let _ = tx.send(helm_domain::HostEvent::Notification {
                             host_id: notification.host_id,
                             notification,
                         });
+                    }
+                    for schedule in &mut schedules {
+                        if schedule.host_id == anchor_local {
+                            schedule.host_id = anchor_host_id;
+                        }
                     }
                     for schedule in schedules {
                         let _ = tx.send(helm_domain::HostEvent::ScheduleUpserted { schedule });
@@ -401,6 +505,18 @@ fn spawn_bridge(
         loop {
             match events.recv().await {
                 Ok(evt) => {
+                    // Drop anchor host-list events — subscribers keep
+                    // their own host registry in v1; forwarding the
+                    // anchor's would pollute it with ids the
+                    // subscriber doesn't understand.
+                    if matches!(
+                        evt,
+                        helm_domain::AnchorEvent::HostUpserted { .. }
+                            | helm_domain::AnchorEvent::HostRemoved { .. }
+                    ) {
+                        continue;
+                    }
+                    let evt = remap_anchor_local(evt, anchor_host_id);
                     let host_event = helm_domain::anchor_event_to_host_event(evt);
                     if let Some(tx) = &event_tx {
                         if tx.send(host_event).is_err() {

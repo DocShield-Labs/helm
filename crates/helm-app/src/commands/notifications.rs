@@ -22,7 +22,16 @@ pub async fn notifications_list(
 ) -> Result<Vec<helm_domain::Notification>, String> {
     if let Some(client) = subscriber_client(&state) {
         return match client.request(RpcOp::ListNotifications).await? {
-            RpcResult::Notifications { notifications } => Ok(notifications),
+            RpcResult::Notifications { mut notifications } => {
+                if let Some(anchor_id) =
+                    crate::subscriber::current_anchor_host_id(&state.hosts, state.local_host_id)
+                {
+                    for n in &mut notifications {
+                        crate::subscriber::remap_notification(n, anchor_id);
+                    }
+                }
+                Ok(notifications)
+            }
             other => Err(format!("unexpected reply: {other:?}")),
         };
     }

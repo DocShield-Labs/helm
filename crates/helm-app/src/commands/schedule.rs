@@ -24,6 +24,13 @@ pub async fn schedule_list(state: State<'_, AppState>) -> Result<Vec<Schedule>, 
     if let Some(client) = subscriber_client(&state) {
         return match client.request(RpcOp::ListSchedules).await? {
             RpcResult::Schedules { mut schedules } => {
+                if let Some(anchor_id) =
+                    crate::subscriber::current_anchor_host_id(&state.hosts, state.local_host_id)
+                {
+                    for s in &mut schedules {
+                        crate::subscriber::remap_schedule(s, anchor_id);
+                    }
+                }
                 schedules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                 Ok(schedules)
             }
