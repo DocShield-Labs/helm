@@ -11,16 +11,26 @@
 //!   - the single event channel that delivers everything to the frontend
 
 use helm_domain::{
-    Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification, NotificationId, Schedule,
-    ScheduleId, ScheduleRun,
+    AnchorEvent, Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification,
+    NotificationId, Schedule, ScheduleId, ScheduleRun,
 };
 use helm_ssh::SshSession;
 use helm_tmux::TmuxClient;
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::task::AbortHandle;
+
+use crate::db::Db;
+
+/// Buffered slots in the anchor event broadcast. Sized for ~1k events/sec
+/// peak (BEL spam, long CommandDone bursts) with a 16-second window
+/// before a slow subscriber would lag and miss messages. Subscribers
+/// always do a fresh snapshot on connect so missing the first events
+/// after subscribe-time is recoverable.
+pub const ANCHOR_EVENT_BUFFER: usize = 16_384;
 
 /// One host's runtime presence. Wrapped in an `Arc<Mutex<…>>` per entry so
 /// connect/disconnect can serialize on a single host without blocking work
@@ -169,6 +179,11 @@ impl HostEntry {
 pub type SharedHostEntry = Arc<Mutex<HostEntry>>;
 
 pub struct AppState {
+    /// Durable storage. Hosts, schedules, and undismissed notifications
+    /// live here; the in-memory DashMaps below are hot caches kept in
+    /// lockstep with this on every mutation.
+    pub db: Db,
+
     /// All known hosts. Stage A seeds this with localhost only; Stage C
     /// loads/saves additional hosts from `hosts.json`.
     pub hosts: DashMap<HostId, SharedHostEntry>,
@@ -257,6 +272,38 @@ pub struct AppState {
     /// an async context, while async commands can also lock cheaply.
     pub scheduler_tx:
         parking_lot::Mutex<Option<mpsc::UnboundedSender<crate::scheduler::SchedulerSignal>>>,
+
+    /// Broadcast channel for AnchorEvents — the strict subset of
+    /// HostEvents that subscriber helm processes need from the anchor.
+    /// Always exists (created at `open()`); subscribers (the anchor
+    /// RPC server's per-connection tasks) call `.subscribe()` to get a
+    /// Receiver. When no anchor RPC server is running, the channel
+    /// just has zero receivers and `send()` succeeds as a no-op.
+    pub anchor_event_tx: broadcast::Sender<AnchorEvent>,
+
+    /// Handle to the running anchor RPC server. Some when this machine
+    /// is the anchor (localhost.is_anchor=true) and the unix-socket
+    /// listener is up; None otherwise. Replaced on every
+    /// host_set_anchor flip — start when localhost becomes the anchor,
+    /// stop when it stops being.
+    pub anchor_server: parking_lot::Mutex<Option<crate::anchor::AnchorServerHandle>>,
+
+    /// Subscriber-side connection to a remote anchor. Some when a
+    /// *remote* host is designated as the anchor AND is currently
+    /// SSH-connected (the subscriber rides on top of the existing SSH
+    /// session). The wrapped handle holds the RPC client + the bridge
+    /// task that forwards anchor events onto the local frontend
+    /// channel. Mutually exclusive with `anchor_server` in normal use:
+    /// you're either the anchor or subscribed to one, not both.
+    pub subscriber: parking_lot::Mutex<Option<crate::subscriber::SubscriberHandle>>,
+
+    /// Hot-path flag: true iff a subscriber is currently active. Set
+    /// alongside `subscriber` so code on the local-mutation paths
+    /// (notification capture, scheduler fire) can cheaply check
+    /// without taking the Mutex. When true, those paths suppress
+    /// their work because the anchor is authoritative — anchor's
+    /// events arrive through the bridge.
+    pub subscriber_active: Arc<AtomicBool>,
 }
 
 /// Cap on the in-memory run history per schedule. ~50 keeps the palette
@@ -318,10 +365,22 @@ pub struct NotificationsCtx {
     /// surfaced (or processed) the suggestion toast for a tool
     /// integration this session. See AppState's same-named field.
     pub tool_integration_seen: Arc<DashMap<(HostId, String), ()>>,
+    /// Durable store. Notification mutations mirror through here so
+    /// rows survive app restarts (and so the future anchor-mode work
+    /// has a stable storage layer to read).
+    pub db: Db,
+    /// Anchor event broadcast — the same handle as `AppState`'s. Cloning
+    /// a `broadcast::Sender` is cheap (one Arc bump). Subscribers
+    /// subscribe via `.subscribe()` on their own Receiver.
+    pub anchor_event_tx: broadcast::Sender<AnchorEvent>,
+    /// True while a subscriber is open. Read in `upsert` to suppress
+    /// local notification creation (anchor is the source of truth).
+    pub subscriber_active: Arc<AtomicBool>,
 }
 
 impl AppState {
-    /// Cheap snapshot of the supervisor-side handles. Clones six `Arc`s.
+    /// Cheap snapshot of the supervisor-side handles. Clones a handful
+    /// of `Arc`s plus the db handle.
     pub fn notifications_ctx(&self) -> NotificationsCtx {
         NotificationsCtx {
             notifications: self.notifications.clone(),
@@ -330,6 +389,9 @@ impl AppState {
             focus: self.focus.clone(),
             refresh_locks: self.refresh_locks.clone(),
             tool_integration_seen: self.tool_integration_seen.clone(),
+            db: self.db.clone(),
+            anchor_event_tx: self.anchor_event_tx.clone(),
+            subscriber_active: self.subscriber_active.clone(),
         }
     }
 }
@@ -344,37 +406,61 @@ impl AppState {
     }
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        let local = Host::localhost();
+impl AppState {
+    /// Open the persistent store, run any pending JSON→SQLite migration,
+    /// then hydrate the in-memory caches from it. Localhost is rebuilt
+    /// fresh each boot (its id is the per-process canonical const, so
+    /// nothing meaningful is lost by not persisting it).
+    pub fn open() -> Result<Self, String> {
+        let db = Db::open()?;
+        db.migrate_from_json_if_needed()?;
+
+        // Start with the default localhost shape, then let any
+        // persisted localhost row override it so `is_anchor` (and any
+        // future per-machine metadata) survives restart. Remote hosts
+        // come in unconditionally; legacy port==0 rows are skipped.
+        let mut local = Host::localhost();
         let local_id = local.id;
+        let mut remotes: Vec<Host> = Vec::new();
+        for host in db.list_hosts()? {
+            if host.id == local_id {
+                local = host;
+            } else if host.port != 0 {
+                remotes.push(host);
+            }
+        }
         let hosts = DashMap::new();
         hosts.insert(local_id, Arc::new(Mutex::new(HostEntry::new(local))));
-        // Hydrate from `hosts.json`. Localhost isn't persisted (its id
-        // is process-local), so this only adds remote hosts saved by
-        // earlier sessions.
-        for host in crate::persistence::try_load_hosts() {
-            // Skip any persisted localhost entry defensively — earlier
-            // versions of the app may have written one.
-            if host.port == 0 {
-                continue;
-            }
+        for host in remotes {
             hosts.insert(host.id, Arc::new(Mutex::new(HostEntry::new(host))));
         }
-        // Hydrate schedules. Same fail-soft semantics as hosts: log on
-        // parse error, start with an empty map.
+
         let schedules = DashMap::new();
-        for s in crate::schedules::try_load_schedules() {
+        for s in db.list_schedules()? {
             schedules.insert(s.id, s);
         }
-        Self {
+
+        // Notifications survive restarts now. Rebuild the per-pane
+        // coalesce index alongside the flat registry so post-restart
+        // events fold into existing rows instead of stacking new ones.
+        let notifications = DashMap::new();
+        let notification_by_pane = DashMap::new();
+        for n in db.list_notifications()? {
+            notification_by_pane.insert((n.host_id, n.pane_id.clone()), n.id);
+            notifications.insert(n.id, n);
+        }
+
+        let (anchor_event_tx, _) = broadcast::channel(ANCHOR_EVENT_BUFFER);
+
+        Ok(Self {
+            db,
             hosts,
             local_host_id: local_id,
             event_tx: Mutex::new(None),
             pending_host_key_prompts: Arc::new(DashMap::new()),
             network_online: crate::reachability::spawn(),
-            notifications: Arc::new(DashMap::new()),
-            notification_by_pane: Arc::new(DashMap::new()),
+            notifications: Arc::new(notifications),
+            notification_by_pane: Arc::new(notification_by_pane),
             pane_runtime: Arc::new(DashMap::new()),
             focus: Arc::new(parking_lot::Mutex::new(None)),
             refresh_locks: Arc::new(DashMap::new()),
@@ -382,7 +468,11 @@ impl Default for AppState {
             schedules: Arc::new(schedules),
             schedule_runs: Arc::new(DashMap::new()),
             scheduler_tx: parking_lot::Mutex::new(None),
-        }
+            anchor_event_tx,
+            anchor_server: parking_lot::Mutex::new(None),
+            subscriber: parking_lot::Mutex::new(None),
+            subscriber_active: Arc::new(AtomicBool::new(false)),
+        })
     }
 }
 

@@ -3,16 +3,17 @@
 //! Wires helm-pty / helm-tmux / helm-ssh into the Tauri runtime, owns the
 //! global app state, and exposes commands + channels to the frontend.
 
+mod anchor;
 mod commands;
 mod connection;
+mod db;
 mod integration;
 mod keychain;
 mod notifications;
-mod persistence;
 mod reachability;
 mod scheduler;
-mod schedules;
 mod state;
+mod subscriber;
 mod tool_integrations;
 
 use specta_typescript::{BigIntExportBehavior, Typescript};
@@ -29,6 +30,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::host::host_local_id,
         commands::host::host_save,
         commands::host::host_delete,
+        commands::host::host_set_anchor,
         commands::host::host_save_password,
         commands::host::ssh_config_aliases,
         commands::host::host_subscribe,
@@ -69,7 +71,15 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::schedule::schedule_set_enabled,
         commands::schedule::schedule_run_now,
         commands::schedule::schedule_runs,
+        commands::anchor::anchor_probe,
     ])
+}
+
+/// Entry point for `helm anchor-rpc`. Stdio↔unix-socket proxy that
+/// subscribers run via SSH to reach the anchor's RPC server. Returns
+/// the process exit code.
+pub fn anchor_rpc_main() -> i32 {
+    anchor::run_stdio_proxy()
 }
 
 /// Regenerate `src/types/bindings.ts`. Run via `cargo run --bin export-bindings`.
@@ -158,9 +168,25 @@ pub fn run() {
             // schedules whose first fire is more than a second away
             // give the frontend plenty of time to subscribe in practice.
             scheduler::spawn_supervisor(app.handle());
+            // If localhost is the anchor on this machine, start the
+            // RPC server so subscribers (and our future
+            // SSH-piped transport in 1c) can talk to us. Skipped
+            // when localhost isn't the anchor; the
+            // `host_set_anchor` command starts/stops on flip.
+            let state = app.state::<state::AppState>();
+            if let Some(local) = state.hosts.get(&state.local_host_id) {
+                if local.try_lock().map(|g| g.host.is_anchor).unwrap_or(false) {
+                    match anchor::spawn(app.handle()) {
+                        Ok(handle) => {
+                            *state.anchor_server.lock() = Some(handle);
+                        }
+                        Err(e) => tracing::warn!("anchor RPC start failed: {e}"),
+                    }
+                }
+            }
             Ok(())
         })
-        .manage(state::AppState::default())
+        .manage(state::AppState::open().expect("open helm.db"))
         .build(tauri::generate_context!())
         .expect("error while building Helm");
 

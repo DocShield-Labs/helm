@@ -397,6 +397,17 @@ pub struct Host {
     pub tmux_integration: bool,
     pub default_workspace: String,
     pub startup_commands: Vec<String>,
+    /// The canonical "always-on" peer for this user's helm network. At
+    /// most one host has this flag at a time — enforced atomically by
+    /// `host_set_anchor`. When set on localhost, this machine is the
+    /// anchor and runs the scheduler + notification capture as the
+    /// source of truth. When set on a remote host, this helm is a
+    /// subscriber that reads notifications/schedules from there.
+    ///
+    /// `#[serde(default)]` so existing rows persisted before this field
+    /// existed deserialize to `false` instead of failing.
+    #[serde(default)]
+    pub is_anchor: bool,
 }
 
 impl Host {
@@ -413,6 +424,7 @@ impl Host {
             tmux_integration: true,
             default_workspace: "default".into(),
             startup_commands: vec![],
+            is_anchor: false,
         }
     }
 }
@@ -583,6 +595,231 @@ pub enum ScheduleRunStatus {
     Failed { reason: String },
     /// User triggered `schedule_run_now` while the schedule was disabled.
     Manual,
+}
+
+// ---------- Anchor RPC ----------
+//
+// Wire protocol between subscriber helm processes and the anchor helm
+// process. Newline-delimited JSON over a stream (unix socket on
+// loopback in 1b; SSH-piped stdio in 1c). Kept narrow — only the
+// events subscribers actually need from the anchor (notifications,
+// schedules, host list). Tmux output and host-key prompts are
+// deliberately excluded; subscribers keep their own SSH connections
+// for interactive work.
+//
+// These types don't carry `#[derive(Type)]` because they don't cross
+// the Tauri↔TS boundary. They cross Rust↔Rust over the socket.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnchorEvent {
+    /// A pane wants the user's attention. Mirrors `HostEvent::Notification`.
+    Notification {
+        host_id: HostId,
+        notification: Notification,
+    },
+    /// A previously-emitted notification was dismissed.
+    NotificationDismissed {
+        host_id: HostId,
+        notification_id: NotificationId,
+    },
+    /// A schedule was created / updated / re-enabled.
+    ScheduleUpserted { schedule: Schedule },
+    /// A schedule was deleted from the registry.
+    ScheduleRemoved { schedule_id: ScheduleId },
+    /// A scheduled run successfully opened a window.
+    ScheduleFired {
+        schedule_id: ScheduleId,
+        run_id: ScheduleRunId,
+        started_at: u64,
+        window_id: String,
+        manual: bool,
+    },
+    /// A host was added or updated. Subscribers use this to keep their
+    /// projected host list aligned with the anchor.
+    HostUpserted { host: Host },
+    /// A host was removed.
+    HostRemoved { host_id: HostId },
+}
+
+/// Reverse of `host_event_to_anchor_event`. A subscriber translates
+/// every event it receives from the anchor back into a HostEvent and
+/// pushes it onto the local frontend channel — so the existing UI
+/// glue (which listens on HostEvent) Just Works in subscriber mode.
+/// Total over `AnchorEvent` since every variant maps to exactly one
+/// HostEvent variant.
+pub fn anchor_event_to_host_event(event: AnchorEvent) -> HostEvent {
+    match event {
+        AnchorEvent::Notification {
+            host_id,
+            notification,
+        } => HostEvent::Notification {
+            host_id,
+            notification,
+        },
+        AnchorEvent::NotificationDismissed {
+            host_id,
+            notification_id,
+        } => HostEvent::NotificationDismissed {
+            host_id,
+            notification_id,
+        },
+        AnchorEvent::ScheduleUpserted { schedule } => HostEvent::ScheduleUpserted { schedule },
+        AnchorEvent::ScheduleRemoved { schedule_id } => HostEvent::ScheduleRemoved { schedule_id },
+        AnchorEvent::ScheduleFired {
+            schedule_id,
+            run_id,
+            started_at,
+            window_id,
+            manual,
+        } => HostEvent::ScheduleFired {
+            schedule_id,
+            run_id,
+            started_at,
+            window_id,
+            manual,
+        },
+        AnchorEvent::HostUpserted { host } => HostEvent::HostAdded { host },
+        AnchorEvent::HostRemoved { host_id } => HostEvent::HostRemoved { host_id },
+    }
+}
+
+/// Translate a HostEvent to its AnchorEvent equivalent, if applicable.
+/// Returns None for variants that shouldn't cross to subscribers (Tmux
+/// output, host-key prompts, status transitions, tool-integration
+/// suggestions). Used at the emit-time fan-out: every emit_event call
+/// site that produces a translatable HostEvent also broadcasts the
+/// AnchorEvent so the RPC server can forward to subscribers.
+pub fn host_event_to_anchor_event(event: &HostEvent) -> Option<AnchorEvent> {
+    match event {
+        HostEvent::Notification {
+            host_id,
+            notification,
+        } => Some(AnchorEvent::Notification {
+            host_id: *host_id,
+            notification: notification.clone(),
+        }),
+        HostEvent::NotificationDismissed {
+            host_id,
+            notification_id,
+        } => Some(AnchorEvent::NotificationDismissed {
+            host_id: *host_id,
+            notification_id: *notification_id,
+        }),
+        HostEvent::ScheduleUpserted { schedule } => Some(AnchorEvent::ScheduleUpserted {
+            schedule: schedule.clone(),
+        }),
+        HostEvent::ScheduleRemoved { schedule_id } => Some(AnchorEvent::ScheduleRemoved {
+            schedule_id: *schedule_id,
+        }),
+        HostEvent::ScheduleFired {
+            schedule_id,
+            run_id,
+            started_at,
+            window_id,
+            manual,
+        } => Some(AnchorEvent::ScheduleFired {
+            schedule_id: *schedule_id,
+            run_id: *run_id,
+            started_at: *started_at,
+            window_id: window_id.clone(),
+            manual: *manual,
+        }),
+        HostEvent::HostAdded { host } => Some(AnchorEvent::HostUpserted { host: host.clone() }),
+        HostEvent::HostRemoved { host_id } => Some(AnchorEvent::HostRemoved { host_id: *host_id }),
+        // Deliberately not translated: Tmux output (subscriber has its
+        // own SSH connection), Status (subscriber tracks its own
+        // connect state), HostKeyPrompt (interactive, host-local),
+        // ToolIntegrationSuggested (UI-local to the machine running
+        // the integration).
+        HostEvent::Tmux { .. }
+        | HostEvent::Status { .. }
+        | HostEvent::HostKeyPrompt { .. }
+        | HostEvent::ToolIntegrationSuggested { .. } => None,
+    }
+}
+
+/// One request from subscriber to anchor. `id` echoes back in the
+/// response so callers can match async replies to their pending
+/// futures. The op fields are flattened to the top level — a hello
+/// request reads as `{"kind":"request","id":1,"op":"hello"}` rather
+/// than the doubly-nested `{"kind":"request","id":1,"op":{"op":"hello"}}`
+/// you'd get without the flatten attribute. Easier to write by hand
+/// and more idiomatic JSON-RPC-ish.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RpcClientMessage {
+    Request {
+        id: u64,
+        #[serde(flatten)]
+        op: RpcOp,
+    },
+}
+
+/// One message from anchor to subscriber. Either a reply to a prior
+/// request (`Ok` / `Err`, both carry the matching `id`) or a pushed
+/// `Event` that arrives without a request (post-Subscribe stream).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RpcServerMessage {
+    Ok { id: u64, body: RpcResult },
+    Err { id: u64, message: String },
+    Event { event: AnchorEvent },
+}
+
+/// The op the subscriber wants the anchor to perform. Narrow on
+/// purpose — Phase 1b only wires the notification ops end-to-end.
+/// Schedule + host ops land in 1d when the subscriber-side UI bindings
+/// stitch up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RpcOp {
+    /// Handshake — returns the anchor's version so subscribers can
+    /// detect incompatible versions before doing real work.
+    Hello,
+    /// Snapshot the current world (notifications + schedules) and
+    /// start the push stream. The reply's `body` is
+    /// `RpcResult::Subscribed`; subsequent `Event`s arrive without
+    /// requests.
+    Subscribe,
+
+    ListNotifications,
+    /// Renamed from `id` to avoid colliding with the outer request id
+    /// once the op is flattened into RpcClientMessage::Request.
+    DismissNotification { notification_id: NotificationId },
+
+    ListSchedules,
+    SaveSchedule { schedule: Schedule },
+    DeleteSchedule { schedule_id: ScheduleId },
+    SetScheduleEnabled { schedule_id: ScheduleId, enabled: bool },
+    RunScheduleNow { schedule_id: ScheduleId },
+}
+
+/// Reply payload for a successful request. Variant chosen by the op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum RpcResult {
+    Hello {
+        version: String,
+    },
+    /// Initial snapshot. Subscribers use these to prime their local
+    /// projections before processing the event stream. Hosts are
+    /// intentionally absent in v1 — subscribers keep their own local
+    /// host registry; hosts-on-anchor sync is a later sub-phase.
+    Subscribed {
+        notifications: Vec<Notification>,
+        schedules: Vec<Schedule>,
+    },
+    Notifications {
+        notifications: Vec<Notification>,
+    },
+    Schedules {
+        schedules: Vec<Schedule>,
+    },
+    SavedSchedule {
+        schedule_id: ScheduleId,
+    },
+    Ack,
 }
 
 // ---------- Errors ----------

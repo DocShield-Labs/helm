@@ -2,19 +2,17 @@
 //! [`crate::scheduler`]; this module is purely the IPC surface the
 //! frontend's editor and palette wire onto.
 //!
-//! Every mutation persists `schedules.json` atomically before returning,
-//! mirrors the change into the in-memory registry, and signals the
-//! supervisor so its next-fire cache rebuilds. Order matters: the
-//! supervisor must see the registry update before its signal, otherwise
-//! it'll recompute against stale state. We do registry → persist →
-//! signal.
+//! Every mutation persists to `helm.db` before returning, mirrors the
+//! change into the in-memory registry, and signals the supervisor so
+//! its next-fire cache rebuilds. Order matters: the supervisor must see
+//! the registry update before its signal, otherwise it'll recompute
+//! against stale state. We do registry → persist → signal.
 
-use helm_domain::{HostEvent, Schedule, ScheduleId, ScheduleRun, Trigger};
+use helm_domain::{HostEvent, RpcOp, RpcResult, Schedule, ScheduleId, ScheduleRun, Trigger};
 use tauri::State;
 
-use crate::commands::emit_event;
+use crate::commands::{emit_event_anchored, subscriber_client};
 use crate::scheduler::{self, SchedulerSignal};
-use crate::schedules;
 use crate::state::AppState;
 
 /// Snapshot the full schedule registry. Most-recent-edit-first ordering
@@ -23,6 +21,15 @@ use crate::state::AppState;
 #[tauri::command]
 #[specta::specta]
 pub async fn schedule_list(state: State<'_, AppState>) -> Result<Vec<Schedule>, String> {
+    if let Some(client) = subscriber_client(&state) {
+        return match client.request(RpcOp::ListSchedules).await? {
+            RpcResult::Schedules { mut schedules } => {
+                schedules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                Ok(schedules)
+            }
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     let mut out: Vec<Schedule> = state.schedules.iter().map(|r| r.value().clone()).collect();
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(out)
@@ -38,13 +45,21 @@ pub async fn schedule_save(
     schedule: Schedule,
 ) -> Result<ScheduleId, String> {
     validate_trigger(&schedule.trigger)?;
+    if let Some(client) = subscriber_client(&state) {
+        return match client.request(RpcOp::SaveSchedule { schedule }).await? {
+            RpcResult::SavedSchedule { schedule_id } => Ok(schedule_id),
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     let id = schedule.id;
     state.schedules.insert(id, schedule.clone());
-    persist(&state)?;
+    state.db.upsert_schedule(&schedule)?;
 
     let event_tx = state.event_tx.lock().await.clone();
-    emit_event(
+    let anchor_tx = state.anchor_event_tx.clone();
+    emit_event_anchored(
         &event_tx,
+        &anchor_tx,
         HostEvent::ScheduleUpserted {
             schedule: schedule.clone(),
         },
@@ -61,12 +76,26 @@ pub async fn schedule_delete(
     state: State<'_, AppState>,
     schedule_id: ScheduleId,
 ) -> Result<(), String> {
+    if let Some(client) = subscriber_client(&state) {
+        return match client
+            .request(RpcOp::DeleteSchedule { schedule_id })
+            .await?
+        {
+            RpcResult::Ack => Ok(()),
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     state.schedules.remove(&schedule_id);
     state.schedule_runs.remove(&schedule_id);
-    persist(&state)?;
+    state.db.delete_schedule(schedule_id)?;
 
     let event_tx = state.event_tx.lock().await.clone();
-    emit_event(&event_tx, HostEvent::ScheduleRemoved { schedule_id });
+    let anchor_tx = state.anchor_event_tx.clone();
+    emit_event_anchored(
+        &event_tx,
+        &anchor_tx,
+        HostEvent::ScheduleRemoved { schedule_id },
+    );
     scheduler::signal(&state, SchedulerSignal::Removed(schedule_id));
     Ok(())
 }
@@ -81,6 +110,18 @@ pub async fn schedule_set_enabled(
     schedule_id: ScheduleId,
     enabled: bool,
 ) -> Result<(), String> {
+    if let Some(client) = subscriber_client(&state) {
+        return match client
+            .request(RpcOp::SetScheduleEnabled {
+                schedule_id,
+                enabled,
+            })
+            .await?
+        {
+            RpcResult::Ack => Ok(()),
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     let mut updated: Option<Schedule> = None;
     if let Some(mut entry) = state.schedules.get_mut(&schedule_id) {
         entry.value_mut().enabled = enabled;
@@ -89,10 +130,12 @@ pub async fn schedule_set_enabled(
     let Some(updated) = updated else {
         return Err("unknown schedule".into());
     };
-    persist(&state)?;
+    state.db.upsert_schedule(&updated)?;
     let event_tx = state.event_tx.lock().await.clone();
-    emit_event(
+    let anchor_tx = state.anchor_event_tx.clone();
+    emit_event_anchored(
         &event_tx,
+        &anchor_tx,
         HostEvent::ScheduleUpserted { schedule: updated },
     );
     scheduler::signal(&state, SchedulerSignal::Upserted(schedule_id));
@@ -109,6 +152,15 @@ pub async fn schedule_run_now(
     state: State<'_, AppState>,
     schedule_id: ScheduleId,
 ) -> Result<(), String> {
+    if let Some(client) = subscriber_client(&state) {
+        return match client
+            .request(RpcOp::RunScheduleNow { schedule_id })
+            .await?
+        {
+            RpcResult::Ack => Ok(()),
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     if !state.schedules.contains_key(&schedule_id) {
         return Err("unknown schedule".into());
     }
@@ -129,11 +181,6 @@ pub async fn schedule_runs(
         .get(&schedule_id)
         .map(|r| r.value().clone())
         .unwrap_or_default())
-}
-
-fn persist(state: &State<'_, AppState>) -> Result<(), String> {
-    let snapshot: Vec<Schedule> = state.schedules.iter().map(|r| r.value().clone()).collect();
-    schedules::save_schedules(&snapshot)
 }
 
 /// Validate a trigger. Bad cron expressions error here so the editor

@@ -13,14 +13,15 @@
 //! [`crate::connection`] — kept out of this tree so command modules
 //! stay focused on the IPC surface.
 
-use helm_domain::{HostEvent, HostId};
+use helm_domain::{host_event_to_anchor_event, AnchorEvent, HostEvent, HostId};
 use helm_tmux::TmuxClient;
 use std::sync::Arc;
 use tauri::State;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::state::{AppState, SharedHostEntry};
 
+pub mod anchor;
 pub mod fs;
 pub mod host;
 pub mod notifications;
@@ -40,6 +41,40 @@ pub(crate) fn emit_event(
     if let Some(tx) = tx {
         let _ = tx.send(event);
     }
+}
+
+/// Emit a HostEvent to the Tauri frontend AND broadcast its AnchorEvent
+/// equivalent (if any) to anchor RPC subscribers. Use at every emit
+/// site whose event variant is translatable (notifications, schedules,
+/// host registry). For untranslatable events (Tmux, Status, host-key
+/// prompts), use `emit_event` directly — translating would just be a
+/// branch that always returns None.
+///
+/// Cheap: the broadcast send is one Arc bump per subscriber slot;
+/// when no anchor server is running, `send()` returns immediately with
+/// `Err(SendError)` which we ignore.
+pub(crate) fn emit_event_anchored(
+    event_tx: &Option<mpsc::UnboundedSender<HostEvent>>,
+    anchor_tx: &broadcast::Sender<AnchorEvent>,
+    event: HostEvent,
+) {
+    if let Some(translated) = host_event_to_anchor_event(&event) {
+        let _ = anchor_tx.send(translated);
+    }
+    if let Some(tx) = event_tx {
+        let _ = tx.send(event);
+    }
+}
+
+/// Cheap clone of the active subscriber's RPC client, if any. Returns
+/// `None` when this helm process is in implicit-local or anchor mode
+/// — in those cases commands hit the local db directly. The Mutex is
+/// held only briefly to clone the inner `SubscriberClient` (one Arc
+/// bump) so this is safe to call from hot paths.
+pub(crate) fn subscriber_client(
+    state: &State<'_, AppState>,
+) -> Option<crate::subscriber::SubscriberClient> {
+    state.subscriber.lock().as_ref().map(|h| h.client.clone())
 }
 
 /// Resolve the primary control client for a host. Multi-client model:

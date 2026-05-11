@@ -1,0 +1,477 @@
+//! Subscriber-side anchor RPC client.
+//!
+//! Owns one transport pair (read half + write half) speaking the
+//! newline-delimited JSON protocol defined in `helm_domain`. Two
+//! dedicated `std::thread`s drive I/O:
+//!
+//!   - **reader**: parses incoming `RpcServerMessage`s and demultiplexes
+//!     them into either the pending-request `HashMap` (for Ok/Err
+//!     replies) or the event broadcast channel (for pushed events).
+//!   - **writer**: serializes outgoing `RpcClientMessage::Request`s and
+//!     writes them as NDJSON.
+//!
+//! Sync threads + a sync `std::sync::mpsc` between async callers and
+//! the writer matches helm-tmux's existing pattern for SSH channels
+//! (PipeReader/PipeWriter are sync) and keeps the lifetime story
+//! simple.
+//!
+//! Two transports are exposed today:
+//!
+//!   - [`open_local_subprocess`]: spawns `helm anchor-rpc` as a child
+//!     process and uses its stdio. Lets us prove the client + protocol
+//!     end-to-end on a single machine without involving SSH at all.
+//!   - [`open_ssh`]: opens an exec channel on an existing
+//!     [`helm_ssh::SshSession`], running `helm anchor-rpc` on the
+//!     remote. This is what subscribers use against a real anchor
+//!     across a Tailscale-style network.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc as sync_mpsc, Arc};
+
+use helm_domain::{AnchorEvent, RpcClientMessage, RpcOp, RpcResult, RpcServerMessage};
+use helm_ssh::{OpenedChannel, SshSession};
+use parking_lot::Mutex;
+use tokio::sync::{broadcast, oneshot};
+use tracing::{debug, warn};
+
+/// Cheap-to-clone handle to a live subscriber client. Cloning a
+/// `SubscriberClient` lets multiple parts of the app share the same
+/// underlying connection; the I/O threads stop when the *last* clone
+/// is dropped (which also drops the embedded transport guard).
+#[derive(Clone)]
+pub struct SubscriberClient {
+    inner: Arc<ClientInner>,
+}
+
+#[allow(dead_code)] // event_tx, pending, next_id are read once into
+                    // worker threads; the compiler doesn't see those
+                    // moves as use-sites of the *struct* fields.
+struct ClientInner {
+    /// Send a request into the writer thread. Unbounded — caller's
+    /// only failure mode is the writer being already gone (transport
+    /// died), which surfaces as a closed channel.
+    cmd_tx: sync_mpsc::Sender<ClientRequest>,
+    /// Broadcast for AnchorEvents pushed by the server. Cloned into
+    /// every consumer via `events()`. Holds a large buffer so a
+    /// momentarily-slow consumer doesn't miss bursts of pane-bell
+    /// events.
+    event_tx: broadcast::Sender<AnchorEvent>,
+    /// Pending responses keyed by request id. Inserted by the writer
+    /// before it writes; removed by the reader when the matching
+    /// Ok/Err arrives. Behind a `parking_lot::Mutex` — held only
+    /// briefly per access.
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<RpcResult, String>>>>>,
+    /// Monotonic request id source. Wraps after ~1.8e19 requests, by
+    /// which point any same-id collision is long gone.
+    next_id: Arc<AtomicU64>,
+    /// Lifetime guard for the underlying transport. Owns the
+    /// channel/subprocess; dropping it closes the connection and
+    /// causes the reader thread to EOF and exit, the writer thread
+    /// to error and exit.
+    _transport: Box<dyn TransportGuard>,
+}
+
+/// Marker trait for transport-lifetime guards. The concrete impl owns
+/// whatever resource keeps the connection alive (an `OpenedChannel`
+/// for SSH, a `tokio::process::Child` for subprocess). Dropping it
+/// must close the connection so the I/O threads exit.
+trait TransportGuard: Send + Sync {}
+
+struct ClientRequest {
+    op: RpcOp,
+    response: oneshot::Sender<Result<RpcResult, String>>,
+}
+
+impl SubscriberClient {
+    fn from_streams<R, W, G>(reader: R, writer: W, guard: G) -> Self
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+        G: TransportGuard + 'static,
+    {
+        let (cmd_tx, cmd_rx) = sync_mpsc::channel::<ClientRequest>();
+        let (event_tx, _) = broadcast::channel(4_096);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<RpcResult, String>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let next_id = Arc::new(AtomicU64::new(1));
+
+        // Reader thread — parses incoming, fans out to pending map / event broadcast.
+        {
+            let pending = pending.clone();
+            let event_tx = event_tx.clone();
+            std::thread::spawn(move || reader_loop(reader, pending, event_tx));
+        }
+        // Writer thread — serializes outgoing requests + records the
+        // oneshot in the pending map so the reader can route the reply.
+        {
+            let pending = pending.clone();
+            let next_id = next_id.clone();
+            std::thread::spawn(move || writer_loop(writer, cmd_rx, pending, next_id));
+        }
+
+        SubscriberClient {
+            inner: Arc::new(ClientInner {
+                cmd_tx,
+                event_tx,
+                pending,
+                next_id,
+                _transport: Box::new(guard),
+            }),
+        }
+    }
+
+    /// Send a request and await the matching reply. Fails fast if the
+    /// transport is dead (writer thread gone), and after the response
+    /// channel is dropped (reader thread gone before a reply arrived).
+    pub async fn request(&self, op: RpcOp) -> Result<RpcResult, String> {
+        let (tx, rx) = oneshot::channel();
+        let req = ClientRequest { op, response: tx };
+        self.inner
+            .cmd_tx
+            .send(req)
+            .map_err(|_| "subscriber: writer thread gone".to_string())?;
+        rx.await
+            .map_err(|_| "subscriber: response channel dropped before reply".to_string())?
+    }
+
+    /// New receiver for the AnchorEvent push stream. Each subscriber
+    /// sees every event from the *moment it subscribed* onward; the
+    /// caller is responsible for snapshotting via `request(Subscribe)`
+    /// before subscribing if it needs a full picture.
+    #[allow(dead_code)] // wired in by 1d (subscriber UI)
+    pub fn events(&self) -> broadcast::Receiver<AnchorEvent> {
+        self.inner.event_tx.subscribe()
+    }
+}
+
+fn reader_loop<R: Read>(
+    reader: R,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<RpcResult, String>>>>>,
+    event_tx: broadcast::Sender<AnchorEvent>,
+) {
+    let mut br = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match br.read_line(&mut line) {
+            Ok(0) => {
+                debug!("subscriber: transport EOF");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("subscriber: read error: {e}");
+                break;
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let msg: RpcServerMessage = match serde_json::from_str(trimmed) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("subscriber: bad server message: {e} (line: {trimmed})");
+                continue;
+            }
+        };
+        match msg {
+            RpcServerMessage::Ok { id, body } => {
+                if let Some(tx) = pending.lock().remove(&id) {
+                    let _ = tx.send(Ok(body));
+                }
+            }
+            RpcServerMessage::Err { id, message } => {
+                if let Some(tx) = pending.lock().remove(&id) {
+                    let _ = tx.send(Err(message));
+                }
+            }
+            RpcServerMessage::Event { event } => {
+                let _ = event_tx.send(event);
+            }
+        }
+    }
+    // Transport dropped — fail every still-pending request so callers
+    // unblock instead of awaiting a reply that will never arrive.
+    let mut guard = pending.lock();
+    for (_, tx) in guard.drain() {
+        let _ = tx.send(Err("subscriber: connection closed".into()));
+    }
+}
+
+fn writer_loop<W: Write>(
+    mut writer: W,
+    cmd_rx: sync_mpsc::Receiver<ClientRequest>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<RpcResult, String>>>>>,
+    next_id: Arc<AtomicU64>,
+) {
+    while let Ok(req) = cmd_rx.recv() {
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let msg = RpcClientMessage::Request { id, op: req.op };
+        let mut bytes = match serde_json::to_vec(&msg) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = req
+                    .response
+                    .send(Err(format!("subscriber: serialize: {e}")));
+                continue;
+            }
+        };
+        bytes.push(b'\n');
+        // Insert BEFORE write so a fast reply can't arrive at the
+        // reader before we've registered the matching slot.
+        pending.lock().insert(id, req.response);
+        if let Err(e) = writer.write_all(&bytes) {
+            if let Some(tx) = pending.lock().remove(&id) {
+                let _ = tx.send(Err(format!("subscriber: write: {e}")));
+            }
+            warn!("subscriber: writer exiting after error: {e}");
+            return;
+        }
+        if let Err(e) = writer.flush() {
+            warn!("subscriber: flush warning: {e}");
+        }
+    }
+    debug!("subscriber: writer cmd channel closed");
+}
+
+// ---------- SSH transport ----------
+
+/// Combined handle: the subscriber client + the bridge task forwarding
+/// its events onto the local frontend channel. Stored on `AppState`
+/// while a remote anchor is configured; `shutdown()` (or drop) aborts
+/// the bridge and closes the client.
+pub struct SubscriberHandle {
+    /// The RPC client itself. Public because the next slice (1d.2)
+    /// reroutes the `notifications_list` / `notification_dismiss`
+    /// commands through this client when a subscriber is active.
+    #[allow(dead_code)]
+    pub client: SubscriberClient,
+    /// Bridge task forwarding `AnchorEvent`s → `HostEvent`s onto the
+    /// frontend channel. Aborted on shutdown so we don't leak a task
+    /// after the user switches anchors.
+    bridge: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl SubscriberHandle {
+    pub fn shutdown(self) {
+        self.bridge.abort();
+        // Dropping `self.client` drops the inner Arc<ClientInner>;
+        // when the last clone goes, the transport guard drops and
+        // closes the connection, the reader/writer threads exit.
+    }
+}
+
+/// Open a subscriber client to a remote anchor over an existing SSH
+/// session. Runs `helm anchor-rpc` via the user's login shell so the
+/// remote's PATH includes `/usr/local/bin` etc. (non-interactive
+/// `exec` channels typically don't source .bashrc/.zshrc).
+pub fn open_ssh(session: Arc<SshSession>) -> Result<SubscriberClient, String> {
+    let command = "bash -lc 'exec helm anchor-rpc'".to_string();
+    let channel = session
+        .open_exec(command)
+        .map_err(|e| format!("subscriber: open_exec: {e}"))?;
+    // PipeReader/PipeWriter both implement std::io::Read/Write. Move
+    // them out so the guard can hold the OpenedChannel separately.
+    // Actually we need them all in scope: split via destructuring.
+    let OpenedChannel { reader, writer } = channel;
+    // Reconstruct a guard that owns enough to keep the channel alive —
+    // we re-pack the (now-empty) OpenedChannel via cloning the
+    // backing pipes' Drop semantics. But OpenedChannel fields are
+    // public and consumed individually; the I/O thread closes on
+    // BOTH ends EOF, so dropping the reader/writer at end of streams
+    // is what we rely on. The guard holds the Arc<SshSession> so the
+    // session itself doesn't drop out from under us.
+    let guard = SshSessionGuard {
+        _session: session,
+    };
+    Ok(SubscriberClient::from_streams(reader, writer, guard))
+}
+
+struct SshSessionGuard {
+    _session: Arc<SshSession>,
+}
+impl TransportGuard for SshSessionGuard {}
+
+// ---------- Local subprocess transport ----------
+
+/// Open a subscriber client backed by a local `helm anchor-rpc`
+/// subprocess. Useful for verifying the client + protocol end-to-end
+/// on a single machine without involving SSH. The subprocess connects
+/// to the same local anchor socket the GUI is serving, so what you're
+/// really testing is the subscriber client itself.
+pub fn open_local_subprocess(helm_bin: &std::path::Path) -> Result<SubscriberClient, String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(helm_bin)
+        .arg("anchor-rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("subscriber: spawn helm anchor-rpc: {e}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "subscriber: no stdin handle".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "subscriber: no stdout handle".to_string())?;
+    let guard = ChildGuard { _child: child };
+    Ok(SubscriberClient::from_streams(stdout, stdin, guard))
+}
+
+struct ChildGuard {
+    // The Child handle owns the subprocess; dropping it leaves the
+    // process running (std behavior). We rely on stdin closing —
+    // which happens when our writer thread exits and drops its
+    // borrow — to signal the proxy to exit cleanly.
+    _child: std::process::Child,
+}
+impl TransportGuard for ChildGuard {}
+
+// ---------- Bridge: anchor events → local HostEvent channel ----------
+
+/// Open an SSH-backed subscriber for `host_id` and spawn the bridge
+/// task that pumps its events onto the local frontend channel.
+/// Returns a handle the caller stores on `AppState`.
+///
+/// Pre-snapshots the anchor's notifications via `Subscribe` so the
+/// frontend sees the anchor's existing inbox immediately — without
+/// waiting for the next inbound event. Snapshot rows are forwarded as
+/// individual `HostEvent::Notification` upserts, matching how the UI
+/// already handles delta events.
+pub fn open_anchor_bridge(
+    app: tauri::AppHandle,
+    session: Arc<SshSession>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<helm_domain::HostEvent>>,
+) -> Result<SubscriberHandle, String> {
+    let client = open_ssh(session)?;
+    let bridge = spawn_bridge(app, client.clone(), event_tx);
+    Ok(SubscriberHandle { client, bridge })
+}
+
+fn spawn_bridge(
+    _app: tauri::AppHandle,
+    client: SubscriberClient,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<helm_domain::HostEvent>>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        // Subscribe to the anchor's push stream BEFORE snapshotting so
+        // we can't miss an event emitted between snapshot read and
+        // subscribe. The Subscribe op atomically does both on the
+        // server side, returning the snapshot in its reply and starting
+        // the push stream immediately after.
+        let mut events = client.events();
+        match client.request(helm_domain::RpcOp::Subscribe).await {
+            Ok(helm_domain::RpcResult::Subscribed {
+                notifications,
+                schedules,
+            }) => {
+                if let Some(tx) = &event_tx {
+                    for notification in notifications {
+                        let _ = tx.send(helm_domain::HostEvent::Notification {
+                            host_id: notification.host_id,
+                            notification,
+                        });
+                    }
+                    for schedule in schedules {
+                        let _ = tx.send(helm_domain::HostEvent::ScheduleUpserted { schedule });
+                    }
+                }
+            }
+            Ok(other) => {
+                warn!("subscriber: unexpected Subscribe reply: {other:?}");
+            }
+            Err(e) => {
+                warn!("subscriber: Subscribe failed: {e}");
+                return;
+            }
+        }
+        loop {
+            match events.recv().await {
+                Ok(evt) => {
+                    let host_event = helm_domain::anchor_event_to_host_event(evt);
+                    if let Some(tx) = &event_tx {
+                        if tx.send(host_event).is_err() {
+                            debug!("subscriber bridge: frontend channel closed, exiting");
+                            return;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("subscriber bridge: lagged {n} events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!("subscriber bridge: anchor event stream closed, exiting");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Minimal in-memory transport for the reader's protocol parsing.
+    /// Doesn't exercise the writer — the writer needs a live remote to
+    /// hand back replies, which we can't fake without a much heavier
+    /// duplex pipe.
+    #[test]
+    fn reader_routes_ok_to_pending() {
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<RpcResult, String>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (oneshot_tx, oneshot_rx) = oneshot::channel::<Result<RpcResult, String>>();
+        pending.lock().insert(7, oneshot_tx);
+
+        let body = serde_json::to_string(&RpcServerMessage::Ok {
+            id: 7,
+            body: RpcResult::Hello {
+                version: "test".into(),
+            },
+        })
+        .unwrap();
+        let mut buf = body.into_bytes();
+        buf.push(b'\n');
+        let reader = Cursor::new(buf);
+        let (event_tx, _) = broadcast::channel(8);
+        reader_loop(reader, pending.clone(), event_tx);
+
+        let received = oneshot_rx
+            .blocking_recv()
+            .expect("reader should have fired the oneshot");
+        match received {
+            Ok(RpcResult::Hello { version }) => assert_eq!(version, "test"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_broadcasts_events() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+
+        let event_msg = serde_json::to_string(&RpcServerMessage::Event {
+            event: AnchorEvent::NotificationDismissed {
+                host_id: helm_domain::HostId::local(),
+                notification_id: helm_domain::NotificationId::new(),
+            },
+        })
+        .unwrap();
+        let mut buf = event_msg.into_bytes();
+        buf.push(b'\n');
+        let reader = Cursor::new(buf);
+
+        reader_loop(reader, pending, event_tx);
+
+        // After reader_loop returns (EOF), the event should be sitting
+        // in the broadcast buffer.
+        let evt = event_rx.try_recv().expect("event should be queued");
+        assert!(matches!(evt, AnchorEvent::NotificationDismissed { .. }));
+    }
+}

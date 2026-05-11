@@ -13,7 +13,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::commands::emit_event;
+use crate::commands::{emit_event, emit_event_anchored};
 use crate::notifications;
 use crate::state::AppState;
 
@@ -59,11 +59,20 @@ pub fn host_local_id(state: State<'_, AppState>) -> HostId {
 /// Save a host to the persistent registry. Upsert semantics: if a host
 /// with the same id already exists, it's replaced (any active
 /// connection is torn down first since the new metadata could change
-/// the connect path). The on-disk `hosts.json` is rewritten atomically.
+/// the connect path). The row is persisted to `helm.db`.
+///
+/// `is_anchor` is *not* mutable through this command — it's preserved
+/// from whatever's in the db (false for new hosts) and only ever
+/// changed by the dedicated `host_set_anchor` command. The metadata
+/// editor can't accidentally flip the anchor designation by re-saving
+/// a host with a stale flag.
 #[tauri::command]
 #[specta::specta]
 pub async fn host_save(state: State<'_, AppState>, host: Host) -> Result<HostId, String> {
     let id = host.id;
+    let preserved_anchor = state.db.get_host(id)?.map(|h| h.is_anchor).unwrap_or(false);
+    let mut host = host;
+    host.is_anchor = preserved_anchor;
     let host_clone = host.clone();
     let is_replace = state.hosts.contains_key(&id);
 
@@ -87,15 +96,16 @@ pub async fn host_save(state: State<'_, AppState>, host: Host) -> Result<HostId,
         state.hosts.insert(id, entry);
     }
 
-    persist_hosts(&state).await?;
+    state.db.upsert_host(&host_clone)?;
 
     let event_tx = state.event_tx.lock().await.clone();
+    let anchor_tx = state.anchor_event_tx.clone();
     if is_replace {
         // Frontend treats HostAdded as upsert — overwrites the existing
         // entry. Saves us a separate "host_updated" event variant.
-        emit_event(&event_tx, HostEvent::HostAdded { host: host_clone });
+        emit_event_anchored(&event_tx, &anchor_tx, HostEvent::HostAdded { host: host_clone });
     } else {
-        emit_event(&event_tx, HostEvent::HostAdded { host: host_clone });
+        emit_event_anchored(&event_tx, &anchor_tx, HostEvent::HostAdded { host: host_clone });
         emit_event(
             &event_tx,
             HostEvent::Status {
@@ -108,7 +118,7 @@ pub async fn host_save(state: State<'_, AppState>, host: Host) -> Result<HostId,
     Ok(id)
 }
 
-/// Delete a host from both the in-memory registry and `hosts.json`.
+/// Delete a host from both the in-memory registry and `helm.db`.
 /// Tears down any active connection and clears any Keychain entry the
 /// host owned. Localhost cannot be deleted.
 #[tauri::command]
@@ -144,9 +154,10 @@ pub async fn host_delete(state: State<'_, AppState>, host_id: HostId) -> Result<
     // frontend store removes the host on this event — independent of
     // both the disk persist below and the detached supervisor cleanup.
     let event_tx = state.event_tx.lock().await.clone();
+    let anchor_tx = state.anchor_event_tx.clone();
     let notif_ctx = state.notifications_ctx();
     notifications::dismiss_for_host(&notif_ctx, &event_tx, host_id);
-    emit_event(&event_tx, HostEvent::HostRemoved { host_id });
+    emit_event_anchored(&event_tx, &anchor_tx, HostEvent::HostRemoved { host_id });
 
     // Detached cleanup: lock the entry, mark voluntary, abort the
     // supervisor, drop clients. Not awaited — a stuck connect can
@@ -166,7 +177,132 @@ pub async fn host_delete(state: State<'_, AppState>, host_id: HostId) -> Result<
         });
     }
 
-    persist_hosts(&state).await?;
+    state.db.delete_host(host_id)?;
+    state.db.delete_notifications_for_host(host_id)?;
+    Ok(())
+}
+
+/// Designate `host_id` as the user's anchor — the canonical always-on
+/// peer that will own notification capture, schedule execution, and
+/// the host list once Phase 1 RPC lands. Passing `None` clears the
+/// designation entirely (back to local-only "implicit anchor"
+/// behavior).
+///
+/// Atomic: the db transaction flips every affected row's `is_anchor`
+/// flag together, so concurrent host edits can't leave the registry
+/// with two anchors. Emits `HostAdded` (upsert) for each affected row
+/// so the frontend's host list re-renders without needing a dedicated
+/// event variant.
+///
+/// Side effect: if localhost is transitioning to/from being the
+/// anchor on this machine, the RPC server is started or stopped
+/// accordingly. Subscribers reach this server over a unix socket
+/// (loopback in 1b; SSH-piped stdio in 1c).
+#[tauri::command]
+#[specta::specta]
+pub async fn host_set_anchor(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    host_id: Option<HostId>,
+) -> Result<(), String> {
+    if let Some(id) = host_id {
+        if !state.hosts.contains_key(&id) {
+            return Err("unknown host".into());
+        }
+        // Ensure the target host is persisted in the db so
+        // `set_anchor_host` has a row to flip. Localhost in particular
+        // isn't in the db until something explicitly persists it —
+        // without this, set_anchor_host would no-op and the anchor
+        // flag would never survive an app restart.
+        if let Some(entry) = state.entry(id) {
+            let host_snapshot = entry.lock().await.host.clone();
+            state.db.upsert_host(&host_snapshot)?;
+        }
+    }
+    let affected = state.db.set_anchor_host(host_id)?;
+    // Mirror the db flip onto the in-memory entries so subsequent
+    // host_list calls reflect the new state immediately (without
+    // needing a re-read from disk).
+    for h in &affected {
+        if let Some(entry) = state.entry(h.id) {
+            let mut guard = entry.lock().await;
+            guard.host.is_anchor = h.is_anchor;
+        }
+    }
+    // Start/stop the anchor RPC server based on whether localhost is
+    // (becoming) the anchor. The input parameter encodes the user's
+    // intent directly — no need to re-read state after the flip.
+    let local_is_anchor = host_id == Some(state.local_host_id);
+    {
+        let mut guard = state.anchor_server.lock();
+        match (&*guard, local_is_anchor) {
+            (None, true) => match crate::anchor::spawn(&app) {
+                Ok(handle) => *guard = Some(handle),
+                // Propagate so the JS caller sees the failure instead
+                // of having to grep the dev terminal for the warn line.
+                Err(e) => {
+                    tracing::warn!("anchor RPC start failed: {e}");
+                    return Err(format!("anchor RPC start failed: {e}"));
+                }
+            },
+            (Some(_), false) => {
+                if let Some(handle) = guard.take() {
+                    handle.shutdown();
+                }
+            }
+            _ => {} // already in the desired state
+        }
+    }
+
+    // Start/stop the subscriber side. Mutually exclusive with the
+    // anchor server above: if we're hosting, we don't subscribe.
+    // Any prior subscriber (different anchor, or anchor cleared) is
+    // shut down before considering whether to open a new one.
+    if let Some(prev) = state.subscriber.lock().take() {
+        state
+            .subscriber_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        prev.shutdown();
+    }
+    if let Some(target_id) = host_id {
+        if target_id != state.local_host_id {
+            // Remote anchor: requires a live SSH session on that
+            // host so the subscriber can ride on top of it. If the
+            // user hasn't connected yet, return a clear error rather
+            // than silently doing nothing.
+            let entry = state
+                .entry(target_id)
+                .ok_or_else(|| "anchor host disappeared".to_string())?;
+            let session = {
+                let guard = entry.lock().await;
+                guard.ssh.as_ref().cloned()
+            };
+            let session = session.ok_or_else(|| {
+                "anchor host is not connected — call host_connect first".to_string()
+            })?;
+            let frontend_tx = state.event_tx.lock().await.clone();
+            match crate::subscriber::open_anchor_bridge(app.clone(), session, frontend_tx) {
+                Ok(handle) => {
+                    *state.subscriber.lock() = Some(handle);
+                    // Flip the flag *after* the handle is in place so
+                    // the upsert/fire suppression paths see a
+                    // consistent (handle, flag) pairing.
+                    state
+                        .subscriber_active
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!("subscriber open failed: {e}");
+                    return Err(format!("subscriber open failed: {e}"));
+                }
+            }
+        }
+    }
+    let event_tx = state.event_tx.lock().await.clone();
+    let anchor_tx = state.anchor_event_tx.clone();
+    for h in affected {
+        emit_event_anchored(&event_tx, &anchor_tx, HostEvent::HostAdded { host: h });
+    }
     Ok(())
 }
 
@@ -240,21 +376,6 @@ pub async fn ssh_config_aliases() -> Result<Vec<SshConfigAlias>, String> {
     // Stable order: alphabetical so the autocomplete list is consistent.
     out.sort_by(|a, b| a.alias.cmp(&b.alias));
     Ok(out)
-}
-
-/// Snapshot the in-memory registry (minus localhost) and write
-/// `hosts.json`. Holds each entry's lock briefly to clone its `Host`.
-async fn persist_hosts(state: &State<'_, AppState>) -> Result<(), String> {
-    let mut to_save: Vec<Host> = Vec::new();
-    let local_id = state.local_host_id;
-    for entry in state.hosts.iter() {
-        if *entry.key() == local_id {
-            continue;
-        }
-        let guard = entry.value().lock().await;
-        to_save.push(guard.host.clone());
-    }
-    crate::persistence::save_hosts(&to_save)
 }
 
 // ---------- host event channel + connect lifecycle ----------

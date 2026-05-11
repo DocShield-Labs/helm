@@ -46,10 +46,10 @@ use helm_domain::{
 use helm_tmux::{quote_arg, TmuxClient};
 use tauri::{AppHandle, Manager};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::commands::emit_event;
+use crate::commands::emit_event_anchored;
 use crate::state::{AppState, NotificationsCtx, SCHEDULE_RUN_HISTORY_LIMIT};
 
 /// One signal into the supervisor's mpsc. Tells the loop to wake up and
@@ -281,6 +281,20 @@ fn datetime_to_ms<Tz: TimeZone>(dt: &DateTime<Tz>) -> u64 {
 /// we tag them so the history view can distinguish).
 async fn fire_one(app: &AppHandle, id: ScheduleId, manual: bool) {
     let state = app.state::<AppState>();
+    // Subscriber mode: anchor owns schedule firing. Locally-fired runs
+    // would double up with the anchor's. Supervisor itself keeps
+    // running so the next-fire HashMap stays warm — we just no-op the
+    // fire path until subscriber mode ends.
+    if state
+        .subscriber_active
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        debug!(
+            "scheduler: skipping fire for {:?} — subscriber mode (anchor will fire)",
+            id
+        );
+        return;
+    }
     let Some(schedule) = state.schedules.get(&id).map(|r| r.clone()) else {
         warn!(
             "scheduler: fire requested for unknown schedule id {:?} (manual={})",
@@ -291,6 +305,7 @@ async fn fire_one(app: &AppHandle, id: ScheduleId, manual: bool) {
     let started_at = unix_ms();
     let run_id = ScheduleRunId::new();
     let event_tx = state.event_tx.lock().await.clone();
+    let anchor_tx = state.anchor_event_tx.clone();
     let notif_ctx = state.notifications_ctx();
 
     let outcome = spawn_scheduled_run(&state, &schedule).await;
@@ -315,6 +330,9 @@ async fn fire_one(app: &AppHandle, id: ScheduleId, manual: bool) {
         updated_schedule.enabled = false;
     }
     state.schedules.insert(id, updated_schedule.clone());
+    if let Err(e) = state.db.upsert_schedule(&updated_schedule) {
+        warn!("scheduler: persist failed: {e}");
+    }
 
     let run = ScheduleRun {
         id: run_id,
@@ -325,9 +343,6 @@ async fn fire_one(app: &AppHandle, id: ScheduleId, manual: bool) {
         window_id: outcome.as_ref().ok().cloned(),
     };
     push_run(&state, id, run);
-    if let Err(e) = crate::schedules::save_schedules(&snapshot_schedules(&state)) {
-        warn!("scheduler: persist failed: {e}");
-    }
 
     match outcome {
         Ok(window_id) => {
@@ -335,8 +350,9 @@ async fn fire_one(app: &AppHandle, id: ScheduleId, manual: bool) {
                 "schedule fired: name={} window={} host={:?} manual={}",
                 updated_schedule.name, window_id, updated_schedule.host_id, manual
             );
-            emit_event(
+            emit_event_anchored(
                 &event_tx,
+                &anchor_tx,
                 HostEvent::ScheduleFired {
                     schedule_id: id,
                     run_id,
@@ -363,8 +379,9 @@ async fn fire_one(app: &AppHandle, id: ScheduleId, manual: bool) {
     }
     // Always emit ScheduleUpserted so the frontend's projection refreshes
     // its `last_fired_at` / `last_run_status` regardless of outcome.
-    emit_event(
+    emit_event_anchored(
         &event_tx,
+        &anchor_tx,
         HostEvent::ScheduleUpserted {
             schedule: updated_schedule,
         },
@@ -701,8 +718,12 @@ fn push_failure_notification(
         }
     };
     if let Some(notif) = ctx.notifications.get(&id).map(|r| r.clone()) {
-        emit_event(
+        if let Err(e) = ctx.db.upsert_notification(&notif) {
+            warn!("schedule failure notification persist failed: {e}");
+        }
+        emit_event_anchored(
             event_tx,
+            &ctx.anchor_event_tx,
             HostEvent::Notification {
                 host_id,
                 notification: notif,
@@ -720,13 +741,6 @@ fn push_run(state: &tauri::State<'_, AppState>, id: ScheduleId, run: ScheduleRun
     if v.len() > SCHEDULE_RUN_HISTORY_LIMIT {
         v.truncate(SCHEDULE_RUN_HISTORY_LIMIT);
     }
-}
-
-/// Take a snapshot of the schedules registry as a Vec for persistence.
-/// Walking the DashMap in place would race with concurrent inserts; the
-/// snapshot keeps the on-disk file consistent with a single point-in-time.
-fn snapshot_schedules(state: &tauri::State<'_, AppState>) -> Vec<Schedule> {
-    state.schedules.iter().map(|r| r.value().clone()).collect()
 }
 
 fn unix_ms() -> u64 {

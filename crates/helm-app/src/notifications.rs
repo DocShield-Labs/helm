@@ -14,9 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use helm_domain::{
-    HostEvent, HostId, MarkerAt, Notification, NotificationId, NotificationKind, OutputMarker,
+    host_event_to_anchor_event, AnchorEvent, HostEvent, HostId, MarkerAt, Notification,
+    NotificationId, NotificationKind, OutputMarker,
 };
 use helm_tmux::TmuxClient;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::state::{NotificationsCtx, PaneRuntime, PREVIEW_BYTES};
@@ -155,6 +157,18 @@ fn upsert(
     incoming_kind: NotificationKind,
     now: u64,
 ) {
+    // Subscriber mode: the anchor is the source of truth for the
+    // inbox. Markers from our own SSH sessions still arrive at this
+    // function (we still want pane_runtime updated above so dismiss-on-
+    // keystroke etc. work), but creating a local notification would
+    // duplicate the one the anchor is also seeing and will push to us
+    // through the bridge. So just return without upserting.
+    if ctx
+        .subscriber_active
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
     let pane_key = (host_id, pane_id.to_string());
 
     // Snapshot the current preview ring + best-known window/session
@@ -239,9 +253,18 @@ fn upsert(
     };
 
     // Re-clone out of the registry so we emit the *current* shape,
-    // including the merge above.
+    // including the merge above. Mirror to durable storage on the
+    // same shape we just emitted, so a restart picks up the merged
+    // row and not a stale earlier snapshot.
     if let Some(notif) = ctx.notifications.get(&id).map(|r| r.clone()) {
-        emit(event_tx, HostEvent::Notification { host_id, notification: notif });
+        if let Err(e) = ctx.db.upsert_notification(&notif) {
+            tracing::warn!("notification persist failed: {e}");
+        }
+        emit(
+            event_tx,
+            &ctx.anchor_event_tx,
+            HostEvent::Notification { host_id, notification: notif },
+        );
     }
 }
 
@@ -423,8 +446,12 @@ pub fn dismiss_for_panes(
         let key = (host_id, pane_id.clone());
         if let Some((_, id)) = ctx.notification_by_pane.remove(&key) {
             ctx.notifications.remove(&id);
+            if let Err(e) = ctx.db.delete_notification(id) {
+                tracing::warn!("notification dismiss persist failed: {e}");
+            }
             emit(
                 event_tx,
+                &ctx.anchor_event_tx,
                 HostEvent::NotificationDismissed {
                     host_id,
                     notification_id: id,
@@ -454,11 +481,17 @@ pub fn dismiss_for_host(
         ctx.notifications.remove(&id);
         emit(
             event_tx,
+            &ctx.anchor_event_tx,
             HostEvent::NotificationDismissed {
                 host_id,
                 notification_id: id,
             },
         );
+    }
+    // One bulk delete in the db is cheaper than N per-id deletes when
+    // a host with a lot of inbox rows disconnects.
+    if let Err(e) = ctx.db.delete_notifications_for_host(host_id) {
+        tracing::warn!("notification dismiss-for-host persist failed: {e}");
     }
     // Drop per-pane runtime for this host too.
     ctx.pane_runtime.retain(|key, _| key.0 != host_id);
@@ -540,7 +573,19 @@ pub async fn refresh_pane_index(
     Ok(())
 }
 
-fn emit(tx: &Option<UnboundedSender<HostEvent>>, event: HostEvent) {
+/// Dual emit: HostEvent to the Tauri frontend channel + AnchorEvent
+/// to the anchor RPC broadcast (when the event variant is
+/// translatable). Local to this module so we don't have to drag
+/// `commands::emit_event_anchored` into every notifications-internal
+/// call site.
+fn emit(
+    tx: &Option<UnboundedSender<HostEvent>>,
+    anchor_tx: &broadcast::Sender<AnchorEvent>,
+    event: HostEvent,
+) {
+    if let Some(translated) = host_event_to_anchor_event(&event) {
+        let _ = anchor_tx.send(translated);
+    }
     if let Some(tx) = tx {
         let _ = tx.send(event);
     }
@@ -616,6 +661,7 @@ mod tests {
 
     /// Build a NotificationsCtx with empty maps suitable for upsert tests.
     fn test_ctx() -> NotificationsCtx {
+        let (anchor_event_tx, _) = tokio::sync::broadcast::channel(64);
         NotificationsCtx {
             notifications: Arc::new(DashMap::new()),
             notification_by_pane: Arc::new(DashMap::new()),
@@ -623,6 +669,9 @@ mod tests {
             focus: Arc::new(parking_lot::Mutex::new(None)),
             refresh_locks: Arc::new(DashMap::new()),
             tool_integration_seen: Arc::new(DashMap::new()),
+            db: crate::db::Db::in_memory(),
+            anchor_event_tx,
+            subscriber_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

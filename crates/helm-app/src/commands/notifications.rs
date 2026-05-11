@@ -3,21 +3,29 @@
 //! here too — it's the active-window suppression knob the inbox layer
 //! consults on every event.
 
-use helm_domain::{HostEvent, HostId};
+use helm_domain::{HostEvent, HostId, RpcOp, RpcResult};
 use tauri::State;
 
-use crate::commands::emit_event;
+use crate::commands::{emit_event_anchored, subscriber_client};
 use crate::state::AppState;
 
 /// Snapshot every live notification, ordered oldest-first by created_at.
 /// The frontend uses this on boot to repopulate its inbox; subsequent
 /// updates flow through the `Notification` / `NotificationDismissed`
-/// HostEvent variants.
+/// HostEvent variants. In subscriber mode, the list comes from the
+/// anchor over RPC instead of the local db — the local rows are
+/// already kept in lockstep via the bridge.
 #[tauri::command]
 #[specta::specta]
 pub async fn notifications_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<helm_domain::Notification>, String> {
+    if let Some(client) = subscriber_client(&state) {
+        return match client.request(RpcOp::ListNotifications).await? {
+            RpcResult::Notifications { notifications } => Ok(notifications),
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     let mut out: Vec<_> = state
         .notifications
         .iter()
@@ -36,15 +44,33 @@ pub async fn notification_dismiss(
     state: State<'_, AppState>,
     notification_id: helm_domain::NotificationId,
 ) -> Result<(), String> {
+    if let Some(client) = subscriber_client(&state) {
+        // Anchor owns the row. Send the dismiss and let the event
+        // bridge propagate the matching NotificationDismissed back
+        // to us — the frontend will see the same event shape as if
+        // we'd dismissed locally.
+        return match client
+            .request(RpcOp::DismissNotification { notification_id })
+            .await?
+        {
+            RpcResult::Ack => Ok(()),
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     let event_tx = state.event_tx.lock().await.clone();
+    let anchor_tx = state.anchor_event_tx.clone();
     let Some((_, notif)) = state.notifications.remove(&notification_id) else {
         return Ok(());
     };
     state
         .notification_by_pane
         .remove(&(notif.host_id, notif.pane_id));
-    emit_event(
+    if let Err(e) = state.db.delete_notification(notification_id) {
+        tracing::warn!("notification dismiss persist failed: {e}");
+    }
+    emit_event_anchored(
         &event_tx,
+        &anchor_tx,
         HostEvent::NotificationDismissed {
             host_id: notif.host_id,
             notification_id,
