@@ -47,6 +47,15 @@ use helm_tmux::TmuxClient;
 
 pub mod claude_code;
 
+/// True iff `s` looks like a semver (`<digits>.<digits>…`). Used by
+/// callers (e.g. `claude_code::pane_matches`, the scheduler's
+/// Claude-foreground detector) to recognize tools that rewrite their
+/// `process.title` to their version string — Claude Code being the
+/// canonical example.
+pub fn is_semver_like(s: &str) -> bool {
+    !s.is_empty() && s.contains('.') && s.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
 /// One installable tool integration. Stable id is the persistence key
 /// (used for "user dismissed this") and the wire identifier between
 /// frontend and backend, so it must not change across releases.

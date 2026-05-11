@@ -19,6 +19,8 @@ import type {
   HostStatus,
   Notification,
   NotificationId,
+  Schedule,
+  ScheduleId,
 } from '@bindings'
 
 export interface Bootstrap {
@@ -418,6 +420,40 @@ interface HelmState {
    * animation timer fires. */
   mergingInboxId: NotificationId | null
   setMergingInboxId: (id: NotificationId | null) => void
+
+  // ---------- schedules ----------
+  /** User-defined scheduled runs, keyed by id. Hydrated from
+   * `schedule_list` at boot and kept fresh by `schedule_upserted` /
+   * `schedule_removed` events. The backend is the source of truth — UI
+   * mutations call into commands, which round-trip back as events. */
+  schedules: Map<ScheduleId, Schedule>
+  upsertSchedule: (s: Schedule) => void
+  removeSchedule: (id: ScheduleId) => void
+  setSchedules: (list: Schedule[]) => void
+
+  /** Editor modal state. Open with optional `editing` (existing schedule)
+   * or `prefill` (defaults for a fresh form: usually pulled from the
+   * active host + active pane's cwd at the moment the user invoked the
+   * action). The modal mounts in App.tsx, the actions toggle this. */
+  scheduleEditor: {
+    open: boolean
+    editing: Schedule | null
+    /** Initial body kind to seed the form with. Lets the
+     * `schedule.new-claude` action open the modal pre-set to Claude. */
+    prefillBodyKind: 'shell' | 'claude_code' | null
+    /** Initial cwd to seed if creating new. Defaults to active pane's cwd
+     * if available; falls back to $HOME server-side. */
+    prefillCwd: string | null
+    /** Initial host id to seed if creating new. */
+    prefillHostId: HostId | null
+  }
+  openScheduleEditor: (opts?: {
+    editing?: Schedule
+    prefillBodyKind?: 'shell' | 'claude_code'
+    prefillCwd?: string
+    prefillHostId?: HostId
+  }) => void
+  closeScheduleEditor: () => void
 
   // ---------- tool integration suggestions ----------
   /** Sticky cards prompting the user to install a tool integration
@@ -1291,6 +1327,55 @@ export const useStore = create<HelmState>((set, get) => ({
 
   mergingInboxId: null,
   setMergingInboxId: (id) => set({ mergingInboxId: id }),
+
+  schedules: new Map(),
+  upsertSchedule: (s) =>
+    set((state) => {
+      const next = new Map(state.schedules)
+      next.set(s.id, s)
+      return { schedules: next }
+    }),
+  removeSchedule: (id) =>
+    set((state) => {
+      if (!state.schedules.has(id)) return {}
+      const next = new Map(state.schedules)
+      next.delete(id)
+      return { schedules: next }
+    }),
+  setSchedules: (list) =>
+    set(() => {
+      const next = new Map<ScheduleId, Schedule>()
+      for (const s of list) next.set(s.id, s)
+      return { schedules: next }
+    }),
+
+  scheduleEditor: {
+    open: false,
+    editing: null,
+    prefillBodyKind: null,
+    prefillCwd: null,
+    prefillHostId: null,
+  },
+  openScheduleEditor: (opts) =>
+    set({
+      scheduleEditor: {
+        open: true,
+        editing: opts?.editing ?? null,
+        prefillBodyKind: opts?.prefillBodyKind ?? null,
+        prefillCwd: opts?.prefillCwd ?? null,
+        prefillHostId: opts?.prefillHostId ?? null,
+      },
+    }),
+  closeScheduleEditor: () =>
+    set({
+      scheduleEditor: {
+        open: false,
+        editing: null,
+        prefillBodyKind: null,
+        prefillCwd: null,
+        prefillHostId: null,
+      },
+    }),
 
   toolSuggestions: [],
   pushToolSuggestion: (sug) =>

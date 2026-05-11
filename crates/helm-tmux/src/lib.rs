@@ -9,5 +9,5 @@
 pub mod client;
 pub mod parse;
 
-pub use client::{Cleanup, TmuxClient, TmuxError};
+pub use client::{quote_arg, Cleanup, TmuxClient, TmuxError};
 pub use parse::{parse_line, Notification, TmuxLine};

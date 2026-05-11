@@ -259,6 +259,12 @@ fn upsert(
 fn kind_priority(k: &NotificationKind) -> u8 {
     match k {
         NotificationKind::CommandDone { exit_code: Some(c), .. } if *c != 0 => 3,
+        // Schedule failures sit alongside non-zero exits — both indicate
+        // something the user actively needs to fix. Coalesce-priority
+        // doesn't matter much in practice since the scheduler emits its
+        // own pane key (`schedule:<id>`), so a ScheduleFailed row never
+        // shares a slot with a real pane's CommandDone.
+        NotificationKind::ScheduleFailed { .. } => 3,
         NotificationKind::Bell => 2,
         NotificationKind::CommandDone { .. } => 1,
     }

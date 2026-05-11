@@ -56,6 +56,9 @@ dirs = "5"
 security-framework = "2"
 ssh2-config = "0.7"
 base64 = "0.22"
+cron = "0.12"
+chrono = "0.4"
+chrono-tz = "0.9"
 
 [profile.release]
 codegen-units = 1

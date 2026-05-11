@@ -10,7 +10,10 @@
 //!   - the live `TmuxClient` per connected host
 //!   - the single event channel that delivers everything to the frontend
 
-use helm_domain::{Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification, NotificationId};
+use helm_domain::{
+    Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification, NotificationId, Schedule,
+    ScheduleId, ScheduleRun,
+};
 use helm_ssh::SshSession;
 use helm_tmux::TmuxClient;
 use dashmap::DashMap;
@@ -232,7 +235,34 @@ pub struct AppState {
     /// the same `claude` process. Cleared on app restart — we re-suggest
     /// each launch since the user may have changed their mind.
     pub tool_integration_seen: Arc<DashMap<(HostId, String), ()>>,
+
+    /// User-defined scheduled runs, keyed by id. Persisted to
+    /// `schedules.json`. Mutated under the per-id lock the scheduler
+    /// holds while reading/firing — the simple choice is a Mutex<Vec>,
+    /// but a DashMap mirrors the hosts registry shape and lets reads
+    /// through `schedule_list` not block fires.
+    pub schedules: Arc<DashMap<ScheduleId, Schedule>>,
+
+    /// In-memory ring of recent runs per schedule. Most recent first;
+    /// capped at `SCHEDULE_RUN_HISTORY_LIMIT`. Not persisted — survives
+    /// only as long as the app instance.
+    pub schedule_runs: Arc<DashMap<ScheduleId, Vec<ScheduleRun>>>,
+
+    /// Sender into the scheduler supervisor's signal channel. Set when
+    /// the supervisor is spawned at boot. Used by the schedule_*
+    /// commands to wake the supervisor whenever a schedule is
+    /// added / changed / removed so it can rebuild its next-fire map.
+    /// `parking_lot` rather than tokio so the supervisor's own boot
+    /// path (sync setup callback) can stash the sender without needing
+    /// an async context, while async commands can also lock cheaply.
+    pub scheduler_tx:
+        parking_lot::Mutex<Option<mpsc::UnboundedSender<crate::scheduler::SchedulerSignal>>>,
 }
+
+/// Cap on the in-memory run history per schedule. ~50 keeps the palette
+/// "Recent runs" view useful without unbounded memory growth on a
+/// minutely cron that runs for weeks.
+pub const SCHEDULE_RUN_HISTORY_LIMIT: usize = 50;
 
 /// Mutable per-pane state the notifications layer accumulates between
 /// marker events. Cheap to clone; held briefly under the `pane_runtime`
@@ -331,6 +361,12 @@ impl Default for AppState {
             }
             hosts.insert(host.id, Arc::new(Mutex::new(HostEntry::new(host))));
         }
+        // Hydrate schedules. Same fail-soft semantics as hosts: log on
+        // parse error, start with an empty map.
+        let schedules = DashMap::new();
+        for s in crate::schedules::try_load_schedules() {
+            schedules.insert(s.id, s);
+        }
         Self {
             hosts,
             local_host_id: local_id,
@@ -343,6 +379,9 @@ impl Default for AppState {
             focus: Arc::new(parking_lot::Mutex::new(None)),
             refresh_locks: Arc::new(DashMap::new()),
             tool_integration_seen: Arc::new(DashMap::new()),
+            schedules: Arc::new(schedules),
+            schedule_runs: Arc::new(DashMap::new()),
+            scheduler_tx: parking_lot::Mutex::new(None),
         }
     }
 }

@@ -160,6 +160,39 @@ export async function subscribeHostEvents(): Promise<void> {
       })
       return
     }
+    if (evt.kind === 'schedule_upserted') {
+      useStore.getState().upsertSchedule(evt.schedule)
+      return
+    }
+    if (evt.kind === 'schedule_removed') {
+      useStore.getState().removeSchedule(evt.schedule_id)
+      return
+    }
+    if (evt.kind === 'schedule_fired') {
+      // For *manual* fires (user clicked "Run now"), jump to the new
+      // window — the user just kicked off a run and expects to see
+      // what they did. Without this, the new window opens in the
+      // `scheduled` workspace and the user, who's typically looking
+      // at a different workspace, sees nothing visible happen.
+      // Cron-time fires don't auto-jump because that would yank the
+      // user out of whatever they're doing every time a recurring
+      // schedule ticks over. The schedule_upserted event right after
+      // refreshes last_fired_at / last_run_status either way.
+      if (evt.manual) {
+        const store = useStore.getState()
+        const sched = store.schedules.get(evt.schedule_id)
+        if (sched) {
+          store.setActiveHost(sched.host_id)
+          // window_ids are server-globally unique in tmux, so we
+          // don't need workspace_id to route — tmux's
+          // session_window_changed event that follows updates the
+          // store's active workspace so the sidebar selection
+          // catches up.
+          void commands.tmuxSelectWindow(sched.host_id, evt.window_id)
+        }
+      }
+      return
+    }
     // evt.kind === 'tmux'
     const { host_id, notification: n } = evt
     const store = useStore.getState()
@@ -275,6 +308,17 @@ export async function subscribeHostEvents(): Promise<void> {
     if (list.status === 'ok') {
       const upsert = useStore.getState().upsertNotification
       for (const n of list.data) upsert(n)
+    }
+  } catch {
+    /* no-op */
+  }
+
+  // Hydrate the schedule registry. Same best-effort pattern: failures
+  // just leave the user with an empty list until the next save.
+  try {
+    const list = await commands.scheduleList()
+    if (list.status === 'ok') {
+      useStore.getState().setSchedules(list.data)
     }
   } catch {
     /* no-op */

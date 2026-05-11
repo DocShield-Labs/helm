@@ -11,6 +11,7 @@ import { workspaceActions } from './workspace'
 import { windowActions } from './window'
 import { inboxActions } from './inbox'
 import { themeActions } from './theme'
+import { scheduleActions } from './schedule'
 
 export type { Action, ActionContext, ActionKind, ActionSource } from './types'
 
@@ -21,6 +22,7 @@ export const STATIC_ACTIONS: Action[] = [
   ...windowActions,
   ...inboxActions,
   ...themeActions,
+  ...scheduleActions,
 ]
 
 export function findActionById(id: string): Action | undefined {

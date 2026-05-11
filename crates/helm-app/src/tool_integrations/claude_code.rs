@@ -93,7 +93,7 @@ impl ToolIntegration for ClaudeCodeIntegration {
         {
             return true;
         }
-        is_semver_like(current_command)
+        super::is_semver_like(current_command)
     }
 
     async fn is_installed(
@@ -133,17 +133,6 @@ impl ToolIntegration for ClaudeCodeIntegration {
     fn post_install_note(&self) -> &'static str {
         "Restart Claude Code (close and reopen the session) to activate the hooks."
     }
-}
-
-/// True iff `s` looks like a semantic version (`<digits>.<digits>...`).
-/// Catches Claude Code's process title pattern (`"2.1.126"`) without
-/// matching genuine binary names — they'd need to contain a dot AND
-/// be entirely numeric to false-positive.
-fn is_semver_like(s: &str) -> bool {
-    if s.is_empty() || !s.contains('.') {
-        return false;
-    }
-    s.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// Read `~/.claude/settings.json` from the right side of the wire and
@@ -420,6 +409,7 @@ mod tests {
 
     #[test]
     fn semver_pattern_matches_claude_titles() {
+        use super::super::is_semver_like;
         assert!(is_semver_like("2.1.126"));
         assert!(is_semver_like("1.0.0"));
         assert!(is_semver_like("0.0.1"));
@@ -428,6 +418,7 @@ mod tests {
 
     #[test]
     fn semver_pattern_rejects_real_binaries() {
+        use super::super::is_semver_like;
         assert!(!is_semver_like("claude"));
         assert!(!is_semver_like("node"));
         assert!(!is_semver_like("zsh"));

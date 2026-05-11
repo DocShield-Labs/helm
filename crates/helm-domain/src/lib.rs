@@ -33,6 +33,8 @@ newtype_id!(WorkspaceId);
 newtype_id!(WindowId);
 newtype_id!(PaneId);
 newtype_id!(NotificationId);
+newtype_id!(ScheduleId);
+newtype_id!(ScheduleRunId);
 
 impl HostId {
     /// The localhost host id is stable across app launches so any
@@ -238,6 +240,37 @@ pub enum HostEvent {
         description: String,
         post_install_note: String,
     },
+    /// A schedule was created / updated / re-enabled. Frontend upserts
+    /// into its schedules Map. Also covers the case where the
+    /// supervisor advanced `last_fired_at` / `last_run_status` after a
+    /// fire — same shape, so the frontend's projection just refreshes.
+    ScheduleUpserted {
+        schedule: Schedule,
+    },
+    /// A schedule was deleted from the registry. Frontend drops it.
+    ScheduleRemoved {
+        schedule_id: ScheduleId,
+    },
+    /// A scheduled run successfully opened a window. The frontend
+    /// doesn't toast — attention-worthy follow-up reaches the user
+    /// through the existing notification pipeline (Bell / CommandDone)
+    /// — but the projection updates so palette rows show "ran 2m ago."
+    ///
+    /// `manual` is true when the fire was triggered by the user's
+    /// explicit `schedule_run_now` rather than the supervisor's
+    /// schedule-time loop. The frontend uses this to auto-jump to the
+    /// new window for manual fires (the user expects to see what they
+    /// just kicked off) without disrupting the user's current focus on
+    /// every cron-time fire.
+    ScheduleFired {
+        schedule_id: ScheduleId,
+        run_id: ScheduleRunId,
+        /// Unix ms when the run started.
+        started_at: u64,
+        /// tmux window id the run landed in.
+        window_id: String,
+        manual: bool,
+    },
 }
 
 // ---------- notifications ----------
@@ -297,6 +330,23 @@ pub enum NotificationKind {
         /// Wall-clock duration in milliseconds, B → D. None when we
         /// didn't observe the start marker.
         duration_ms: Option<u64>,
+    },
+    /// A scheduled run failed before it could even reach the user's
+    /// shell — host wouldn't connect, working directory missing,
+    /// new-window failed. Coalesced per schedule id (one inbox row per
+    /// schedule, latest reason wins). Successful fires produce no
+    /// notification of their own; whatever the spawned command does
+    /// (Claude waiting, build failing, …) reaches the user through the
+    /// normal Bell / CommandDone pipeline.
+    ScheduleFailed {
+        schedule_id: ScheduleId,
+        /// User-facing schedule name at fire time, snapshotted so the
+        /// inbox row remains readable if the schedule is later renamed
+        /// or deleted.
+        schedule_name: String,
+        /// Short human-readable reason ("host not connected", "cwd does
+        /// not exist", etc.). Mirrors what we'd surface in a toast.
+        reason: String,
     },
 }
 
@@ -419,6 +469,120 @@ pub struct Pane {
     pub cwd: String,
     pub command: String,
     pub activity: PaneActivity,
+}
+
+// ---------- Schedules ----------
+
+/// A user-defined scheduled run. Local-only in v1: persisted in
+/// `schedules.json` next to `hosts.json`, fired by an in-process
+/// supervisor on whichever helm instance saved them. Each fire opens a
+/// new tmux window on `host_id`, cd's to `cwd`, and runs the body.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct Schedule {
+    pub id: ScheduleId,
+    /// Human label shown in the palette and used as the new window's
+    /// tmux name when fired.
+    pub name: String,
+    pub host_id: HostId,
+    /// Absolute path on the target host. Validated locally at save time
+    /// for localhost; remote cwd is trusted at save time and only fails
+    /// at fire time (visible as a `ScheduleFailed` notification).
+    pub cwd: String,
+    pub body: ScheduleBody,
+    pub trigger: Trigger,
+    /// Workspace (tmux session) to land the new window in. `Named`
+    /// creates if missing; the sentinel "scheduled" is the default.
+    pub workspace_target: WorkspaceTarget,
+    /// When false, the supervisor skips this schedule. The user can
+    /// still fire it manually via `schedule_run_now`.
+    pub enabled: bool,
+    /// Unix ms of the most recent fire. None until first run.
+    pub last_fired_at: Option<u64>,
+    /// Status of the most recent run. None until first run.
+    pub last_run_status: Option<ScheduleRunStatus>,
+}
+
+/// What to run when a schedule fires.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleBody {
+    /// A literal shell line — sent verbatim followed by `\r`. Includes
+    /// any redirections, pipes, or chained commands the user typed.
+    Shell { command: String },
+    /// First-class Claude Code launch. Materialized at fire time as
+    /// either `claude` (interactive, empty prompt) or `claude -p
+    /// "<prompt>"` (non-interactive). `dangerously_skip_permissions`
+    /// maps to `--dangerously-skip-permissions`. Optional `model` maps
+    /// to `--model <id>`.
+    ClaudeCode {
+        /// Empty string → launch interactive Claude with no prompt.
+        prompt: String,
+        /// When true, use `-p` (print mode, non-interactive). When
+        /// false, launch interactive `claude` and send the prompt as a
+        /// follow-up keystroke once the TUI is ready.
+        non_interactive: bool,
+        /// `--model <id>`. None omits the flag.
+        model: Option<String>,
+        /// Add `--dangerously-skip-permissions`.
+        dangerously_skip_permissions: bool,
+    },
+}
+
+/// When a schedule fires.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Trigger {
+    /// Standard 5-field cron (`m h dom mon dow`) interpreted in the
+    /// user's chosen IANA timezone.
+    Cron {
+        /// `0 9 * * 1-5` etc. Validated at save time.
+        expr: String,
+        /// IANA timezone name, e.g. `America/Los_Angeles`. Defaults to
+        /// the host machine's local timezone when the user hasn't
+        /// picked one.
+        tz: String,
+    },
+    /// Run exactly once at this absolute unix-ms timestamp. The
+    /// supervisor disables the schedule after a successful Once fire so
+    /// it doesn't spuriously refire on next boot.
+    Once { at: u64 },
+    /// Run every `seconds` seconds, starting `seconds` from registration.
+    Interval { seconds: u32 },
+}
+
+/// Where to land the new window.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceTarget {
+    /// Resolve by tmux session name; create the workspace if no session
+    /// matches. Default `Named { name: "scheduled" }` keeps cron output
+    /// out of the user's day-to-day workspaces.
+    Named { name: String },
+}
+
+/// One historical run of a schedule. Kept in-memory only in v1.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct ScheduleRun {
+    pub id: ScheduleRunId,
+    pub schedule_id: ScheduleId,
+    /// Unix ms.
+    pub started_at: u64,
+    /// Unix ms when the spawn completed (success) or failed.
+    pub finished_at: u64,
+    pub status: ScheduleRunStatus,
+    /// Tmux window id when the run successfully spawned a window.
+    pub window_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleRunStatus {
+    /// Window opened and command was sent.
+    Ok,
+    /// Spawn failed (host won't connect, cwd missing, send-keys errored).
+    Failed { reason: String },
+    /// User triggered `schedule_run_now` while the schedule was disabled.
+    Manual,
 }
 
 // ---------- Errors ----------

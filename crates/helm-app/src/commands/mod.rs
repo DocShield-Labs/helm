@@ -21,8 +21,10 @@ use tokio::sync::mpsc;
 
 use crate::state::{AppState, SharedHostEntry};
 
+pub mod fs;
 pub mod host;
 pub mod notifications;
+pub mod schedule;
 pub mod system;
 pub mod tmux;
 pub mod tools;

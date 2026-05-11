@@ -29,6 +29,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
+
 #[derive(Debug, Error)]
 pub enum TmuxError {
     #[error("io: {0}")]
@@ -383,6 +384,43 @@ impl TmuxClient {
         self.send_command(parts.join(" ")).await.map(|_| ())
     }
 
+    /// Open a new window whose pane runs `command` as its initial
+    /// process (via tmux's positional `shell-command` argument).
+    /// Returns the new window id via `-P -F '#{window_id}'` so the
+    /// caller can target follow-up commands at it. `--` separates
+    /// flags from the shell-command so a command that begins with
+    /// `-` isn't misparsed as a flag.
+    pub async fn new_window_with_command_returning_id(
+        &self,
+        session_id: Option<&str>,
+        name: Option<&str>,
+        start_dir: Option<&str>,
+        command: &str,
+    ) -> Result<String, TmuxError> {
+        let mut parts: Vec<String> = vec![
+            "new-window".to_string(),
+            "-P".to_string(),
+            "-F".to_string(),
+            "'#{window_id}'".to_string(),
+        ];
+        if let Some(s) = session_id {
+            parts.push("-t".to_string());
+            parts.push(s.to_string());
+        }
+        if let Some(c) = start_dir {
+            parts.push("-c".to_string());
+            parts.push(quote_arg(c));
+        }
+        if let Some(n) = name {
+            parts.push("-n".to_string());
+            parts.push(quote_arg(n));
+        }
+        parts.push("--".to_string());
+        parts.push(quote_arg(command));
+        let out = self.send_command(parts.join(" ")).await?;
+        Ok(out.trim().to_string())
+    }
+
     pub async fn split_pane(&self, pane_id: &str, vertical: bool) -> Result<(), TmuxError> {
         let dir = if vertical { "-v" } else { "-h" };
         self.send_command(format!("split-window {} -t {}", dir, pane_id))
@@ -471,6 +509,70 @@ impl TmuxClient {
         }
         let out = self.send_command(parts.join(" ")).await?;
         Ok(out.trim().to_string())
+    }
+
+    /// Like `new_session` but additionally takes the first window's
+    /// name and a `shell-command` to run as that window's initial
+    /// process. Returns the new window's id (not the session's — the
+    /// scheduler routes follow-ups to the window). See the rationale
+    /// on `new_window_with_command_returning_id` for why this exists
+    /// (canonical-mode `MAX_CANON` avoidance).
+    pub async fn new_session_with_command_returning_window_id(
+        &self,
+        session_name: &str,
+        window_name: &str,
+        start_dir: &str,
+        command: &str,
+    ) -> Result<String, TmuxError> {
+        let parts: Vec<String> = vec![
+            "new-session".to_string(),
+            "-d".to_string(),
+            "-P".to_string(),
+            "-F".to_string(),
+            "'#{window_id}'".to_string(),
+            "-s".to_string(),
+            quote_arg(session_name),
+            "-n".to_string(),
+            quote_arg(window_name),
+            "-c".to_string(),
+            quote_arg(start_dir),
+            "--".to_string(),
+            quote_arg(command),
+        ];
+        let out = self.send_command(parts.join(" ")).await?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Write `content` to `path` on the tmux server's host via tmux's
+    /// paste-buffer API: `set-buffer` → `save-buffer` → `delete-buffer`.
+    /// Rides the existing tmux control channel — zero new SSH channels,
+    /// so this is safe to call from callers (e.g. the scheduler) that
+    /// would otherwise exhaust the SSH server's `MaxSessions` budget.
+    /// `buffer_name` must be unique per concurrent caller.
+    pub async fn write_file_via_buffer(
+        &self,
+        buffer_name: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<(), TmuxError> {
+        self.send_command(format!(
+            "set-buffer -b {} {}",
+            quote_arg(buffer_name),
+            quote_arg(content)
+        ))
+        .await?;
+        self.send_command(format!(
+            "save-buffer -b {} {}",
+            quote_arg(buffer_name),
+            quote_arg(path)
+        ))
+        .await?;
+        // Best-effort cleanup; if delete fails the buffer leaks until
+        // the tmux server exits, which is harmless.
+        let _ = self
+            .send_command(format!("delete-buffer -b {}", quote_arg(buffer_name)))
+            .await;
+        Ok(())
     }
 
     pub async fn kill_session(&self, session_id: &str) -> Result<(), TmuxError> {
@@ -910,9 +1012,12 @@ fn kill_orphan_cc_clients(known_to_tmux: &std::collections::HashSet<u32>) -> Vec
     killed
 }
 
-/// Wrap an argument in single quotes, escaping any single quote inside as `'\''`.
-/// tmux's command parser accepts shell-style single-quoted strings.
-fn quote_arg(s: &str) -> String {
+/// POSIX shell single-quote escape: wrap in `'…'`, replace any inner
+/// `'` with `'\''` (close, escaped quote, reopen). Round-trips
+/// through tmux's command parser AND through `/bin/sh -c`, so
+/// callers in helm-app re-use it for any place a value needs to
+/// survive a shell parser intact.
+pub fn quote_arg(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {

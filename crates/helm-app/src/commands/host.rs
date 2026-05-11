@@ -328,6 +328,20 @@ pub async fn host_connect(
     host_id: HostId,
     bootstrap_workspace: Option<String>,
 ) -> Result<(), String> {
+    connect_host_impl(&state, host_id, bootstrap_workspace).await
+}
+
+/// The body of `host_connect`, callable from places other than a Tauri
+/// command (notably the scheduler's auto-connect path). Builds the
+/// host-key prompter, aborts any prior supervisor, and hands off to
+/// `connection::do_connect`. The caller's `&State` borrow is dropped
+/// before the long-running connect work begins so we don't pin it
+/// across the full SSH handshake.
+pub(crate) async fn connect_host_impl(
+    state: &State<'_, AppState>,
+    host_id: HostId,
+    bootstrap_workspace: Option<String>,
+) -> Result<(), String> {
     let entry = state
         .entry(host_id)
         .ok_or_else(|| "unknown host".to_string())?;
@@ -351,7 +365,6 @@ pub async fn host_connect(
         guard.voluntary_disconnect = false;
     }
 
-    drop(state); // release the State borrow before the long-running connect.
     crate::connection::do_connect(
         entry,
         host_id,
