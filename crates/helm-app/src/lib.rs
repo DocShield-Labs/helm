@@ -83,6 +83,45 @@ pub fn anchor_rpc_main() -> i32 {
     anchor::run_stdio_proxy()
 }
 
+/// Boot-time path for subscribers: connect to the designated remote
+/// anchor and open the bridge so the frontend sees the anchor's
+/// notifications + schedules without manual intervention. Soft-fails
+/// — any error logs and the user can recover by re-setting the
+/// anchor from the palette.
+async fn bootstrap_remote_anchor(app: tauri::AppHandle, anchor_id: helm_domain::HostId) {
+    use tauri::Manager;
+    let state = app.state::<state::AppState>();
+    if let Err(e) = commands::host::connect_host_impl(&state, anchor_id, None).await {
+        tracing::warn!("subscriber bootstrap: connect failed: {e}");
+        return;
+    }
+    let session = {
+        let Some(entry) = state.entry(anchor_id) else {
+            return;
+        };
+        let guard = entry.lock().await;
+        guard.ssh.as_ref().cloned()
+    };
+    let Some(session) = session else {
+        tracing::warn!(
+            "subscriber bootstrap: connect returned ok but no SSH session — \
+             expected for localhost, unexpected for a remote anchor"
+        );
+        return;
+    };
+    let frontend_tx = state.event_tx.lock().await.clone();
+    match subscriber::open_anchor_bridge(app.clone(), session, frontend_tx) {
+        Ok(handle) => {
+            *state.subscriber.lock() = Some(handle);
+            state
+                .subscriber_active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("subscriber bootstrap: bridge opened for remote anchor");
+        }
+        Err(e) => tracing::warn!("subscriber bootstrap: open_anchor_bridge failed: {e}"),
+    }
+}
+
 /// Regenerate `src/types/bindings.ts`. Run via `cargo run --bin export-bindings`.
 pub fn export_bindings() {
     specta_builder()
@@ -182,7 +221,8 @@ pub fn run() {
             // when localhost isn't the anchor; the
             // `host_set_anchor` command starts/stops on flip.
             let state = app.state::<state::AppState>();
-            if let Some(local) = state.hosts.get(&state.local_host_id) {
+            let local_id = state.local_host_id;
+            if let Some(local) = state.hosts.get(&local_id) {
                 if local.try_lock().map(|g| g.host.is_anchor).unwrap_or(false) {
                     match anchor::spawn(app.handle()) {
                         Ok(handle) => {
@@ -191,6 +231,26 @@ pub fn run() {
                         Err(e) => tracing::warn!("anchor RPC start failed: {e}"),
                     }
                 }
+            }
+            // If a *remote* host is the anchor, kick off an
+            // auto-connect + subscriber bridge open in the background.
+            // Without this, the subscriber starts cold every helm
+            // launch — the user would have to manually connect to
+            // the anchor + re-designate it on each restart for
+            // notifications to flow again.
+            let remote_anchor_id = state.hosts.iter().find_map(|entry| {
+                let guard = entry.value().try_lock().ok()?;
+                if guard.host.is_anchor && guard.host.id != local_id {
+                    Some(guard.host.id)
+                } else {
+                    None
+                }
+            });
+            if let Some(anchor_id) = remote_anchor_id {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    bootstrap_remote_anchor(app_handle, anchor_id).await;
+                });
             }
             Ok(())
         })
