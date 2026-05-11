@@ -75,23 +75,37 @@ fn ensure_launcher_symlink() -> Result<PathBuf, String> {
 }
 
 /// Check whether `~/.helm/bin` is on the current process's PATH. If
-/// not, log a one-time hint with the exact line to add to the user's
-/// login shell rc file. We don't auto-edit rc files — that crosses an
+/// not, log a one-time hint with a single command the user can copy-
+/// paste to fix it. We don't auto-edit rc files — that crosses an
 /// invasiveness line — but we make the fix one copy-paste away.
+///
+/// Picks the rc file from $SHELL: `~/.zprofile` for zsh (macOS
+/// default), `~/.bash_profile` for bash. Falls back to `~/.profile`
+/// for anything else. All three are sourced by login shells, which is
+/// what `ssh user@host` triggers when SSH runs `bash -lc 'helm
+/// anchor-rpc'` on the remote.
 fn warn_if_not_on_path(launcher_dir: &std::path::Path) {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let on_path = std::env::split_paths(&path).any(|p| p == launcher_dir);
     if on_path {
         return;
     }
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let rc_file = if shell.ends_with("/zsh") {
+        "~/.zprofile"
+    } else if shell.ends_with("/bash") {
+        "~/.bash_profile"
+    } else {
+        "~/.profile"
+    };
     warn!(
-        "anchor RPC: `helm` launcher installed at {:?}, but this directory \
-         isn't on your PATH. Subscribers reach this machine over SSH by \
-         running `helm anchor-rpc`, which needs the binary discoverable in \
-         the remote login shell. Add this line to ~/.zprofile (or \
-         ~/.bash_profile / ~/.profile):\n  \
-         export PATH=\"$HOME/.helm/bin:$PATH\"",
-        launcher_dir,
+        "anchor RPC: `helm` launcher installed at {:?}, but this \
+         directory isn't on your PATH. Subscribers reach this machine \
+         over SSH by running `helm anchor-rpc`, which needs the binary \
+         discoverable in the remote login shell. Run this once to fix \
+         it (then open a new terminal):\n\n  \
+         echo 'export PATH=\"$HOME/.helm/bin:$PATH\"' >> {}\n",
+        launcher_dir, rc_file,
     );
 }
 
