@@ -272,6 +272,61 @@ function hostSubActions(host: Host, display: HostDisplayStatus): Action[] {
       },
     })
   }
+
+  // Anchor toggle. Remote anchors require an active SSH session so
+  // the subscriber client can ride on top of it — gate the option
+  // accordingly. Localhost can always be the anchor (its connection
+  // path is intrinsic).
+  if (host.is_anchor) {
+    out.push({
+      id: `host.${host.id}.clear-anchor`,
+      kind: 'action',
+      label: 'Clear anchor',
+      icon: '⚓',
+      run: () => {
+        void (async () => {
+          const res = await commands.hostSetAnchor(null)
+          if (res.status !== 'ok') {
+            useStore.getState().pushToast({
+              id: `host-anchor-error::${host.id}`,
+              message: `Couldn't clear anchor: ${res.error}`,
+              durationMs: 8_000,
+            })
+          }
+        })()
+      },
+    })
+  } else {
+    const canSet = host.port === 0 || display === 'connected'
+    out.push({
+      id: `host.${host.id}.set-anchor`,
+      kind: 'action',
+      label: canSet
+        ? 'Make this my anchor'
+        : 'Make this my anchor (connect first)',
+      icon: '⚓',
+      run: () => {
+        void (async () => {
+          if (!canSet) {
+            useStore.getState().pushToast({
+              id: `host-anchor-error::${host.id}`,
+              message: `Connect to "${host.name}" before designating it as anchor.`,
+              durationMs: 6_000,
+            })
+            return
+          }
+          const res = await commands.hostSetAnchor(host.id)
+          if (res.status !== 'ok') {
+            useStore.getState().pushToast({
+              id: `host-anchor-error::${host.id}`,
+              message: `Couldn't set anchor: ${res.error}`,
+              durationMs: 8_000,
+            })
+          }
+        })()
+      },
+    })
+  }
   // Localhost (port 0) can't be removed from the registry.
   if (host.port !== 0) {
     out.push({
@@ -344,14 +399,18 @@ export function hostsAsActions(): SubModeResult {
   }
 
   for (const { host, display } of sorted) {
-    const sublabel = host.port === 0 ? `· localhost` : `· ssh ${host.user}@${host.hostname}`
+    const transport = host.port === 0 ? `· localhost` : `· ssh ${host.user}@${host.hostname}`
+    // Anchor designation is per-network metadata; surface it in the
+    // host row so the user always sees which machine they've picked
+    // without drilling into sub-actions.
+    const sublabel = host.is_anchor ? `· anchor ${transport}` : transport
     const id = `host.${host.id}`
     actions.push({
       id,
       kind: 'host',
       label: host.name,
       sublabel,
-      icon: '●',
+      icon: host.is_anchor ? '⚓' : '●',
       run: () => {
         state.setActiveHost(host.id)
         if (display === 'disconnected' || display === 'error') {
