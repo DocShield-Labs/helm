@@ -7,6 +7,7 @@ mod anchor;
 mod commands;
 mod connection;
 mod db;
+mod install;
 mod integration;
 mod keychain;
 mod notifications;
@@ -115,6 +116,13 @@ pub fn run() {
     if let Err(e) = integration::install_local() {
         tracing::warn!("shell integration install failed: {e}");
     }
+
+    // Refresh the launcher symlink at ~/.helm/bin/helm. Lets the
+    // anchor RPC's SSH-piped transport find `helm anchor-rpc` when
+    // subscribers exec against this machine — provided the user has
+    // ~/.helm/bin on their login-shell PATH, which we log a hint
+    // about if they don't.
+    install::ensure_launcher();
 
     // Set the integration env vars in helm's own process env so the
     // *very first* tmux server we spawn inherits them at server start.
