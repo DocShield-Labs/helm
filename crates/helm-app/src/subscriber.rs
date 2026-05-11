@@ -265,11 +265,19 @@ impl SubscriberHandle {
 }
 
 /// Open a subscriber client to a remote anchor over an existing SSH
-/// session. Runs `helm anchor-rpc` via the user's login shell so the
-/// remote's PATH includes `/usr/local/bin` etc. (non-interactive
-/// `exec` channels typically don't source .bashrc/.zshrc).
+/// session. Runs `helm anchor-rpc` via the user's *login* shell so the
+/// remote's PATH includes whatever they set up in their shell's login
+/// rc file (~/.zprofile for zsh, ~/.bash_profile for bash, etc.).
+///
+/// `${SHELL:-/bin/bash}` rather than a hardcoded `bash` because macOS
+/// users are overwhelmingly on zsh — `bash -lc` doesn't read
+/// `~/.zprofile`, so a `~/.helm/bin` PATH addition the user thought
+/// they'd made would be silently invisible to this exec channel.
+/// Expanding $SHELL picks the right interpreter at runtime; the
+/// fallback only kicks in on the unusual case where SSH doesn't
+/// propagate SHELL (very few sshd setups).
 pub fn open_ssh(session: Arc<SshSession>) -> Result<SubscriberClient, String> {
-    let command = "bash -lc 'exec helm anchor-rpc'".to_string();
+    let command = "${SHELL:-/bin/bash} -lc 'exec helm anchor-rpc'".to_string();
     let channel = session
         .open_exec(command)
         .map_err(|e| format!("subscriber: open_exec: {e}"))?;
