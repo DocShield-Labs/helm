@@ -136,13 +136,16 @@ async fn bootstrap_remote_anchor(app: tauri::AppHandle, anchor_id: helm_domain::
         return;
     };
     let frontend_tx = state.event_tx.lock().await.clone();
-    match subscriber::open_anchor_bridge(app.clone(), session, frontend_tx, anchor_id) {
+    match subscriber::open_anchor_bridge(app.clone(), session, frontend_tx, anchor_id).await {
         Ok(handle) => {
+            let monitored = handle.your_id_on_anchor.is_some();
             *state.subscriber.lock() = Some(handle);
             state
                 .subscriber_active
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!("subscriber bootstrap: bridge opened for remote anchor");
+                .store(monitored, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "subscriber bootstrap: bridge opened for remote anchor (anchor monitors us: {monitored})"
+            );
         }
         Err(e) => tracing::warn!("subscriber bootstrap: open_anchor_bridge failed: {e}"),
     }

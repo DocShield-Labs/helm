@@ -286,15 +286,19 @@ pub async fn host_set_anchor(
                 session,
                 frontend_tx,
                 target_id,
-            ) {
+            )
+            .await
+            {
                 Ok(handle) => {
+                    // Capture before moving the handle into state.
+                    let monitored = handle.your_id_on_anchor.is_some();
                     *state.subscriber.lock() = Some(handle);
-                    // Flip the flag *after* the handle is in place so
-                    // the upsert/fire suppression paths see a
-                    // consistent (handle, flag) pairing.
+                    // Only suppress local capture when the anchor
+                    // actually monitors this machine — otherwise the
+                    // subscriber would lose its own events entirely.
                     state
                         .subscriber_active
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                        .store(monitored, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
                     tracing::warn!("subscriber open failed: {e}");

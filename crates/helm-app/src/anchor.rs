@@ -281,9 +281,14 @@ async fn handle_request(
 ) -> Result<(), String> {
     let RpcClientMessage::Request { id, op } = msg;
     let reply = match op {
-        RpcOp::Hello => Ok(RpcResult::Hello {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        }),
+        RpcOp::Hello { hostname } => {
+            let state = app.state::<AppState>();
+            let your_id_on_anchor = match_subscriber_hostname(&state, &hostname);
+            Ok(RpcResult::Hello {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                your_id_on_anchor,
+            })
+        }
         RpcOp::Subscribe => {
             let state = app.state::<AppState>();
             // Subscribe BEFORE snapshotting so we can't miss any event
@@ -455,5 +460,32 @@ async fn write_message(
     w.write_all(&buf).await.map_err(|e| format!("write: {e}"))?;
     w.flush().await.map_err(|e| format!("flush: {e}"))?;
     Ok(())
+}
+
+/// Look up which host in the anchor's registry corresponds to the
+/// subscriber's machine, by hostname stem match. Returns None when
+/// the subscriber's hostname is empty (older subscriber that doesn't
+/// send one) or no host entry matches. First match wins — duplicates
+/// are rare in practice and hostname is a soft identifier anyway.
+fn match_subscriber_hostname(
+    state: &tauri::State<'_, AppState>,
+    subscriber_hostname: &str,
+) -> Option<helm_domain::HostId> {
+    if subscriber_hostname.trim().is_empty() {
+        return None;
+    }
+    let wanted = helm_domain::hostname_stem(subscriber_hostname);
+    if wanted.is_empty() {
+        return None;
+    }
+    for entry in state.hosts.iter() {
+        if let Ok(guard) = entry.value().try_lock() {
+            let stem = helm_domain::hostname_stem(&guard.host.hostname);
+            if !stem.is_empty() && stem == wanted {
+                return Some(guard.host.id);
+            }
+        }
+    }
+    None
 }
 

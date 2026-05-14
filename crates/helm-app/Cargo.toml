@@ -49,6 +49,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
+hostname.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"

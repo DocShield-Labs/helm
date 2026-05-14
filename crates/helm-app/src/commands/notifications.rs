@@ -23,11 +23,11 @@ pub async fn notifications_list(
     if let Some(client) = subscriber_client(&state) {
         return match client.request(RpcOp::ListNotifications).await? {
             RpcResult::Notifications { mut notifications } => {
-                if let Some(anchor_id) =
-                    crate::subscriber::current_anchor_host_id(&state.hosts, state.local_host_id)
+                if let Some((anchor_id, your_id)) =
+                    crate::subscriber::current_translation(&state.subscriber)
                 {
                     for n in &mut notifications {
-                        crate::subscriber::remap_notification(n, anchor_id);
+                        crate::subscriber::remap_notification_in(n, anchor_id, your_id);
                     }
                 }
                 Ok(notifications)

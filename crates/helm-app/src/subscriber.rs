@@ -244,11 +244,17 @@ fn writer_loop<W: Write>(
 /// while a remote anchor is configured; `shutdown()` (or drop) aborts
 /// the bridge and closes the client.
 pub struct SubscriberHandle {
-    /// The RPC client itself. Public because the next slice (1d.2)
-    /// reroutes the `notifications_list` / `notification_dismiss`
-    /// commands through this client when a subscriber is active.
-    #[allow(dead_code)]
     pub client: SubscriberClient,
+    /// Subscriber's local id for the anchor machine. Used to translate
+    /// outgoing requests (subscriber's `anchor_host_id` → anchor's
+    /// `HostId::local()`) and the snapshot's local-side flip in the
+    /// other direction.
+    pub anchor_host_id: helm_domain::HostId,
+    /// Anchor's id for the subscriber's own machine (resolved via
+    /// hostname stem match on Hello). None when the anchor doesn't
+    /// have this machine in its host registry — translation for
+    /// "this machine" is then skipped and local capture stays on.
+    pub your_id_on_anchor: Option<helm_domain::HostId>,
     /// Bridge task forwarding `AnchorEvent`s → `HostEvent`s onto the
     /// frontend channel. Aborted on shutdown so we don't leak a task
     /// after the user switches anchors.
@@ -262,6 +268,17 @@ impl SubscriberHandle {
         // when the last clone goes, the transport guard drops and
         // closes the connection, the reader/writer threads exit.
     }
+}
+
+/// Best-effort local hostname, lowercased. Empty string on failure;
+/// the Hello protocol treats empty as "subscriber didn't supply one"
+/// and skips matching.
+fn local_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|os| os.to_str().map(String::from))
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default()
 }
 
 /// Open a subscriber client to a remote anchor over an existing SSH
@@ -363,87 +380,159 @@ impl TransportGuard for ChildGuard {}
 /// the anchor's localhost as the user's anchor host entry — which is
 /// also the host the subscriber's own SSH session is attached to, so
 /// the workspace tree resolves window names correctly.
-pub fn open_anchor_bridge(
+pub async fn open_anchor_bridge(
     app: tauri::AppHandle,
     session: Arc<SshSession>,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<helm_domain::HostEvent>>,
     anchor_host_id: helm_domain::HostId,
 ) -> Result<SubscriberHandle, String> {
     let client = open_ssh(session)?;
-    let bridge = spawn_bridge(app, client.clone(), event_tx, anchor_host_id);
-    Ok(SubscriberHandle { client, bridge })
+    // Hello first — needs to complete before Subscribe so the bridge
+    // knows whether the anchor maps this machine. Surfaces transport
+    // failures (helm not on remote PATH, broken pipe) early instead
+    // of letting the bridge silently die later.
+    let your_id_on_anchor = match client
+        .request(helm_domain::RpcOp::Hello {
+            hostname: local_hostname(),
+        })
+        .await?
+    {
+        helm_domain::RpcResult::Hello {
+            your_id_on_anchor, ..
+        } => your_id_on_anchor,
+        other => return Err(format!("unexpected hello reply: {other:?}")),
+    };
+    if your_id_on_anchor.is_none() {
+        tracing::info!(
+            "subscriber: anchor doesn't have this machine in its host list — \
+             local-capture suppression will be off, and notifications for this \
+             machine will only appear if the user captures locally"
+        );
+    } else {
+        tracing::info!(
+            "subscriber: anchor maps this machine to {:?}",
+            your_id_on_anchor
+        );
+    }
+    let bridge = spawn_bridge(
+        app,
+        client.clone(),
+        event_tx,
+        anchor_host_id,
+        your_id_on_anchor,
+    );
+    Ok(SubscriberHandle {
+        client,
+        anchor_host_id,
+        your_id_on_anchor,
+        bridge,
+    })
 }
 
-/// Rewrite anchor's `HostId::local()` to `anchor_host_id` on a
-/// notification fetched directly via RPC (not through the event
-/// stream). Used by `notifications_list` when subscriber mode is on.
-pub fn remap_notification(
+/// Translate a host id from the anchor's id space to the subscriber's.
+/// Applied to every host id arriving from the anchor (in events and
+/// in synchronous list replies) so the subscriber's UI sees coherent
+/// ids:
+///   - anchor's `HostId::local()` (= the anchor machine itself) →
+///     subscriber's `anchor_host_id` (the user's existing remote-host
+///     entry for the anchor)
+///   - anchor's `your_id_on_anchor` (= subscriber's machine, from
+///     anchor's view) → subscriber's `HostId::local()` (the user's
+///     own localhost)
+///   - anything else → unchanged (these are "ghost" hosts the
+///     subscriber sees via host sync)
+pub fn translate_id_in(
+    id: helm_domain::HostId,
+    anchor_host_id: helm_domain::HostId,
+    your_id_on_anchor: Option<helm_domain::HostId>,
+) -> helm_domain::HostId {
+    if id == helm_domain::HostId::local() {
+        return anchor_host_id;
+    }
+    if let Some(your_id) = your_id_on_anchor {
+        if id == your_id {
+            return helm_domain::HostId::local();
+        }
+    }
+    id
+}
+
+/// Reverse direction: subscriber's id space → anchor's. Used when
+/// sending outgoing requests that carry a host_id (e.g. SaveSchedule)
+/// so the anchor receives ids in its own space.
+pub fn translate_id_out(
+    id: helm_domain::HostId,
+    anchor_host_id: helm_domain::HostId,
+    your_id_on_anchor: Option<helm_domain::HostId>,
+) -> helm_domain::HostId {
+    if id == anchor_host_id {
+        return helm_domain::HostId::local();
+    }
+    if id == helm_domain::HostId::local() {
+        if let Some(your_id) = your_id_on_anchor {
+            return your_id;
+        }
+        // No translation possible — pass through. Caller will hit
+        // "unknown host" on the anchor side, which surfaces the
+        // misconfiguration honestly rather than silently retargeting.
+    }
+    id
+}
+
+/// Apply incoming id translation to a single notification in place.
+/// Used by `notifications_list` on the synchronous fetch path.
+pub fn remap_notification_in(
     notification: &mut helm_domain::Notification,
     anchor_host_id: helm_domain::HostId,
+    your_id_on_anchor: Option<helm_domain::HostId>,
 ) {
-    if notification.host_id == helm_domain::HostId::local() {
-        notification.host_id = anchor_host_id;
-    }
+    notification.host_id =
+        translate_id_in(notification.host_id, anchor_host_id, your_id_on_anchor);
 }
 
-/// Same idea for a fetched schedule.
-pub fn remap_schedule(
+/// Same for a schedule.
+pub fn remap_schedule_in(
     schedule: &mut helm_domain::Schedule,
     anchor_host_id: helm_domain::HostId,
+    your_id_on_anchor: Option<helm_domain::HostId>,
 ) {
-    if schedule.host_id == helm_domain::HostId::local() {
-        schedule.host_id = anchor_host_id;
-    }
+    schedule.host_id = translate_id_in(schedule.host_id, anchor_host_id, your_id_on_anchor);
 }
 
-/// Look up the host id designated as the current subscriber's anchor
-/// (the *remote* host with `is_anchor=true`). Returns None when this
-/// helm isn't in subscriber mode. Caller uses this to remap fetched
-/// data; see `remap_notification` / `remap_schedule`.
-pub fn current_anchor_host_id(
-    hosts: &dashmap::DashMap<helm_domain::HostId, crate::state::SharedHostEntry>,
-    local_id: helm_domain::HostId,
-) -> Option<helm_domain::HostId> {
-    for entry in hosts.iter() {
-        if *entry.key() == local_id {
-            continue;
-        }
-        if let Ok(guard) = entry.value().try_lock() {
-            if guard.host.is_anchor {
-                return Some(guard.host.id);
-            }
-        }
-    }
-    None
+/// Cheap snapshot of (anchor_host_id, your_id_on_anchor) when a
+/// subscriber is active. Returns None when this helm isn't in
+/// subscriber mode. Used by command handlers to translate request
+/// payloads before sending and reply payloads after receiving.
+pub fn current_translation(
+    subscriber: &parking_lot::Mutex<Option<SubscriberHandle>>,
+) -> Option<(helm_domain::HostId, Option<helm_domain::HostId>)> {
+    let guard = subscriber.lock();
+    guard.as_ref().map(|h| (h.anchor_host_id, h.your_id_on_anchor))
 }
 
-/// Rewrite any `HostId::local()` reference in `evt` to `anchor_host_id`.
-/// See `open_anchor_bridge` for why. Total: walks every variant that
-/// carries a host_id (directly or nested in a Notification/Schedule)
-/// and replaces matches.
-fn remap_anchor_local(
+/// Apply incoming id translation to every host_id reference in `evt`.
+/// See `translate_id_in` for the mapping rules.
+fn translate_event_in(
     mut evt: helm_domain::AnchorEvent,
     anchor_host_id: helm_domain::HostId,
+    your_id_on_anchor: Option<helm_domain::HostId>,
 ) -> helm_domain::AnchorEvent {
-    let anchor_local = helm_domain::HostId::local();
-    let remap = |id: &mut helm_domain::HostId| {
-        if *id == anchor_local {
-            *id = anchor_host_id;
-        }
+    let xform = |id: &mut helm_domain::HostId| {
+        *id = translate_id_in(*id, anchor_host_id, your_id_on_anchor);
     };
     match &mut evt {
         helm_domain::AnchorEvent::Notification {
             host_id,
             notification,
         } => {
-            remap(host_id);
-            remap(&mut notification.host_id);
+            xform(host_id);
+            xform(&mut notification.host_id);
         }
         helm_domain::AnchorEvent::NotificationDismissed { host_id, .. } => {
-            remap(host_id);
+            xform(host_id);
         }
         helm_domain::AnchorEvent::ScheduleUpserted { schedule } => {
-            remap(&mut schedule.host_id);
+            xform(&mut schedule.host_id);
         }
         helm_domain::AnchorEvent::ScheduleRemoved { .. }
         | helm_domain::AnchorEvent::ScheduleFired { .. }
@@ -458,13 +547,9 @@ fn spawn_bridge(
     client: SubscriberClient,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<helm_domain::HostEvent>>,
     anchor_host_id: helm_domain::HostId,
+    your_id_on_anchor: Option<helm_domain::HostId>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        // Subscribe to the anchor's push stream BEFORE snapshotting so
-        // we can't miss an event emitted between snapshot read and
-        // subscribe. The Subscribe op atomically does both on the
-        // server side, returning the snapshot in its reply and starting
-        // the push stream immediately after.
         let mut events = client.events();
         match client.request(helm_domain::RpcOp::Subscribe).await {
             Ok(helm_domain::RpcResult::Subscribed {
@@ -480,19 +565,24 @@ fn spawn_bridge(
                     // those ids arrive.
                     for host in hosts {
                         // Defensive — anchor's snapshot already
-                        // filters out its own localhost, but if a
-                        // future build sends it through we still
-                        // skip rather than overwrite the subscriber's
-                        // own anchor-host entry.
-                        if host.id == anchor_local {
+                        // filters out its own localhost, but skip on
+                        // our side too. Also skip the anchor's entry
+                        // for this very machine: the subscriber's own
+                        // localhost is the canonical local
+                        // representation, no need for a ghost copy.
+                        if host.id == anchor_local
+                            || Some(host.id) == your_id_on_anchor
+                        {
                             continue;
                         }
                         let _ = tx.send(helm_domain::HostEvent::HostAdded { host });
                     }
                     for notification in &mut notifications {
-                        if notification.host_id == anchor_local {
-                            notification.host_id = anchor_host_id;
-                        }
+                        remap_notification_in(
+                            notification,
+                            anchor_host_id,
+                            your_id_on_anchor,
+                        );
                     }
                     for notification in notifications {
                         let _ = tx.send(helm_domain::HostEvent::Notification {
@@ -501,9 +591,7 @@ fn spawn_bridge(
                         });
                     }
                     for schedule in &mut schedules {
-                        if schedule.host_id == anchor_local {
-                            schedule.host_id = anchor_host_id;
-                        }
+                        remap_schedule_in(schedule, anchor_host_id, your_id_on_anchor);
                     }
                     for schedule in schedules {
                         let _ = tx.send(helm_domain::HostEvent::ScheduleUpserted { schedule });
@@ -521,22 +609,25 @@ fn spawn_bridge(
         loop {
             match events.recv().await {
                 Ok(evt) => {
-                    // Skip anchor host-list events that reference the
-                    // anchor's own localhost — the subscriber's
-                    // existing entry for the anchor is canonical on
-                    // this machine and shouldn't get clobbered with
-                    // anchor-side metadata.
+                    // Skip anchor host-list events for either the
+                    // anchor's localhost (the subscriber's anchor
+                    // entry is canonical) or the subscriber's own
+                    // machine (already represented as local).
                     if let helm_domain::AnchorEvent::HostUpserted { host } = &evt {
-                        if host.id == helm_domain::HostId::local() {
+                        if host.id == helm_domain::HostId::local()
+                            || Some(host.id) == your_id_on_anchor
+                        {
                             continue;
                         }
                     }
                     if let helm_domain::AnchorEvent::HostRemoved { host_id } = &evt {
-                        if *host_id == helm_domain::HostId::local() {
+                        if *host_id == helm_domain::HostId::local()
+                            || Some(*host_id) == your_id_on_anchor
+                        {
                             continue;
                         }
                     }
-                    let evt = remap_anchor_local(evt, anchor_host_id);
+                    let evt = translate_event_in(evt, anchor_host_id, your_id_on_anchor);
                     let host_event = helm_domain::anchor_event_to_host_event(evt);
                     if let Some(tx) = &event_tx {
                         if tx.send(host_event).is_err() {
@@ -577,6 +668,7 @@ mod tests {
             id: 7,
             body: RpcResult::Hello {
                 version: "test".into(),
+                your_id_on_anchor: None,
             },
         })
         .unwrap();
@@ -590,7 +682,7 @@ mod tests {
             .blocking_recv()
             .expect("reader should have fired the oneshot");
         match received {
-            Ok(RpcResult::Hello { version }) => assert_eq!(version, "test"),
+            Ok(RpcResult::Hello { version, .. }) => assert_eq!(version, "test"),
             other => panic!("unexpected: {other:?}"),
         }
     }

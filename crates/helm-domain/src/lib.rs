@@ -684,6 +684,19 @@ pub fn anchor_event_to_host_event(event: AnchorEvent) -> HostEvent {
     }
 }
 
+/// Stem of a hostname: lowercased, trimmed of trailing dot, then
+/// everything before the first remaining `.`. Used for matching
+/// subscriber hostnames against anchor host entries — `macbook` matches
+/// `macbook.local`, `macbook.tailnet.ts.net`, and case variants. Two
+/// hosts with different stems are treated as distinct machines.
+pub fn hostname_stem(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    match trimmed.split_once('.') {
+        Some((head, _)) => head.to_string(),
+        None => trimmed,
+    }
+}
+
 /// Translate a HostEvent to its AnchorEvent equivalent, if applicable.
 /// Returns None for variants that shouldn't cross to subscribers (Tmux
 /// output, host-key prompts, status transitions, tool-integration
@@ -775,8 +788,20 @@ pub enum RpcServerMessage {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RpcOp {
     /// Handshake — returns the anchor's version so subscribers can
-    /// detect incompatible versions before doing real work.
-    Hello,
+    /// detect incompatible versions before doing real work, and tells
+    /// the subscriber which host id (if any) the anchor uses for the
+    /// subscriber's own machine. That id is what lets the subscriber
+    /// translate notifications from "anchor's view of this machine"
+    /// to "this machine" / `HostId::local()` in its local UI.
+    ///
+    /// `hostname` is the subscriber's local hostname (via
+    /// `gethostname`). Anchor case-insensitive stem-matches it against
+    /// the hostnames in its host registry; the first match becomes
+    /// `your_id_on_anchor` in the reply.
+    Hello {
+        #[serde(default)]
+        hostname: String,
+    },
     /// Snapshot the current world (notifications + schedules) and
     /// start the push stream. The reply's `body` is
     /// `RpcResult::Subscribed`; subsequent `Event`s arrive without
@@ -801,6 +826,17 @@ pub enum RpcOp {
 pub enum RpcResult {
     Hello {
         version: String,
+        /// The anchor's host id that corresponds to the subscriber's
+        /// own machine, resolved by hostname stem match. None when
+        /// the anchor doesn't have the subscriber's machine in its
+        /// host registry — translation is then skipped and local
+        /// capture stays on (subscriber needs to fend for itself).
+        ///
+        /// `#[serde(default)]` so a newer subscriber talking to an
+        /// older anchor (no field in the reply) deserializes cleanly
+        /// to None instead of failing the whole Hello.
+        #[serde(default)]
+        your_id_on_anchor: Option<HostId>,
     },
     /// Initial snapshot. Subscribers prime their local projections
     /// from these before processing the event stream. `hosts` is the
@@ -808,9 +844,15 @@ pub enum RpcResult {
     /// already represent the anchor itself as their `anchor_host_id`
     /// remote, and including localhost here would clobber the
     /// subscriber's own entry with anchor-side metadata.
+    ///
+    /// `#[serde(default)]` on `hosts` so a newer subscriber talking to
+    /// an older anchor (without host sync) deserializes cleanly — the
+    /// snapshot just doesn't carry hosts, and the subscriber proceeds
+    /// without them rather than failing the whole Subscribe.
     Subscribed {
         notifications: Vec<Notification>,
         schedules: Vec<Schedule>,
+        #[serde(default)]
         hosts: Vec<Host>,
     },
     Notifications {

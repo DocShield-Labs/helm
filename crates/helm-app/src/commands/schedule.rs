@@ -24,11 +24,11 @@ pub async fn schedule_list(state: State<'_, AppState>) -> Result<Vec<Schedule>, 
     if let Some(client) = subscriber_client(&state) {
         return match client.request(RpcOp::ListSchedules).await? {
             RpcResult::Schedules { mut schedules } => {
-                if let Some(anchor_id) =
-                    crate::subscriber::current_anchor_host_id(&state.hosts, state.local_host_id)
+                if let Some((anchor_id, your_id)) =
+                    crate::subscriber::current_translation(&state.subscriber)
                 {
                     for s in &mut schedules {
-                        crate::subscriber::remap_schedule(s, anchor_id);
+                        crate::subscriber::remap_schedule_in(s, anchor_id, your_id);
                     }
                 }
                 schedules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -53,6 +53,19 @@ pub async fn schedule_save(
 ) -> Result<ScheduleId, String> {
     validate_trigger(&schedule.trigger)?;
     if let Some(client) = subscriber_client(&state) {
+        // Translate the schedule's host_id from subscriber's id space
+        // to anchor's before sending. Without this, a schedule the
+        // user created on their macbook targeting "this machine"
+        // (HostId::local()) would arrive at the anchor as HostId::local()
+        // — which on the anchor means the *anchor* machine, the wrong
+        // target entirely.
+        let mut schedule = schedule;
+        if let Some((anchor_id, your_id)) =
+            crate::subscriber::current_translation(&state.subscriber)
+        {
+            schedule.host_id =
+                crate::subscriber::translate_id_out(schedule.host_id, anchor_id, your_id);
+        }
         return match client.request(RpcOp::SaveSchedule { schedule }).await? {
             RpcResult::SavedSchedule { schedule_id } => Ok(schedule_id),
             other => Err(format!("unexpected reply: {other:?}")),

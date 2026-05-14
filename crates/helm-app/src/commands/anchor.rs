@@ -46,8 +46,13 @@ pub async fn anchor_probe(
         crate::subscriber::open_ssh(session)?
     };
 
-    match client.request(RpcOp::Hello).await? {
-        RpcResult::Hello { version } => Ok(version),
+    match client
+        .request(RpcOp::Hello {
+            hostname: String::new(),
+        })
+        .await?
+    {
+        RpcResult::Hello { version, .. } => Ok(version),
         other => Err(format!("unexpected hello reply: {other:?}")),
     }
 }
