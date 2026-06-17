@@ -540,6 +540,93 @@ pub async fn refresh_pane_index(
     Ok(())
 }
 
+/// One-shot scan for windows carrying tmux's bell flag, surfacing an
+/// inbox notification for each — the "unread while I was disconnected"
+/// backfill that replaces the old always-on anchor instance.
+///
+/// tmux tracks `#{window_bell_flag}` as server-side window state (set on
+/// a BEL in a non-current window, cleared when the window is viewed), so
+/// it accumulates even with no client attached. On (re)connect we read
+/// it and fold each flagged window into the inbox via the same `upsert`
+/// path the live bell handler uses — so coalescing, active-window
+/// suppression, and clear-on-view all apply identically. The Claude Code
+/// hook's BEL participates here too: "Claude finished while you were
+/// away" shows up on reconnect for free.
+///
+/// Must run *after* `refresh_pane_index` so `upsert` can resolve
+/// window/session breadcrumbs from `pane_runtime`. Best-effort: a tmux
+/// query failure just means no backfill this connect.
+pub async fn backfill_bell_notifications(
+    ctx: &NotificationsCtx,
+    event_tx: &Option<UnboundedSender<HostEvent>>,
+    client: &Arc<TmuxClient>,
+    host_id: HostId,
+) {
+    // Windows currently flagged with a bell.
+    let raw_windows = match client.list_windows("#{window_id}|#{window_bell_flag}").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("bell backfill: list-windows failed: {e}");
+            return;
+        }
+    };
+    let mut bell_windows: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in raw_windows.split('\n').filter(|l| !l.is_empty()) {
+        // `split` (not `splitn(2)`) so any trailing fields can't leak
+        // into `flag` and make the `== "1"` comparison silently fail.
+        let mut parts = line.split('|');
+        let window_id = parts.next().unwrap_or("").to_string();
+        let flag = parts.next().unwrap_or("");
+        if !window_id.is_empty() && flag == "1" {
+            bell_windows.insert(window_id);
+        }
+    }
+    if bell_windows.is_empty() {
+        return;
+    }
+
+    // Anchor each flagged window's notification on a pane (notifications
+    // coalesce by pane; one per window is the right granularity for
+    // "this window wants attention"). Prefer the active pane, falling
+    // back to the first pane we see for the window.
+    let raw_panes = match client
+        .list_panes("#{window_id}|#{pane_id}|#{pane_active}")
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("bell backfill: list-panes failed: {e}");
+            return;
+        }
+    };
+    let mut chosen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in raw_panes.split('\n').filter(|l| !l.is_empty()) {
+        let mut parts = line.splitn(3, '|');
+        let window_id = parts.next().unwrap_or("").to_string();
+        let pane_id = parts.next().unwrap_or("").to_string();
+        let active = parts.next().unwrap_or("");
+        if window_id.is_empty() || pane_id.is_empty() || !bell_windows.contains(&window_id) {
+            continue;
+        }
+        if active == "1" {
+            chosen.insert(window_id, pane_id); // active pane wins
+        } else {
+            chosen.entry(window_id).or_insert(pane_id); // else first seen
+        }
+    }
+
+    let now = unix_ms();
+    for pane_id in chosen.values() {
+        upsert(ctx, event_tx, host_id, pane_id, NotificationKind::Bell, now);
+    }
+    if !chosen.is_empty() {
+        tracing::info!(
+            "bell backfill: surfaced {} unread window(s) on {host_id:?}",
+            chosen.len()
+        );
+    }
+}
+
 fn emit(tx: &Option<UnboundedSender<HostEvent>>, event: HostEvent) {
     if let Some(tx) = tx {
         let _ = tx.send(event);

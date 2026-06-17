@@ -189,6 +189,17 @@ pub(crate) async fn do_connect(
                     host_id,
                 )
                 .await;
+                // Backfill "unread while disconnected" from tmux's
+                // per-window bell flags before going live. Runs after
+                // refresh_pane_index so the upserts can resolve
+                // window/session breadcrumbs from pane_runtime.
+                notifications::backfill_bell_notifications(
+                    &notif_ctx,
+                    &event_tx,
+                    pc,
+                    host_id,
+                )
+                .await;
                 crate::tool_integrations::detect_and_suggest(
                     &notif_ctx.tool_integration_seen,
                     &event_tx,
@@ -627,6 +638,15 @@ async fn supervise(
                 }
                 if let Some(ref pc) = primary_client {
                     let _ = notifications::refresh_pane_index(
+                        &notif_ctx,
+                        &event_tx,
+                        pc,
+                        host_id,
+                    )
+                    .await;
+                    // Backfill unread bells missed while the connection
+                    // was down — the whole point of reconnecting cleanly.
+                    notifications::backfill_bell_notifications(
                         &notif_ctx,
                         &event_tx,
                         pc,

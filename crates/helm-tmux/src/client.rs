@@ -134,6 +134,16 @@ impl TmuxClient {
             .send_command("set-option -g detach-on-destroy off")
             .await;
 
+        // Track per-window bell flags server-side so we can backfill
+        // "unread while I was disconnected" on (re)connect by reading
+        // `#{window_bell_flag}`. `monitor-bell` is tmux's default, but we
+        // set it explicitly so the feature doesn't depend on the user's
+        // config. Bells only — `monitor-activity` would flag any
+        // background output and flood the inbox with false unreads.
+        let _ = client
+            .send_command("set-option -g monitor-bell on")
+            .await;
+
         Ok((client, event_rx))
     }
 
