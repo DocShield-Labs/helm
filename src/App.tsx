@@ -396,14 +396,12 @@ export function App() {
             )
           })}
           {!activePaneKey && (
-            <div className="flex flex-1 items-center justify-center font-mono text-[12px] text-text-tertiary">
-              {emptyStatePaneText(
-                bootError,
-                activeHostId ? hostErrors.get(activeHostId) ?? null : null,
-                activeStatus,
-                activeHostSessions,
-              )}
-            </div>
+            <PaneEmptyState
+              bootError={bootError}
+              hostError={activeHostId ? hostErrors.get(activeHostId) ?? null : null}
+              status={activeStatus}
+              hs={activeHostSessions}
+            />
           )}
           {activeHost && activeStatus === 'reconnecting' && (
             <ReconnectingOverlay host={activeHost} />
@@ -564,24 +562,69 @@ function prettyPath(p: string): string {
 }
 
 function emptyStateText(hs: HostSessions | undefined): string {
-  if (!hs) return 'opening session…'
-  if (hs.workspaces.size === 0) return 'no workspaces. press ⌘⇧T to create one.'
-  if (!hs.activeWorkspaceId) return 'select a workspace from the sidebar.'
-  return 'opening session…'
+  if (!hs) return 'Opening session…'
+  if (hs.workspaces.size === 0) return 'No workspaces yet.'
+  if (!hs.activeWorkspaceId) return 'Select a workspace from the sidebar.'
+  return 'Opening session…'
 }
 
-/** Empty-state copy for the pane area when no pane is active. Surfaces
- * boot errors and per-host errors (Error status with stashed message)
- * so a stuck localhost reads "error · tmux not found" instead of an
- * upbeat "no workspaces" prompt that hides the real failure. */
-function emptyStatePaneText(
-  bootError: string | null,
-  hostError: string | null,
-  status: HostStatus | undefined,
-  hs: HostSessions | undefined,
-): string {
-  if (bootError) return `error · ${bootError}`
-  if (status === 'error' && hostError) return `error · ${hostError}`
-  return emptyStateText(hs)
+/** Centered empty state for the pane area when no pane is active.
+ * Surfaces boot/host errors prominently (red, no hints) so a stuck
+ * localhost reads "error · tmux not found" instead of an upbeat prompt
+ * that hides the real failure. For benign "nothing here yet" states it
+ * adds a quiet row of keyboard hints so a first-run user knows where to
+ * start. */
+function PaneEmptyState({
+  bootError,
+  hostError,
+  status,
+  hs,
+}: {
+  bootError: string | null
+  hostError: string | null
+  status: HostStatus | undefined
+  hs: HostSessions | undefined
+}) {
+  const isError = !!bootError || (status === 'error' && !!hostError)
+  const message = bootError
+    ? `error · ${bootError}`
+    : status === 'error' && hostError
+      ? `error · ${hostError}`
+      : emptyStateText(hs)
+  const showHints = !isError && status !== 'connecting' && status !== 'reconnecting'
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-5 px-8 text-center">
+      <div
+        className={`font-mono text-[13px] ${isError ? 'text-status-error' : 'text-text-secondary'}`}
+      >
+        {message}
+      </div>
+      {showHints && (
+        <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
+          <EmptyHint keys={['⌘', 'K']} label="commands" />
+          <EmptyHint keys={['⌘', 'T']} label="new window" />
+          <EmptyHint keys={['⌘', '\\']} label="toggle sidebar" />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function EmptyHint({ keys, label }: { keys: string[]; label: string }) {
+  return (
+    <span className="flex items-center gap-1.5 text-[12px] text-text-tertiary">
+      <span className="flex gap-0.5">
+        {keys.map((k, i) => (
+          <kbd
+            key={i}
+            className="rounded border border-white/[0.08] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[11px] leading-none text-text-secondary"
+          >
+            {k}
+          </kbd>
+        ))}
+      </span>
+      {label}
+    </span>
+  )
 }
 

@@ -31,6 +31,7 @@ import {
   type Sigil,
   type SubModeResult,
 } from '@lib/actions/dynamic'
+import { buildSearchActions } from '@lib/actions/search'
 import { Palette } from '@ui'
 import { Row, Kbd } from './Row'
 import { SectionHeader } from './SectionHeader'
@@ -204,9 +205,24 @@ export function PaletteHost() {
     }
   }, [open, initialQuery])
 
+  // Search mode: a leading `/` switches the palette into cross-window
+  // grep. The text after the slash is the search term; results are
+  // *generated* (not fuzzy-filtered over a fixed list), so this branch
+  // bypasses the sigil + ranking machinery below.
+  const searchMode = open && !drilled && query.startsWith('/')
+  const searchTerm = searchMode ? query.slice(1).replace(/^\s/, '') : ''
+
   const { subs, residual } = useMemo(
-    () => (open ? parseInput(query) : { subs: [] as SubModeResult[], residual: '' }),
-    [open, query],
+    () =>
+      open && !searchMode
+        ? parseInput(query)
+        : { subs: [] as SubModeResult[], residual: '' },
+    [open, searchMode, query],
+  )
+
+  const searchActions = useMemo<readonly Action[]>(
+    () => (searchMode ? buildSearchActions(searchTerm) : []),
+    [searchMode, searchTerm],
   )
 
   // Source list:
@@ -217,6 +233,7 @@ export function PaletteHost() {
   //     windows first)
   //   - otherwise → the static registry (default Cmd+K view)
   const sourceActions = useMemo<readonly Action[]>(() => {
+    if (searchMode) return searchActions
     if (drilled?.subActions) return drilled.subActions()
     if (subs.length > 0) {
       const seen = new Set<string>()
@@ -231,17 +248,21 @@ export function PaletteHost() {
       return out
     }
     return STATIC_ACTIONS
-  }, [drilled, subs])
+  }, [searchMode, searchActions, drilled, subs])
 
-  const ranked = useMemo(
-    () => (open ? rankActions(residual, sourceActions) : []),
-    [open, residual, sourceActions],
-  )
+  const ranked = useMemo(() => {
+    if (!open) return []
+    // Search results are already matches in buffer order — don't re-rank
+    // them by fuzzy score; preserve the host→workspace→window order.
+    if (searchMode) return sourceActions.map((action) => ({ action, score: 0 }))
+    return rankActions(residual, sourceActions)
+  }, [open, searchMode, residual, sourceActions])
 
-  const entries = useMemo<ListEntry[]>(
-    () => (open ? computeEntries({ drilled, subs, residual, ranked }) : []),
-    [open, drilled, subs, residual, ranked],
-  )
+  const entries = useMemo<ListEntry[]>(() => {
+    if (!open) return []
+    if (searchMode) return ranked.map(({ action }) => ({ type: 'item', action }))
+    return computeEntries({ drilled, subs, residual, ranked })
+  }, [open, searchMode, drilled, subs, residual, ranked])
 
   // Index map: position in `entries` of the i-th item-row, used to map
   // `selected` (a 0-based item index) back to the right ListEntry.
@@ -326,6 +347,13 @@ export function PaletteHost() {
       popDrill()
       return true
     }
+    if (searchMode) {
+      // Peel the leading `/` (and a space) — drops out of search back to
+      // the normal palette with the term as a plain query, mirroring how
+      // sigil chips peel.
+      setQuery(query.replace(/^\/\s?/, ''))
+      return true
+    }
     const sigilCount = leadingSigilCount(query)
     if (sigilCount > 0) {
       const next = query.slice(0, sigilCount - 1) + query.slice(sigilCount)
@@ -384,12 +412,18 @@ export function PaletteHost() {
 
   let body: React.ReactNode
   if (entries.length === 0) {
+    const emptyMsg =
+      searchMode && searchTerm.trim().length < 2
+        ? 'Type to search across all windows…'
+        : searchMode
+          ? 'No matches in any window.'
+          : 'No matches.'
     body = (
       <div
         className="px-3 py-6 text-center text-[12px]"
         style={{ color: 'var(--text-tertiary)' }}
       >
-        No matches.
+        {emptyMsg}
       </div>
     )
   } else {
@@ -420,7 +454,11 @@ export function PaletteHost() {
   //   - one or more sigils → one chip per active sub, in the order
   //     they appear in the query
   //   - otherwise → no chips
-  const chips = drilled ? [`↳ ${drilled.label}`] : subs.map((s) => s.chip)
+  const chips = drilled
+    ? [`↳ ${drilled.label}`]
+    : searchMode
+      ? ['⌕ search']
+      : subs.map((s) => s.chip)
 
   // Reconstruct the query when the user types. The visible input
   // value is just the residual; we have to re-prepend the sigil run
@@ -430,9 +468,10 @@ export function PaletteHost() {
   return (
     <Palette
       open={open}
-      query={residual}
+      query={searchMode ? searchTerm : residual}
       onQueryChange={(v) => {
-        if (drilled) setQuery(v)
+        if (searchMode) setQuery('/' + v)
+        else if (drilled) setQuery(v)
         else setQuery(sigilPrefix + v)
       }}
       onClose={close}

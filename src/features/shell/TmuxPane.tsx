@@ -51,6 +51,9 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
   // changes on a hostId/paneId swap).
   const [helmTerm, setHelmTerm] = useState<ReturnType<typeof attachTerminal> | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
+  // True when the viewport is pinned to the latest output. Drives the
+  // "jump to latest" pill, which only shows while scrolled up.
+  const [atBottom, setAtBottom] = useState(true)
 
   const paneKey = `${hostId}::${paneId}`
 
@@ -153,6 +156,14 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
       void commands.tmuxResizeClient(hostId, cols, rows)
     })
 
+    // Track whether we're pinned to the bottom so the "jump to latest"
+    // pill can appear only while the user has scrolled up into history.
+    const scrollDisp = term.onScroll(() => {
+      if (aborted()) return
+      const b = term.buffer.active
+      setAtBottom(b.viewportY >= b.baseY)
+    })
+
     let resizeTimer: ReturnType<typeof setTimeout> | undefined
     const ro = new ResizeObserver(() => {
       if (resizeTimer) clearTimeout(resizeTimer)
@@ -174,6 +185,7 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
       unsub?.()
       inputDisp.dispose()
       resizeDisp.dispose()
+      scrollDisp.dispose()
       ro.disconnect()
       dispose()
       termRef.current = null
@@ -226,13 +238,31 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
   return (
     <div className="relative h-full w-full overflow-hidden bg-[var(--terminal-bg)]">
       {/* xterm fills the whole pane; typing and rendering are native. */}
+      {/* Inset (not padded): xterm's FitAddon reads the host's
+          border-box height, so with Tailwind's box-sizing:border-box it
+          ignores padding and overfits/clips the bottom row. Sizing the
+          host box itself via insets makes FitAddon fit exactly, giving
+          clean gaps on every side (incl. a real gap above the status
+          bar) and no clipped columns on the right. */}
       <div
         ref={hostRef}
-        className="absolute inset-0 overflow-hidden pl-6 pr-2 py-2"
+        className="absolute left-6 right-2 top-2 bottom-3 overflow-hidden"
       />
       {helmTerm && <TerminalScrollbar term={helmTerm.term} />}
       {searchOpen && helmTerm && (
         <SearchOverlay helm={helmTerm} onClose={() => setSearchOpen(false)} />
+      )}
+      {!atBottom && helmTerm && (
+        <button
+          type="button"
+          onClick={() => helmTerm.term.scrollToBottom()}
+          title="Jump to latest output"
+          className="absolute bottom-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-white/[0.08] bg-elevated py-1 pl-2.5 pr-3 text-[12px] text-text-secondary hover:text-text-primary"
+          style={{ boxShadow: 'var(--elevation-2)' }}
+        >
+          <ChevronDownIcon />
+          latest
+        </button>
       )}
     </div>
   )
@@ -263,4 +293,23 @@ function isUserKeystroke(data: string): boolean {
   // CPR / DSR response: `ESC [ row ; col R`
   if (/^\x1b\[\d+;\d+R$/.test(data)) return false
   return true
+}
+
+function ChevronDownIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m6 9 6 6 6-6" />
+    </svg>
+  )
 }
