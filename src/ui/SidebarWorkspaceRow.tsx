@@ -90,7 +90,7 @@ export function SidebarWorkspaceRow({
           onKill()
         }
       }}
-      className={`group flex h-[28px] w-full items-center gap-2 rounded-md pl-[22px] pr-2 ${bg}
+      className={`group flex h-[32px] w-full items-center gap-2 rounded-md pl-[22px] pr-2 ${bg}
                   hover:bg-white/[0.025]`}
     >
       {/* Chevron is its own click target — toggles expansion without
@@ -103,12 +103,17 @@ export function SidebarWorkspaceRow({
           e.stopPropagation()
           onToggleExpand?.()
         }}
-        className="cursor-pointer rounded-sm px-0.5 font-mono text-[10px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+        className="flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-sm text-text-tertiary hover:bg-white/[0.06] hover:text-text-secondary"
       >
-        {expanded ? '▾' : '▸'}
+        <span
+          className="font-mono text-[10px] leading-none transition-transform duration-150 ease-out"
+          style={{ transform: expanded ? 'rotate(90deg)' : 'none' }}
+        >
+          ▸
+        </span>
       </span>
       <span
-        className="font-mono text-[11px]"
+        className="font-mono text-[12px]"
         style={{ color: isActive ? 'var(--accent-text)' : 'var(--text-secondary)' }}
       >
         {icon}
@@ -130,14 +135,14 @@ export function SidebarWorkspaceRow({
             }
           }}
           onClick={(e) => e.stopPropagation()}
-          className="flex-1 rounded-sm bg-canvas px-1 text-[13px] text-text-primary outline-none ring-1 ring-accent focus:outline-none"
+          className="flex-1 rounded-sm bg-canvas px-1 text-[14px] text-text-primary outline-none ring-1 ring-accent focus:outline-none"
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
         />
       ) : (
         <span
-          className={`flex-1 truncate text-left text-[13px] ${isActive ? 'font-medium text-text-primary' : 'text-text-secondary'}`}
+          className={`flex-1 truncate text-left text-[14px] ${isActive ? 'font-medium text-text-primary' : 'text-text-secondary'}`}
         >
           {name}
         </span>

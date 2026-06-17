@@ -5,8 +5,10 @@
  * State semantics:
  *   - `running`   : a command is currently executing in this window
  *                   (live signal sourced from OSC 133 markers). Renders
- *                   a spinning glyph rather than a coloured dot — work
- *                   in progress reads as motion, not status.
+ *                   a soft grey dot with a slow breathe — work in
+ *                   progress reads as quietly *alive*, not as a status
+ *                   that competes for attention. Colour is reserved for
+ *                   states that actually need the user (attention/failed).
  *   - `attention` : a bell fired, the user is being summoned.
  *   - `failed`    : the most recent finished command exited non-zero.
  *   - `completed` : the most recent finished command exited cleanly.
@@ -38,19 +40,19 @@ export function ActivityDot({ state }: { state: ActivityDotState }) {
     return <span className="inline-block size-2" />
   }
   if (state === 'running') {
-    // Pure-CSS spinner: one Unicode glyph + rotate keyframe defined in
-    // index.css. No JS timer, no per-row React renders — the animation
-    // lives entirely in the compositor. `prefers-reduced-motion` hides
-    // the rotation but keeps the glyph visible (motion off, status on).
+    // Soft grey dot with a slow opacity breathe (keyframe in index.css).
+    // Pure CSS — no JS timer, no per-row React renders; the animation
+    // lives in the compositor even with many panes running at once.
+    // `prefers-reduced-motion` settles it to a static dot. Shares the
+    // idle grey so running/idle read as one calm family, distinguished
+    // only by the breathe.
     return (
       <span className="relative inline-block size-2 align-middle leading-none">
         <span
           aria-hidden
-          className="activity-running-spinner absolute -left-px -top-px inline-block text-[10px] leading-none text-text-tertiary"
-          style={{ transformOrigin: '50% 50%' }}
-        >
-          ◐
-        </span>
+          className="activity-running-pulse absolute left-px top-px size-1.5 rounded-full"
+          style={{ background: 'var(--activity-idle)' }}
+        />
       </span>
     )
   }

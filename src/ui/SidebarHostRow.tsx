@@ -69,7 +69,7 @@ export function SidebarHostRow({
           onContextMenu()
         }
       }}
-      className={`flex h-[30px] w-full items-center gap-2 rounded-md px-2 ${bg}
+      className={`flex h-[34px] w-full items-center gap-2 rounded-md px-2 ${bg}
                   text-text-primary hover:bg-white/[0.025]`}
     >
       <span
@@ -79,9 +79,14 @@ export function SidebarHostRow({
           e.stopPropagation()
           onToggleExpand?.()
         }}
-        className="cursor-pointer rounded-sm px-0.5 font-mono text-[10px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+        className="flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-sm text-text-tertiary hover:bg-white/[0.06] hover:text-text-secondary"
       >
-        {expanded ? '▾' : '▸'}
+        <span
+          className="font-mono text-[10px] leading-none transition-transform duration-150 ease-out"
+          style={{ transform: expanded ? 'rotate(90deg)' : 'none' }}
+        >
+          ▸
+        </span>
       </span>
       <span
         role={onConnect ? 'button' : undefined}
@@ -99,7 +104,7 @@ export function SidebarHostRow({
       >
         <StatusDot state={status} />
       </span>
-      <span className="flex-1 truncate text-left text-[13px] font-medium">{name}</span>
+      <span className="flex-1 truncate text-left text-[14px] font-medium">{name}</span>
       {notificationCount > 0 && (
         <span
           className="rounded-full px-1.5 py-0.5 font-mono text-[9px] leading-none"

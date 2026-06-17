@@ -72,17 +72,19 @@ button:not(:disabled),
 }
 
 /*
- * ActivityDot 'running' state — pure-CSS rotation. One glyph, one
- * keyframe, animation lives in the compositor so per-row React
- * renders stay idle even when many panes are running concurrently.
+ * ActivityDot 'running' state — a slow opacity breathe on a soft grey
+ * dot. Calm "work in progress" signal that doesn't compete with the
+ * coloured attention/failed dots. Pure CSS, runs in the compositor so
+ * per-row React renders stay idle even with many panes running at once.
+ * Reduced-motion settles it to a steady, legible dot.
  */
-@keyframes activity-running-spin {
-  from { transform: rotate(0deg); }
-  to   { transform: rotate(360deg); }
+@keyframes activity-running-pulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 0.85; }
 }
-.activity-running-spinner {
-  animation: activity-running-spin 1s linear infinite;
+.activity-running-pulse {
+  animation: activity-running-pulse 1.6s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .activity-running-spinner { animation: none; }
+  .activity-running-pulse { animation: none; opacity: 0.6; }
 }

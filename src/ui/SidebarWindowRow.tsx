@@ -114,10 +114,10 @@ export function SidebarWindowRow({
         e.stopPropagation()
         setMenu({ x: e.clientX, y: e.clientY })
       }}
-      className={`group relative flex h-[26px] w-full items-center gap-2 rounded-md pl-[54px] pr-2 ${bg} ${focused ? '' : 'hover:bg-white/[0.025]'}`}
+      className={`group relative flex h-[30px] w-full items-center gap-2 rounded-md pl-[64px] pr-2 ${bg} ${focused ? '' : 'hover:bg-white/[0.025]'}`}
     >
       <span
-        className="font-mono text-[11px] leading-none"
+        className="font-mono text-[12px] leading-none"
         style={{ color: focused ? 'var(--accent-text)' : 'var(--text-tertiary)' }}
       >
         ▢
@@ -142,7 +142,7 @@ export function SidebarWindowRow({
             }
           }}
           onClick={(e) => e.stopPropagation()}
-          className="flex-1 rounded-sm bg-canvas px-1 text-[12px] text-text-primary outline-none ring-1 ring-accent focus:outline-none"
+          className="flex-1 rounded-sm bg-canvas px-1 text-[14px] text-text-primary outline-none ring-1 ring-accent focus:outline-none"
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
@@ -150,12 +150,13 @@ export function SidebarWindowRow({
       ) : (
         <>
           <span
-            className={`text-[12px] ${focused ? 'font-medium text-text-primary' : 'text-text-secondary'}`}
+            className={`min-w-0 shrink truncate text-[14px] ${focused ? 'font-medium text-text-primary' : 'text-text-secondary'}`}
+            title={name}
           >
             {name}
           </span>
           <span
-            className="flex-1 truncate text-left font-mono text-[10px] text-text-tertiary"
+            className="min-w-0 flex-1 truncate text-left font-mono text-[11px] text-text-tertiary"
             title={label || undefined}
           >
             {label}
@@ -169,7 +170,7 @@ export function SidebarWindowRow({
                 e.stopPropagation()
                 onKill()
               }}
-              className="cursor-pointer rounded-sm px-1 font-mono text-[12px] leading-none text-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 hover:bg-white/[0.06] hover:text-text-secondary"
+              className="shrink-0 cursor-pointer rounded-sm px-1 font-mono text-[12px] leading-none text-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 hover:bg-white/[0.06] hover:text-text-secondary"
             >
               ×
             </span>

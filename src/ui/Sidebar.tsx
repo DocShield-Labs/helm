@@ -279,7 +279,7 @@ function ExpandedSidebar({
                     {expanded && (
                       <>
                         {winsForWs.length === 0 ? (
-                          <div className="px-3 py-2 font-mono text-[11px] text-text-tertiary">
+                          <div className="px-3 py-2 font-mono text-[12px] text-text-tertiary">
                             no windows
                           </div>
                         ) : (
@@ -330,7 +330,7 @@ function ExpandedSidebar({
             {hostExpanded && sidebarViewMode === 'workspace' && (
               <button
                 type="button"
-                className="rounded-md px-2 py-1 text-left font-mono text-[11px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+                className="rounded-md px-2 py-1.5 text-left font-mono text-[13px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
                 onClick={() => onCreateWorkspace(h.id)}
                 title="Cmd+Shift+T"
               >
@@ -340,7 +340,7 @@ function ExpandedSidebar({
             {hostExpanded && sidebarViewMode === 'folder' && (
               <button
                 type="button"
-                className="rounded-md px-2 py-1 text-left font-mono text-[11px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+                className="rounded-md px-2 py-1.5 text-left font-mono text-[13px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
                 onClick={() => {
                   setActiveHost(h.id)
                   void createFolderWindow(h.id)
@@ -359,14 +359,14 @@ function ExpandedSidebar({
         screen position matches the expand chevron in the collapsed
         rail. Right-aligned so the ⇤ glyph (pointing left) anchors at
         the right edge it's pointing away from. */}
-    <div className="flex shrink-0 justify-end px-3 pt-1 pb-2">
+    <div className="flex shrink-0 justify-end px-2 pt-1 pb-2">
       <button
         type="button"
         onClick={onCollapse}
-        className="rounded-sm px-2 py-1 font-mono text-[12px] leading-none text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+        className="flex h-8 w-8 items-center justify-center rounded-md text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
         title="Collapse sidebar (⌘\)"
       >
-        ⇤
+        <ChevronsLeftIcon />
       </button>
     </div>
     </>
@@ -393,10 +393,10 @@ function SectionHeader({ label, count, collapsed, onToggle, rightAffordance }: S
       className="group flex cursor-pointer items-center justify-between rounded-sm pb-1 pt-2 pl-1 pr-1 hover:bg-white/[0.02]"
     >
       <span className="flex items-center gap-1.5">
-        <span className="inline-block w-3 text-center font-mono text-[10px] leading-none text-text-tertiary">
+        <span className="inline-block w-3 text-center font-mono text-[11px] leading-none text-text-tertiary">
           {collapsed ? '▸' : '▾'}
         </span>
-        <span className="text-[10px] font-medium tracking-[0.08em] text-text-tertiary">
+        <span className="text-[11px] font-medium tracking-[0.08em] text-text-tertiary">
           {label}
           {count !== undefined && count > 0 && (
             <span className="ml-1.5 font-mono text-text-tertiary opacity-70">{count}</span>
@@ -555,10 +555,10 @@ function CollapsedSidebar({
       <button
         type="button"
         onClick={onExpand}
-        className="flex h-8 w-8 items-center justify-center rounded-md font-mono text-[12px] text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
+        className="flex h-8 w-8 items-center justify-center rounded-md text-text-tertiary hover:bg-white/[0.04] hover:text-text-secondary"
         title="Expand sidebar (⌘\)"
       >
-        ⇥
+        <ChevronsRightIcon />
       </button>
 
       {peekHost && (
@@ -805,6 +805,50 @@ function FolderIcon({ size = 12 }: { size?: number }) {
       aria-hidden="true"
     >
       <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+    </svg>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar collapse/expand glyphs — Lucide `chevrons-left` / `chevrons-right`.
+// A crisp 2px-stroke icon reads as a real control at small sizes, where a
+// thin Unicode arrow (⇤/⇥) looks tiny and incidental no matter the button.
+function ChevronsLeftIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m11 17-5-5 5-5" />
+      <path d="m18 17-5-5 5-5" />
+    </svg>
+  )
+}
+
+function ChevronsRightIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m6 17 5-5-5-5" />
+      <path d="m13 17 5-5-5-5" />
     </svg>
   )
 }
