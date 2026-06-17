@@ -671,7 +671,15 @@ impl TmuxClient {
             })
             .unwrap_or_default();
 
-        Ok(format!("{capture}{cursor}"))
+        // Reset the SGR pen after the snapshot. `capture-pane -e` emits
+        // colors inline per cell but doesn't guarantee a trailing reset,
+        // so the dump can leave xterm's *current* pen in whatever color
+        // the last captured cell used (e.g. blue in Claude's UI, a dim
+        // gray at a shell). Without this, the first characters the user
+        // types echo in that stale color until the program redraws —
+        // the "random gray/blue text on a new pane" glitch. The already
+        // rendered cells keep their inline colors; only the pen resets.
+        Ok(format!("{capture}\x1b[0m{cursor}"))
     }
 
     /// Resize the *control client* to the given dimensions. For control
