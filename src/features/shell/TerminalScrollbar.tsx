@@ -11,7 +11,7 @@
  *      position).
  *
  * This component renders a slim track + thumb absolutely positioned in
- * the pane's right gutter at z-30 (above `BlockOverlay` z-10), reads
+ * the pane's right gutter at z-30, reads
  * `term.buffer.active.viewportY` for thumb position, and routes
  * mouse-drag → `term.scrollLines()` for grabbing. xterm's own
  * scrollbar is hidden via CSS in `index.css` so the two don't fight

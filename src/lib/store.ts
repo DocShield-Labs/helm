@@ -283,16 +283,6 @@ interface HelmState {
   setPaneCapture: (host: HostId, paneId: string, data: string, hasScrollback: boolean) => void
   clearPaneCapturesForHost: (host: HostId) => void
 
-  // ---------- per-pane block selection (Phase 4F) ----------
-  /** Currently-selected block id per pane, keyed by
-   * `${hostId}::${paneId}`. Drives the Cmd+Up/Down/C/Shift+C/R block
-   * action keymap in `TmuxPane`. The block list itself lives in the
-   * pane's local React state (no need to round-trip through Zustand
-   * for that — only the selection cursor needs to be addressable from
-   * outside the component). */
-  perPaneSelectedBlock: Map<string, string | null>
-  setSelectedBlock: (host: HostId, paneId: string, blockId: string | null) => void
-
   // ---------- per-host sessions ----------
   sessions: Map<HostId, HostSessions>
 
@@ -854,18 +844,6 @@ export const useStore = create<HelmState>((set, get) => ({
         if (!k.startsWith(prefix)) next.set(k, v)
       }
       return next.size === s.paneCaptures.size ? {} : { paneCaptures: next }
-    }),
-
-  perPaneSelectedBlock: new Map(),
-  setSelectedBlock: (host, paneId, blockId) =>
-    set((s) => {
-      const key = `${host}::${paneId}`
-      const prev = s.perPaneSelectedBlock.get(key) ?? null
-      if (prev === blockId) return {}
-      const next = new Map(s.perPaneSelectedBlock)
-      if (blockId === null) next.delete(key)
-      else next.set(key, blockId)
-      return { perPaneSelectedBlock: next }
     }),
 
   sessions: new Map(),
