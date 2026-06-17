@@ -155,7 +155,7 @@ export function InboxSection() {
     <div className="flex flex-col gap-1">
       {hasItems && (
         <div className="group flex items-center justify-between pb-1 pt-1 pl-2 pr-1">
-          <span className="text-[10px] font-medium tracking-[0.08em] text-text-tertiary">
+          <span className="text-[11px] font-medium tracking-[0.08em] text-text-tertiary">
             INBOX · {list.length}
           </span>
           <button
@@ -267,10 +267,10 @@ function InboxRow({
             boxShadow: `0 0 4px 0 ${tone.color}80`,
           }}
         />
-        <span className="flex-1 truncate text-[12px] text-text-primary">
+        <span className="flex-1 truncate text-[14px] text-text-primary">
           {windowName}
         </span>
-        <span className="shrink-0 font-mono text-[10px] text-text-tertiary">
+        <span className="shrink-0 font-mono text-[11px] text-text-tertiary">
           {timeAgo(Date.now() - n.updated_at)}
           {n.count > 1 ? ` · ×${n.count}` : ''}
         </span>
@@ -290,14 +290,14 @@ function InboxRow({
       <div className="flex items-center gap-2 pl-4">
         {n.kind.kind === 'schedule_failed' ? (
           <span
-            className="truncate text-left font-mono text-[10px] text-status-error"
+            className="truncate text-left font-mono text-[11px] text-status-error"
             title={n.kind.reason}
           >
             {host?.name ?? '?'} · {n.kind.reason}
           </span>
         ) : (
           <span
-            className="truncate text-left font-mono text-[10px] text-text-tertiary"
+            className="truncate text-left font-mono text-[11px] text-text-tertiary"
             title={cwd || undefined}
           >
             {host?.name ?? '?'}

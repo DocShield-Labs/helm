@@ -335,7 +335,7 @@ export function App() {
       >
         <span
           data-tauri-drag-region
-          className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-[11px] text-text-tertiary"
+          className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-[12px] text-text-tertiary"
         >
           {activeHost?.name ?? '—'} · {activeWorkspace?.name ?? '—'} ·{' '}
           {activeWindow?.name ?? '—'}
@@ -412,7 +412,7 @@ export function App() {
         </main>
       </div>
 
-      <footer className="flex h-7 items-center border-t border-white/[0.08] bg-sidebar px-1">
+      <footer className="flex h-8 items-center border-t border-white/[0.08] bg-sidebar px-1">
         <StatusBarHostSegment
           hostName={activeHost?.name ?? '—'}
           state={
@@ -423,13 +423,13 @@ export function App() {
         />
         <StatusBarDivider />
         <StatusBarSegment>
-          <span className="font-mono text-[11px] text-text-secondary">◫</span>
-          <span className="text-[11px] text-text-primary">{activeWorkspace?.name ?? '—'}</span>
+          <span className="font-mono text-[12px] text-text-secondary">◫</span>
+          <span className="text-[12px] text-text-primary">{activeWorkspace?.name ?? '—'}</span>
         </StatusBarSegment>
         <StatusBarDivider />
         <StatusBarSegment>
-          <span className="font-mono text-[11px] text-text-secondary">▢</span>
-          <span className="text-[11px] text-text-primary">{activeWindow?.name ?? '—'}</span>
+          <span className="font-mono text-[12px] text-text-secondary">▢</span>
+          <span className="text-[12px] text-text-primary">{activeWindow?.name ?? '—'}</span>
         </StatusBarSegment>
         {activePane?.cwd && (
           <>
@@ -442,7 +442,7 @@ export function App() {
               }
               title={activeHost?.port === 0 ? 'Reveal in Finder' : undefined}
             >
-              <span className="font-mono text-[11px] text-text-secondary">
+              <span className="font-mono text-[12px] text-text-secondary">
                 {prettyPath(activePane.cwd)}
               </span>
             </StatusBarSegment>
@@ -452,8 +452,8 @@ export function App() {
         {activePane?.branch && (
           <>
             <StatusBarSegment>
-              <span className="font-mono text-[11px] text-text-secondary">⎇</span>
-              <span className="font-mono text-[11px] text-text-tertiary">
+              <span className="font-mono text-[12px] text-text-secondary">⎇</span>
+              <span className="font-mono text-[12px] text-text-tertiary">
                 {activePane.branch}
               </span>
             </StatusBarSegment>
@@ -462,8 +462,8 @@ export function App() {
         )}
         {activeHost && (activeStatus === 'connected' || activeStatus === 'idle') && (
           <StatusBarSegment>
-            <span className="font-mono text-[11px] text-text-secondary">⇄</span>
-            <span className="font-mono text-[11px] text-text-tertiary">
+            <span className="font-mono text-[12px] text-text-secondary">⇄</span>
+            <span className="font-mono text-[12px] text-text-tertiary">
               {activeHost.port === 0
                 ? 'local'
                 : formatLatency(hostLatencies.get(activeHost.id))}
