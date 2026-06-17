@@ -7,6 +7,7 @@
 
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { commands } from '@lib/ipc'
@@ -28,6 +29,10 @@ export type { Theme } from './themes'
 export interface HelmTerminal {
   term: Terminal
   fit: FitAddon
+  /** In-pane find (Cmd+F). The SearchOverlay drives findNext/findPrevious
+   * and reads match counts via `onDidChangeResults`. Decorations are
+   * passed per-call by the overlay so highlight colours track the theme. */
+  search: SearchAddon
   /** Pixel size of one xterm cell, measured from `.xterm-screen / rows`
    * to bypass CSS line-height rounding. Returns the latest value cached
    * by the internal ResizeObserver — single source of truth shared
@@ -70,6 +75,24 @@ export function setThemeForAllTerminals(theme: Theme): void {
 
 export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): HelmTerminal {
   const initialTheme = opts.theme ?? getTheme(undefined)
+
+  // Shared open path for both link mechanisms below (plain-text URLs via
+  // WebLinksAddon, and OSC 8 escape-sequence hyperlinks via linkHandler).
+  // Tauri's webview blocks window.open, so everything routes through the
+  // Rust open_url command unless the caller overrides.
+  const openLink = (uri: string) => {
+    if (opts.onLinkClick) {
+      opts.onLinkClick(uri)
+      return
+    }
+    commands.openUrl(uri).then(
+      (res) => {
+        if (res.status !== 'ok') console.error('[helm] open_url rejected:', res.error)
+      },
+      (err) => console.error('[helm] open_url threw:', err),
+    )
+  }
+
   const term = new Terminal({
     // Lifted from Warp's defaults (app/src/settings/font.rs:11-13):
     //   font: Hack, size: 13, line-height ratio: 1.2.
@@ -90,6 +113,16 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     rescaleOverlappingGlyphs: true,
     theme: xtermThemeFor(initialTheme),
     allowProposedApi: true,
+    // OSC 8 hyperlinks (`ESC ] 8 ; ; URL ST  label  ESC ] 8 ; ; ST`).
+    // Programs like Claude Code emit links this way — a styled label with
+    // the URL carried in the escape sequence rather than printed as raw
+    // text. xterm parses them but only makes them clickable when a
+    // linkHandler is set; without this they render as inert styled text.
+    // (WebLinksAddon below is the *other* path: plain-text URLs like the
+    // raw PR link `gh` prints.)
+    linkHandler: {
+      activate: (_event, uri) => openLink(uri),
+    },
     // tmux's protocol output uses bare LF, not CRLF — xterm needs to translate
     // so the cursor returns to column 0 on each newline. Disable this and
     // every line drifts right by the previous line's length.
@@ -106,6 +139,11 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   const fit = new FitAddon()
   term.loadAddon(fit)
 
+  // In-pane find. Loaded eagerly (cheap) so Cmd+F is instant; the
+  // overlay UI (SearchOverlay) is what's lazily mounted on demand.
+  const search = new SearchAddon()
+  term.loadAddon(search)
+
   // WebLinks: detect http(s) URLs in output and make them clickable.
   // Phase 4F polish: a custom matcher for `path:line` references is
   // layered on top in the consuming pane (TmuxPane) so we keep this
@@ -120,22 +158,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // clicks are forwarded to the app and never reach this handler —
   // see `macOptionClickForcesSelection` above; user holds Option and
   // clicks to bypass.
-  const links = new WebLinksAddon((_event, uri) => {
-    if (opts.onLinkClick) {
-      opts.onLinkClick(uri)
-      return
-    }
-    commands.openUrl(uri).then(
-      (res) => {
-        if (res.status !== 'ok') {
-          console.error('[helm] open_url rejected:', res.error)
-        }
-      },
-      (err) => {
-        console.error('[helm] open_url threw:', err)
-      },
-    )
-  })
+  const links = new WebLinksAddon((_event, uri) => openLink(uri))
   term.loadAddon(links)
 
   // Translate a few macOS-standard editing chords into the bytes
@@ -300,6 +323,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   const helm: HelmTerminal = {
     term,
     fit,
+    search,
     getCellSize: () => ({ width: cachedCellW, height: cachedCellH }),
     setTheme: (theme: Theme) => {
       term.options.theme = xtermThemeFor(theme)

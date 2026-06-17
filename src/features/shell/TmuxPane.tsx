@@ -29,6 +29,7 @@ import { subscribePaneOutput } from '@lib/host'
 import { useStore } from '@lib/store'
 import type { HostId } from '@bindings'
 import { TerminalScrollbar } from './TerminalScrollbar'
+import { SearchOverlay } from './SearchOverlay'
 
 interface TmuxPaneProps {
   hostId: HostId
@@ -49,6 +50,7 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
   // the scrollbar once xterm exists (and remount it if the term identity
   // changes on a hostId/paneId swap).
   const [helmTerm, setHelmTerm] = useState<ReturnType<typeof attachTerminal> | null>(null)
+  const [searchOpen, setSearchOpen] = useState(false)
 
   const paneKey = `${hostId}::${paneId}`
 
@@ -199,6 +201,28 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
     attached.term.focus()
   }, [isVisible])
 
+  // Cmd+F opens in-pane find. Only the visible pane listens (others are
+  // kept-alive but hidden). xterm's custom key handler returns false for
+  // meta chords, so the event reaches this window-level listener. We
+  // claim it (preventDefault) so the webview's native find doesn't fire.
+  useEffect(() => {
+    if (!isVisible) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        !e.shiftKey &&
+        !e.altKey &&
+        (e.key === 'f' || e.key === 'F')
+      ) {
+        e.preventDefault()
+        e.stopPropagation()
+        setSearchOpen(true)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [isVisible])
+
   return (
     <div className="relative h-full w-full overflow-hidden bg-[var(--terminal-bg)]">
       {/* xterm fills the whole pane; typing and rendering are native. */}
@@ -207,6 +231,9 @@ export function TmuxPane({ hostId, paneId, isVisible = true }: TmuxPaneProps) {
         className="absolute inset-0 overflow-hidden pl-6 pr-2 py-2"
       />
       {helmTerm && <TerminalScrollbar term={helmTerm.term} />}
+      {searchOpen && helmTerm && (
+        <SearchOverlay helm={helmTerm} onClose={() => setSearchOpen(false)} />
+      )}
     </div>
   )
 }
