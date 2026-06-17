@@ -9,9 +9,16 @@
 //!   - `Stop` — Claude finished a turn. Surfaces "task done" without
 //!     the user having to keep that pane focused.
 //!
-//! Both hooks are `printf '\a' > /dev/tty 2>/dev/null || true` — the
-//! universal "ring my terminal" line, with the `|| true` so a hook
-//! failure (e.g. headless run, no tty) doesn't break Claude's flow.
+//! Both hooks resolve Claude's tmux pane (`$TMUX_PANE`, which tmux sets
+//! for every process in a pane) to its tty and write a BEL there; tmux
+//! relays the BEL as `%output`, which the inbox picks up.
+//!
+//! NB: we deliberately do *not* use `printf '\a' > /dev/tty`. Claude
+//! runs hook commands with **no controlling terminal**, so `/dev/tty`
+//! doesn't exist and the write silently fails — earlier versions
+//! shipped exactly that and the bell never fired. Writing to the pane's
+//! tty (resolved via tmux) is the reliable path. See `HOOK_CMD`.
+//! Install migrates those legacy broken hooks away (`LEGACY_HOOK_CMDS`).
 //!
 //! ## Idempotency strategy
 //!
@@ -52,10 +59,40 @@ use helm_tmux::TmuxClient;
 
 use super::ToolIntegration;
 
-/// Stable ids for our two hooks. Matches what we write into the
-/// settings file. If we ever change the BEL command, bump these so
-/// is_installed/uninstall match the right thing.
-const HOOK_CMD: &str = r#"printf '\a' > /dev/tty 2>/dev/null || true"#;
+/// Sentinel embedded as a trailing comment in our hook command so we
+/// can recognize hooks we wrote regardless of the exact tmux path the
+/// rest of the line resolves to. Bump only if the recognition scheme
+/// changes — not for ordinary command tweaks.
+const HOOK_SENTINEL: &str = "helm-claude-notify";
+
+/// The hook command we install for both `Notification` and `Stop`.
+///
+/// Resolves `$TMUX_PANE` (set by tmux for every process in a pane) to
+/// the pane's tty via `tmux display-message`, then writes a BEL to that
+/// tty. tmux relays the BEL as `%output`, which the inbox picks up.
+///
+/// `command -v tmux` covers the common case; the fallback loop handles a
+/// minimal hook `PATH`. The leading `[ -n "$p" ]` guard makes this a
+/// no-op outside tmux, and the trailing `; true` keeps the hook's exit
+/// status 0 so a miss never disrupts Claude's flow. The trailing comment
+/// is the recognition sentinel — see `HOOK_SENTINEL`.
+const HOOK_CMD: &str = r#"p="$TMUX_PANE"; [ -n "$p" ] && { tm=$(command -v tmux 2>/dev/null); [ -z "$tm" ] && for c in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do [ -x "$c" ] && tm="$c" && break; done; t=$("$tm" display-message -p -t "$p" '#{pane_tty}' 2>/dev/null) && [ -n "$t" ] && printf '\a' > "$t" 2>/dev/null; }; true # helm-claude-notify"#;
+
+/// Hook commands we wrote in earlier versions and should clean up on
+/// install/uninstall. The `/dev/tty` line is the broken one that never
+/// fired (no controlling terminal in a hook).
+const LEGACY_HOOK_CMDS: &[&str] = &[r#"printf '\a' > /dev/tty 2>/dev/null || true"#];
+
+/// True if `cmd` is the current (working) hook we install.
+fn command_is_current(cmd: &str) -> bool {
+    cmd.contains(HOOK_SENTINEL)
+}
+
+/// True if `cmd` is any hook we own — the current one or a legacy
+/// version we should migrate away.
+fn command_is_ours(cmd: &str) -> bool {
+    command_is_current(cmd) || LEGACY_HOOK_CMDS.contains(&cmd)
+}
 
 pub struct ClaudeCodeIntegration;
 
@@ -224,34 +261,31 @@ fn parse_or_empty(s: &str) -> Result<Value, String> {
 }
 
 /// True iff the value has a hooks.<event>[*].hooks[*] entry whose
-/// `command` field equals our HOOK_CMD. Ignores other hook entries
-/// (the user may have their own).
+/// `command` field is our *current* hook (carries `HOOK_SENTINEL`).
+/// Legacy broken hooks deliberately don't count — so `is_installed`
+/// returns false for them and the install path runs to migrate them.
+/// Ignores unrelated hook entries (the user may have their own).
 fn has_hook(value: &Value, event: &str) -> bool {
-    let Some(events) = value.pointer(&format!("/hooks/{event}")) else {
+    let Some(arr) = value.pointer(&format!("/hooks/{event}")).and_then(|e| e.as_array()) else {
         return false;
     };
-    let Some(arr) = events.as_array() else {
-        return false;
-    };
-    for matcher in arr {
-        let Some(hooks) = matcher.get("hooks").and_then(|h| h.as_array()) else {
-            continue;
-        };
-        for hook in hooks {
-            if hook.get("command").and_then(|c| c.as_str()) == Some(HOOK_CMD) {
-                return true;
-            }
-        }
-    }
-    false
+    arr.iter().any(|matcher| {
+        matcher
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|hook| hook.get("command").and_then(|c| c.as_str()))
+            .any(command_is_current)
+    })
 }
 
-/// Append our hook for `event` if not already present. Creates the
-/// nested structure as needed; never touches sibling keys.
+/// Append our current hook for `event`. First strips any hook we own
+/// (current or legacy) so re-install both de-duplicates and migrates an
+/// out-of-date/broken command to the latest. Creates the nested
+/// structure as needed; never touches the user's own hooks.
 fn ensure_hook(value: &mut Value, event: &str) {
-    if has_hook(value, event) {
-        return;
-    }
+    remove_hook(value, event);
     // Coerce root to object.
     if !value.is_object() {
         *value = Value::Object(Default::default());
@@ -278,11 +312,11 @@ fn ensure_hook(value: &mut Value, event: &str) {
     }));
 }
 
-/// Drop any matcher whose `hooks` array references our HOOK_CMD —
-/// drop the entire matcher (not just our hook entry within it),
-/// because we always create a dedicated matcher when installing.
-/// This means uninstall preserves user-authored matchers that include
-/// other hooks but not ours.
+/// Drop any matcher whose `hooks` array references a command we own —
+/// current *or* legacy. Drops the entire matcher (not just our hook
+/// entry within it), because we always create a dedicated matcher when
+/// installing. Preserves user-authored matchers that contain only their
+/// own hooks. Used by both uninstall and (for migration/dedupe) install.
 fn remove_hook(value: &mut Value, event: &str) {
     let Some(arr) = value
         .pointer_mut(&format!("/hooks/{event}"))
@@ -294,14 +328,10 @@ fn remove_hook(value: &mut Value, event: &str) {
         let Some(hooks) = matcher.get("hooks").and_then(|h| h.as_array()) else {
             return true;
         };
-        // Keep matcher unless ALL of its hooks are ours (we own the
-        // matcher) or it's a single matcher containing only our hook.
-        // For simplicity in v1: drop any matcher containing our hook
-        // command. Since install always creates a dedicated matcher
-        // with just our hook, this matches what we wrote.
         !hooks
             .iter()
-            .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(HOOK_CMD))
+            .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+            .any(command_is_ours)
     });
 }
 
@@ -399,6 +429,67 @@ mod tests {
         assert_eq!(arr.len(), 1);
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("attention"));
+    }
+
+    #[test]
+    fn current_hook_writes_pane_tty_not_dev_tty() {
+        // Guard against regressing to the broken `/dev/tty` command.
+        assert!(HOOK_CMD.contains("$TMUX_PANE"));
+        assert!(HOOK_CMD.contains("pane_tty"));
+        assert!(!HOOK_CMD.contains("/dev/tty"));
+        assert!(command_is_current(HOOK_CMD));
+    }
+
+    #[test]
+    fn install_migrates_legacy_broken_hook() {
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "hooks": {
+                    "Notification": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "printf '\\a' > /dev/tty 2>/dev/null || true"
+                        }]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        // Legacy broken hook present, but not recognized as "installed".
+        assert!(!has_hook(&v, "Notification"), "legacy doesn't count as installed");
+        ensure_hook(&mut v, "Notification");
+        assert!(has_hook(&v, "Notification"), "current hook now installed");
+        let arr = v
+            .pointer("/hooks/Notification")
+            .and_then(|n| n.as_array())
+            .unwrap();
+        assert_eq!(arr.len(), 1, "legacy replaced, not duplicated");
+        let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains(HOOK_SENTINEL), "carries sentinel");
+        assert!(!cmd.contains("/dev/tty"), "broken command gone");
+    }
+
+    #[test]
+    fn uninstall_removes_legacy_too() {
+        let mut v: Value = serde_json::from_str(
+            r#"{
+                "hooks": {
+                    "Stop": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "printf '\\a' > /dev/tty 2>/dev/null || true"
+                        }]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        remove_hook(&mut v, "Stop");
+        let arr = v
+            .pointer("/hooks/Stop")
+            .and_then(|n| n.as_array())
+            .unwrap();
+        assert!(arr.is_empty(), "legacy broken hook cleaned up on uninstall");
     }
 
     #[test]
