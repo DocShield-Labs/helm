@@ -49,3 +49,15 @@ jobs:
           # crates/helm-app/tauri.conf.json itself. Run it through bun so
           # it uses the project-local CLI.
           tauriScript: bun tauri
+
+      # Evergreen download URL. The DMG tauri produces is version-stamped
+      # (Helm_0.1.0_aarch64.dmg), which breaks any pinned link the moment
+      # the next release ships. Upload a stable-named copy so
+      # releases/latest/download/Helm_aarch64.dmg always works in docs.
+      - name: Upload evergreen DMG alias
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dmg=$(find target/release/bundle/dmg -name '*.dmg' | head -n1)
+          cp "$dmg" Helm_aarch64.dmg
+          gh release upload "$GITHUB_REF_NAME" Helm_aarch64.dmg --clobber
