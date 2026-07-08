@@ -28,6 +28,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail fast if the tag and config disagree. The updater only offers
+      # versions greater than the installed one, so tagging v0.2.0 while
+      # tauri.conf.json still says 0.1.0 would publish a release that no
+      # install ever sees — silently.
+      - name: Verify tag matches tauri.conf.json version
+        run: |
+          conf=$(python3 -c "import json; print(json.load(open('crates/helm-app/tauri.conf.json'))['version'])")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$conf" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME ≠ tauri.conf.json version $conf — bump the config before tagging."
+            exit 1
+          fi
+
       - uses: oven-sh/setup-bun@v2
 
       - uses: dtolnay/rust-toolchain@stable
