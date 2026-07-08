@@ -197,6 +197,13 @@ pub struct AppState {
     /// the sleep early and resets the backoff index.
     pub network_online: watch::Receiver<bool>,
 
+    /// System wake watch — a generation counter bumped each time the
+    /// machine resumes from sleep. The reconnect supervisor selects on
+    /// this while connected: on wake it probes the SSH session and
+    /// forces an immediate reconnect if the probe fails, instead of
+    /// waiting out the SSH keepalive window.
+    pub wake_signal: watch::Receiver<u64>,
+
     /// All live inbox notifications, keyed by id. Coalesce semantics
     /// (one per pane, latest event wins, repeated same-kind bumps a
     /// counter) live in `crate::notifications` — this map is just the
@@ -373,6 +380,7 @@ impl Default for AppState {
             event_tx: Mutex::new(None),
             pending_host_key_prompts: Arc::new(DashMap::new()),
             network_online: crate::reachability::spawn(),
+            wake_signal: crate::power::spawn(),
             notifications: Arc::new(DashMap::new()),
             notification_by_pane: Arc::new(DashMap::new()),
             pane_runtime: Arc::new(DashMap::new()),

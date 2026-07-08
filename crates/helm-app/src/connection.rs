@@ -52,6 +52,7 @@ pub(crate) async fn do_connect(
     bootstrap_workspace: Option<String>,
     prompter: Arc<dyn HostKeyPrompter>,
     network_online: watch::Receiver<bool>,
+    wake_signal: watch::Receiver<u64>,
     notif_ctx: NotificationsCtx,
 ) -> Result<(), String> {
     // Serialize connect attempts for this host. Held for the full
@@ -222,6 +223,7 @@ pub(crate) async fn do_connect(
                 prompter,
                 sup_rx,
                 network_online,
+                wake_signal,
                 notif_ctx,
             ));
             {
@@ -443,15 +445,72 @@ async fn supervise(
     prompter: Arc<dyn HostKeyPrompter>,
     mut sup_rx: mpsc::UnboundedReceiver<SupervisorSignal>,
     mut network_online: watch::Receiver<bool>,
+    mut wake_signal: watch::Receiver<u64>,
     notif_ctx: NotificationsCtx,
 ) {
     const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 30];
+    /// How long the post-wake liveness probe waits before declaring the
+    /// SSH session dead. Generous enough for a slow WiFi re-association
+    /// after wake; on a genuinely dead session the probe request just
+    /// queues into the frozen socket and never answers.
+    const WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
     let mut attempt = 0u32;
     let mut last_error: Option<String> = None;
+    // Defensive: if the wake watch ever closes (power thread failed to
+    // register), stop selecting on it — a closed watch resolves
+    // instantly and would spin the loop.
+    let mut wake_alive = true;
+    // A fresh receiver may carry a wake that predates this connection;
+    // mark current as seen so we only probe on wakes from now on.
+    let _ = wake_signal.borrow_and_update();
 
     loop {
-        // ----- handle signals from forwarders until everyone's dead -----
-        while let Some(signal) = sup_rx.recv().await {
+        // ----- handle signals from forwarders until everyone's dead,
+        //       probing SSH liveness on every system wake -----
+        loop {
+            let signal = tokio::select! {
+                signal = sup_rx.recv() => signal,
+                res = wake_signal.changed(), if wake_alive => {
+                    if res.is_err() {
+                        wake_alive = false;
+                        continue;
+                    }
+                    // System resumed from sleep: every TCP connection is
+                    // suspect (the remote may have RST us while we were
+                    // out, and the local kernel wouldn't know). Probe the
+                    // SSH session with a cheap oneshot instead of waiting
+                    // ~45s for the keepalive ladder to notice.
+                    let ssh = entry.lock().await.ssh.clone();
+                    let Some(ssh) = ssh else {
+                        continue; // local host — sleep can't kill it
+                    };
+                    tracing::info!(
+                        "supervisor: system wake; probing ssh liveness for {host_id:?}"
+                    );
+                    let probe = tokio::time::timeout(
+                        WAKE_PROBE_TIMEOUT,
+                        tokio::task::spawn_blocking(move || ssh.run_oneshot("true".into())),
+                    )
+                    .await;
+                    match probe {
+                        Ok(Ok(Ok(_))) => {
+                            tracing::debug!(
+                                "supervisor: post-wake probe ok for {host_id:?}"
+                            );
+                            continue;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "supervisor: post-wake probe failed for {host_id:?}; forcing reconnect"
+                            );
+                            break; // into the reconnect ladder below
+                        }
+                    }
+                }
+            };
+            let Some(signal) = signal else {
+                break; // sup_rx closed — all senders gone
+            };
             match signal {
                 SupervisorSignal::ClientDied(session_id) => {
                     let (now_empty, was_primary) = {
@@ -566,6 +625,17 @@ async fn supervise(
                     tracing::debug!("reachability woke supervisor for {host_id:?}; resetting backoff");
                     attempt = 0;
                     continue;
+                }
+            }
+            res = wake_signal.changed(), if wake_alive => {
+                // System wake during backoff (e.g. slept mid-ladder in
+                // the 30s bucket): the network is likely back — skip the
+                // rest of the wait and retry immediately.
+                if res.is_ok() {
+                    tracing::debug!("system wake woke supervisor for {host_id:?}; retrying now");
+                    attempt = 0;
+                } else {
+                    wake_alive = false;
                 }
             }
         }

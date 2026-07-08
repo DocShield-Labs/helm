@@ -352,6 +352,7 @@ pub(crate) async fn connect_host_impl(
         pending: state.inner().pending_host_key_prompts_handle(),
     });
     let network_online = state.inner().network_online.clone();
+    let wake_signal = state.inner().wake_signal.clone();
     let notif_ctx = state.notifications_ctx();
 
     // Cancel any prior supervisor (live or in-backoff) so we don't have
@@ -372,6 +373,7 @@ pub(crate) async fn connect_host_impl(
         bootstrap_workspace,
         prompter,
         network_online,
+        wake_signal,
         notif_ctx,
     )
     .await

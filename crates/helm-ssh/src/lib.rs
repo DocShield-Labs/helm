@@ -607,7 +607,21 @@ async fn auth_handshake(
     auth: SshAuth,
     prompter: Option<Arc<dyn HostKeyPrompter>>,
 ) -> Result<Handle<Client>, SshError> {
-    let config = Arc::new(client::Config::default());
+    // Keepalive is what surfaces a dead connection. Without it, a socket
+    // left half-open by laptop sleep (or any silent network drop) is never
+    // probed: reads block forever with no EOF and writes just buffer into
+    // the frozen kernel send queue, so the channel never errors, the
+    // supervisor never sees ClientDied, and the UI keeps showing
+    // "connected" while keystrokes vanish. With an interval set, russh
+    // sends SSH global keepalives when idle and — after `keepalive_max`
+    // (default 3) go unanswered — tears the session down, which errors the
+    // channel and triggers reconnect. The timer is frozen during sleep, so
+    // detection lands ~interval × max seconds after wake (~45s here). This
+    // is the equivalent of OpenSSH's ServerAliveInterval/ServerAliveCountMax.
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(15)),
+        ..Default::default()
+    });
 
     let handle = if let Some(jump) = target.jump.as_deref() {
         let jump_client = Client::new(jump.hostname.clone(), jump.port, prompter.clone());

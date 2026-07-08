@@ -9,6 +9,7 @@ mod integration;
 mod keychain;
 mod notifications;
 mod persistence;
+mod power;
 mod reachability;
 mod scheduler;
 mod schedules;
