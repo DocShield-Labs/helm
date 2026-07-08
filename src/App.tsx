@@ -24,6 +24,7 @@ import {
 } from '@lib/store'
 import { connectHost, subscribeHostEvents } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
+import { useAppUpdate } from '@lib/updater'
 import { useGlobalKeymap } from '@lib/keymap-engine'
 import {
   applyThemeCssVars,
@@ -321,6 +322,9 @@ export function App() {
     return () => window.clearInterval(id)
   }, [activeHostId, activeStatus, hosts])
 
+  // Self-update: non-null when a newer signed release is available.
+  const appUpdate = useAppUpdate()
+
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-text-primary">
       {/* drag bar — title centered to the geometric middle of the window
@@ -447,6 +451,22 @@ export function App() {
           </>
         )}
         <span className="flex-1" />
+        {appUpdate && (
+          <>
+            <StatusBarSegment
+              onClick={appUpdate.installing ? undefined : appUpdate.install}
+              title={`Install Helm ${appUpdate.version} and relaunch — tmux sessions survive`}
+            >
+              <span className="font-mono text-[12px] text-text-secondary">⬆</span>
+              <span className="text-[12px] text-text-primary">
+                {appUpdate.installing
+                  ? `installing ${appUpdate.version}…`
+                  : `${appUpdate.version} available`}
+              </span>
+            </StatusBarSegment>
+            <StatusBarDivider />
+          </>
+        )}
         {activePane?.branch && (
           <>
             <StatusBarSegment>

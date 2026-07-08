@@ -1,0 +1,51 @@
+# Release pipeline: push a `v*` tag and this builds, signs, and publishes
+# the update artifacts (+ latest.json manifest) as a GitHub Release on
+# this repo — which is what installed apps poll via tauri-plugin-updater
+# (see tauri.conf.json → plugins.updater.endpoints).
+#
+# Required repo secret:
+#   TAURI_SIGNING_PRIVATE_KEY — contents of the updater signing key
+#     (~/.tauri/helm.key on the machine that ran `tauri signer generate`).
+#     The matching pubkey is baked into tauri.conf.json; installs refuse
+#     bundles this key didn't sign.
+#
+# The version comes from tauri.conf.json — bump it before tagging, and
+# keep the tag in sync (tag v0.2.0 ↔ "version": "0.2.0").
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the release + upload assets
+
+jobs:
+  build:
+    # macos-latest is an arm64 runner → darwin-aarch64 artifacts.
+    # Add an x86_64 matrix leg here if an Intel Mac ever needs Helm.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - run: bun install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          tagName: v__VERSION__
+          releaseName: Helm v__VERSION__
+          releaseBody: 'Signed auto-update artifacts for Helm.'
+          # This repo has no src-tauri; the tauri CLI discovers
+          # crates/helm-app/tauri.conf.json itself. Run it through bun so
+          # it uses the project-local CLI.
+          tauriScript: bun tauri

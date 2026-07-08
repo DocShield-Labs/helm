@@ -150,6 +150,10 @@ pub fn run() {
         .expect("failed to export specta bindings");
 
     let app = tauri::Builder::default()
+        // Self-update: updater checks the release manifest and swaps the
+        // .app bundle; process provides the relaunch after install.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(specta.invoke_handler())
         .setup(move |app| {
             specta.mount_events(app);
