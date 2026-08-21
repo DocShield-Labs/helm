@@ -139,6 +139,41 @@ on upgrade — acceptable, same as a tmux server upgrade; later: graceful
   claude_code.rs hook (BEL to pane tty still works — helmd owns the tty now;
   simpler: hook can write a marker file or use `helmd notify` subcommand).
 
+## Composer (the input) — spec
+
+The shell's prompt is never typed into. The composer (Warp's universal
+input, our palette) is the input; the pane's state picks where ⏎ sends
+text, and the Terminal | Agent control (⌘I) overrides it.
+
+State is derived per pane from the block table (`lib/session/paneState.ts`):
+`prompt` (OSC 133 A seen, no B) · `running` (B seen, no D) · `alt`
+(alternate screen) · `raw` (no markers, or the process exited). A pane is
+an `agent` when the running block's program — or the pane's spawned
+command — is a known coding agent (`claude`, `codex`, `gemini`, `aider`).
+
+| Pane                         | Mode (auto) | What you see                                   | ⏎ does                                           |
+|------------------------------|-------------|------------------------------------------------|--------------------------------------------------|
+| shell at prompt              | Terminal    | blocks pinned to the bottom, xterm hidden      | sends `cmd⏎` (multi-line → bracketed paste)      |
+| shell at prompt, Agent mode  | Agent       | same                                           | `claude '<text>'⏎` — starts an agent on this dir |
+| shell, command running       | —           | xterm shows the command; composer hidden       | keys go to the pty (^C, y/n, sudo…)              |
+| agent running (Claude Code)  | Agent       | xterm shows the TUI; composer below            | types text into the agent and submits            |
+| agent, Terminal mode         | —           | composer collapsed to a slim bar; TUI focused  | native typing (menus, `/` autocomplete)          |
+| agent rang the bell          | blocked     | composer closed: "claude is waiting — keys go straight to it" | keys answer the prompt; ⏎ reopens the composer |
+| non-agent TUI (vim, htop)    | —           | plain terminal, no composer                    | native                                           |
+
+Blocked is Warp's behaviour (the agent input closes while the agent is
+`Blocked`, reopens when it resumes). We detect it from the Claude Code
+hooks (Notification + Stop → BEL on `$HELM_TTY`): helmd strips BEL from
+the stream and the inbox suppresses the focused window, so the pump now
+also emits `SessionEvent::Bell` for every bell and the pane counts them.
+
+Known limits: no shell completion in the composer (the shell isn't
+involved until ⏎); Claude's own input box stays visible in the TUI (we
+don't parse or re-skin it — its permission prompt is its own text);
+`Stop` also rings the bell, so the composer closes at the end of every
+turn until ⏎/click reopens it. The agent command is a constant for now
+(`AGENT_LAUNCH_COMMAND`), to become a per-host setting.
+
 ## Risks / open questions
 
 - **Daemon crash = lost processes.** tmux is battle-hardened; helmd won't be at
@@ -242,7 +277,23 @@ on upgrade — acceptable, same as a tmux server upgrade; later: graceful
       · Smoke-tested live (`bun run tauri:dev`): connect in ~2s, BlockPane
         hydration (`session_blocks` + `session_replay`) 33ms after connect,
         daemon kill → supervisor reconnect + respawn in 1.3s
+- [x] M5 (UI): Warp-framed chrome + composer-as-input (2026-08-21).
+      · `features/sessions/Sidebar.tsx` + `SessionRow.tsx`: 248px session
+        list — one row per window grouped by host, icon (shell / agent,
+        accent while busy) · title / subtitle · one 8px unread dot; the
+        inbox as a single row; filter field; host headers carry the
+        offline/connecting state as text. Tree/pinned/folder modes, the
+        collapsed dot rail, peek popovers, the status bar: gone.
+      · `ui/TopBar.tsx`: 34px bar, centered ⌘K search pill, sidebar toggle,
+        update pill.
+      · Blocks at Warp's geometry: full-width hairlines, prompt row
+        (`cwd on branch`, duration right-aligned), command, output, red
+        wash on failure (no stripe), hover belt top-right.
+      · `features/shell/Composer.tsx` + `BlockPane.tsx`: the composer spec
+        above; `lib/session/{paneState,composer}.ts`; ⌘I toggles mode.
+      · `SessionEvent::Bell` (helm-domain + pump) feeds the blocked state.
       Remaining polish: list virtualization past 250 blocks, settings
-      surface, the agent composer from the Figma, regex search daemon-side
-      (M6), foreground-process tracking in helmd, cross-platform helmd
-      bundles for heterogeneous fleets.
+      surface (agent command per host), regex search daemon-side (M6),
+      foreground-process tracking in helmd, cross-platform helmd bundles
+      for heterogeneous fleets, a real "agent is waiting vs done"
+      distinction (separate hook payloads).
