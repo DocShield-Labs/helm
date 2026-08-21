@@ -24,7 +24,7 @@ import { selectWindow } from '@lib/host'
 import { prettyCwd } from '@lib/path'
 import type { Host, Notification, NotificationId, NotificationKind } from '@bindings'
 
-export function InboxSection() {
+export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = {}) {
   const notifications = useStore((s) => s.notifications)
   const hosts = useStore((s) => s.hosts)
   const sessions = useStore((s) => s.sessions)
@@ -150,7 +150,7 @@ export function InboxSection() {
 
   return (
     <div className="flex flex-col gap-1">
-      {hasItems && (
+      {hasItems && !hideHeader && (
         <div className="group flex items-center justify-between pb-1 pt-1 pl-2 pr-1">
           <span className="text-[11px] font-medium tracking-[0.08em] text-text-tertiary">
             INBOX · {list.length}
@@ -208,7 +208,7 @@ export function InboxSection() {
           </motion.div>
         ))}
       </AnimatePresence>
-      {hasItems && <div className="my-1 border-t border-white/[0.06]" />}
+      {hasItems && !hideHeader && <div className="my-1 border-t border-white/[0.06]" />}
     </div>
   )
 }

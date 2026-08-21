@@ -70,14 +70,12 @@ export interface HostSessions {
    * Keyed by full cwd path (the synthetic grouping key). Mirrors the
    * opt-out semantics of collapsedWorkspaces — newly-observed folders
    * appear expanded by default. In-memory only. */
-  collapsedFolders: Set<string>
 }
 
 export const emptyHostSessions = (): HostSessions => ({
   workspaces: new Map(),
   activeWorkspaceId: null,
   collapsedWorkspaces: new Set(),
-  collapsedFolders: new Set(),
 })
 
 /** Pending host-key prompt — surfaced when the SSH server's key is
@@ -177,15 +175,6 @@ interface HelmState {
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
 
-  /** How the sidebar groups windows: by their parent workspace (the
-   * default — what tmux sessions actually are), or by the folder of
-   * each window's cwd (synthetic labels derived at render time). The
-   * choice is purely presentational; switching modes never mutates
-   * underlying tmux state. Persisted via localStorage. */
-  sidebarViewMode: 'workspace' | 'folder'
-  setSidebarViewMode: (v: 'workspace' | 'folder') => void
-  toggleSidebarViewMode: () => void
-
   /** Active terminal theme name. Drives both xterm's palette and the
    * `--terminal-*` CSS variables the pane chrome reads. Persisted
    * via localStorage. */
@@ -198,24 +187,6 @@ interface HelmState {
    * preview without changing what's effectively rendered). */
   previewThemeName: string | null
   setPreviewThemeName: (name: string | null) => void
-
-  /** Whether the Pinned section in the expanded sidebar is collapsed.
-   * Persisted via localStorage so the preference survives restarts.
-   * The Inbox / Pinned / Hosts sections all live in one scrollable
-   * column now — the user toggles each independently. */
-  pinnedSectionCollapsed: boolean
-  setPinnedSectionCollapsed: (v: boolean) => void
-  /** Whether the Hosts section in the expanded sidebar is collapsed. */
-  hostsSectionCollapsed: boolean
-  setHostsSectionCollapsed: (v: boolean) => void
-
-  /** Hosts the user has explicitly expanded. Default is **collapsed**:
-   * launch always opens to a quiet sidebar with hosts shown as a tidy
-   * list of dots, and the user opts in by clicking a host row to drill
-   * into its workspace tree. Not persisted — every launch starts with
-   * all hosts collapsed. Independent of `activeHostId`. */
-  expandedHosts: Set<HostId>
-  toggleHostExpanded: (host: HostId) => void
 
   /** Command palette open state plus an optional initial query string
    * the palette should boot with. Cmd+K passes nothing (empty palette);
@@ -261,10 +232,6 @@ interface HelmState {
   setActiveHost: (id: HostId) => void
 
   // ---------- per-host latency ----------
-  /** EWMA-smoothed round-trip time (ms) of the most recent ping to each
-   * remote host. Local hosts skip pinging entirely (always ~0ms). */
-  hostLatencies: Map<HostId, number>
-  observeHostLatency: (id: HostId, ms: number) => void
 
   // ---------- per-host sessions ----------
   sessions: Map<HostId, HostSessions>
@@ -290,8 +257,6 @@ interface HelmState {
   updatePaneCwd: (host: HostId, paneId: string, cwd: string, branch: string) => void
   /** Toggle whether a workspace's window list is visible. */
   toggleWorkspaceCollapsed: (host: HostId, workspaceId: string) => void
-  /** Toggle whether a folder's window list is visible (folder view). */
-  toggleFolderCollapsed: (host: HostId, folderPath: string) => void
 
   // ---------- pending window kills (5s undo) ----------
   /** Snapshots of windows that have been optimistically removed from
@@ -598,7 +563,6 @@ const writeStringPref = (key: string, v: string) => {
 }
 
 const SIDEBAR_COLLAPSED_KEY = 'helm.sidebarCollapsed'
-const SIDEBAR_VIEW_MODE_KEY = 'helm.sidebarViewMode'
 const THEME_NAME_KEY = 'helm.themeName'
 
 const PINNED_WINDOWS_KEY = 'helm.pinnedWindows'
@@ -612,8 +576,6 @@ const readPinnedWindows = (): PinnedWindow[] =>
   readJsonArray(PINNED_WINDOWS_KEY, isPinnedWindow)
 const writePinnedWindows = (pins: PinnedWindow[]) => writeJson(PINNED_WINDOWS_KEY, pins)
 
-const PINNED_SECTION_COLLAPSED_KEY = 'helm.pinnedSectionCollapsed'
-const HOSTS_SECTION_COLLAPSED_KEY = 'helm.hostsSectionCollapsed'
 const readBoolPref = (key: string, fallback: boolean): boolean => {
   try {
     const v = localStorage.getItem(key)
@@ -644,23 +606,6 @@ export const useStore = create<HelmState>((set, get) => ({
       return { sidebarCollapsed: next }
     }),
 
-  sidebarViewMode: readStringPref<'workspace' | 'folder'>(
-    SIDEBAR_VIEW_MODE_KEY,
-    'workspace',
-    (v): v is 'workspace' | 'folder' => v === 'workspace' || v === 'folder',
-  ),
-  setSidebarViewMode: (v) => {
-    writeStringPref(SIDEBAR_VIEW_MODE_KEY, v)
-    set({ sidebarViewMode: v })
-  },
-  toggleSidebarViewMode: () =>
-    set((s) => {
-      const next: 'workspace' | 'folder' =
-        s.sidebarViewMode === 'workspace' ? 'folder' : 'workspace'
-      writeStringPref(SIDEBAR_VIEW_MODE_KEY, next)
-      return { sidebarViewMode: next }
-    }),
-
   themeName: readStringPref(THEME_NAME_KEY, DEFAULT_THEME_NAME),
   setThemeName: (v) => {
     writeStringPref(THEME_NAME_KEY, v)
@@ -670,26 +615,6 @@ export const useStore = create<HelmState>((set, get) => ({
   setPreviewThemeName: (v) => set({ previewThemeName: v }),
 
   pinnedWindows: readPinnedWindows(),
-
-  pinnedSectionCollapsed: readBoolPref(PINNED_SECTION_COLLAPSED_KEY, false),
-  setPinnedSectionCollapsed: (v) => {
-    writeBoolPref(PINNED_SECTION_COLLAPSED_KEY, v)
-    set({ pinnedSectionCollapsed: v })
-  },
-  hostsSectionCollapsed: readBoolPref(HOSTS_SECTION_COLLAPSED_KEY, false),
-  setHostsSectionCollapsed: (v) => {
-    writeBoolPref(HOSTS_SECTION_COLLAPSED_KEY, v)
-    set({ hostsSectionCollapsed: v })
-  },
-
-  expandedHosts: new Set(),
-  toggleHostExpanded: (host) =>
-    set((s) => {
-      const next = new Set(s.expandedHosts)
-      if (next.has(host)) next.delete(host)
-      else next.add(host)
-      return { expandedHosts: next }
-    }),
 
   paletteOpen: false,
   paletteInitialQuery: '',
@@ -757,12 +682,8 @@ export const useStore = create<HelmState>((set, get) => ({
       nextSessions.delete(id)
       const nextErrors = new Map(s.hostErrors)
       nextErrors.delete(id)
-      const nextLatencies = new Map(s.hostLatencies)
-      nextLatencies.delete(id)
       const nextHostKeyPrompts = new Map(s.hostKeyPrompts)
       nextHostKeyPrompts.delete(id)
-      const nextExpanded = new Set(s.expandedHosts)
-      nextExpanded.delete(id)
 
       // Notifications, running panes, and tool suggestions are all
       // keyed by string compounds that include
@@ -790,9 +711,7 @@ export const useStore = create<HelmState>((set, get) => ({
         statuses: nextStatuses,
         sessions: nextSessions,
         hostErrors: nextErrors,
-        hostLatencies: nextLatencies,
         hostKeyPrompts: nextHostKeyPrompts,
-        expandedHosts: nextExpanded,
         notifications: nextNotifications,
         runningPanes: nextRunning,
         toolSuggestions: nextSuggestions,
@@ -823,18 +742,6 @@ export const useStore = create<HelmState>((set, get) => ({
 
   setActiveHost: (id) => set({ activeHostId: id }),
 
-  hostLatencies: new Map(),
-  observeHostLatency: (id, ms) =>
-    set((s) => {
-      // Exponential weighted moving average so a single spike doesn't
-      // make the segment flicker; α=0.3 weights recent samples enough to
-      // surface real degradation within a few measurements.
-      const prev = s.hostLatencies.get(id)
-      const next = prev === undefined ? ms : prev * 0.7 + ms * 0.3
-      const map = new Map(s.hostLatencies)
-      map.set(id, next)
-      return { hostLatencies: map }
-    }),
 
   sessions: new Map(),
 
@@ -986,16 +893,6 @@ export const useStore = create<HelmState>((set, get) => ({
         if (next.has(workspaceId)) next.delete(workspaceId)
         else next.add(workspaceId)
         return { ...cur, collapsedWorkspaces: next }
-      }),
-    })),
-
-  toggleFolderCollapsed: (host, folderPath) =>
-    set((s) => ({
-      sessions: withHostSessions(s.sessions, host, (cur) => {
-        const next = new Set(cur.collapsedFolders)
-        if (next.has(folderPath)) next.delete(folderPath)
-        else next.add(folderPath)
-        return { ...cur, collapsedFolders: next }
       }),
     })),
 

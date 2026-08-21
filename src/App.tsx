@@ -23,7 +23,6 @@ import {
   type TmuxWorkspace,
 } from '@lib/store'
 import { connectHost, subscribeHostEvents } from '@lib/host'
-import { displayedHostStatus } from '@lib/host-status'
 import { useAppUpdate } from '@lib/updater'
 import { useGlobalKeymap } from '@lib/keymap-engine'
 import {
@@ -31,7 +30,6 @@ import {
   getTheme,
   setThemeForAllTerminals,
 } from '@lib/terminal'
-import { createWorkspace, killWorkspace } from '@lib/actions/workspace'
 import { BlockPane } from '@features/shell/BlockPane'
 import { sendInput } from '@lib/session/stream'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
@@ -41,14 +39,8 @@ import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSu
 import { NotificationPeek } from '@features/activity-feed/NotificationPeek'
 import { ReconnectingOverlay } from '@features/workspace/ReconnectingOverlay'
 import { PaletteHost } from '@features/palette/PaletteHost'
-import {
-  Sidebar,
-  StatusBarHostSegment,
-  StatusBarSegment,
-  StatusBarDivider,
-  ToastHost,
-  ConfirmHost,
-} from '@ui'
+import { ToastHost, ConfirmHost, TopBar } from '@ui'
+import { Sidebar } from '@features/sessions/Sidebar'
 import type { Host, HostStatus } from '@bindings'
 
 // Module-level flag: only run the boot chain once per process. A
@@ -61,7 +53,6 @@ import type { Host, HostStatus } from '@bindings'
 let bootStarted = false
 
 export function App() {
-  const bootstrap = useStore((s) => s.bootstrap)
   const setBootstrap = useStore((s) => s.setBootstrap)
   const hosts = useStore((s) => s.hosts)
   const statuses = useStore((s) => s.statuses)
@@ -69,8 +60,6 @@ export function App() {
   const activeHostId = useStore((s) => s.activeHostId)
   const setHosts = useStore((s) => s.setHosts)
   const setActiveHost = useStore((s) => s.setActiveHost)
-  const sidebarCollapsed = useStore((s) => s.sidebarCollapsed)
-  const hostLatencies = useStore((s) => s.hostLatencies)
   const hostErrors = useStore((s) => s.hostErrors)
   const [bootError, setBootError] = useState<string | null>(null)
   // Host-editor modal state. `editing` carries the host being edited
@@ -253,10 +242,9 @@ export function App() {
   // path as a keystroke, with iTerm2-style backslash escaping so a
   // shell or a TUI like Claude Code both receive it as if typed.
   //
-  // The focus check skips xterm's hidden helper textarea, which is the
-  // active element whenever the terminal has focus — exactly when we
-  // want a drop to land. Real text inputs (host editor, palette) still
-  // suppress the drop so it doesn't silently type into a hidden pane.
+  // Lands in the composer when it has focus, else in the terminal
+  // (xterm's hidden helper textarea is the active element then). Other
+  // text inputs (host editor, palette) suppress the drop.
   useEffect(() => {
     if (!activeHostId || !activePane) return
     const hostId = activeHostId
@@ -267,7 +255,17 @@ export function App() {
     void (async () => {
       const fn = await getCurrentWebview().onDragDropEvent((event) => {
         if (event.payload.type !== 'drop') return
+        const paths = event.payload.paths
+        if (!paths || paths.length === 0) return
+        const text = paths.map(escapeShellPath).join(' ') + ' '
         const active = document.activeElement as HTMLElement | null
+        // The composer is the input at a prompt: insert there (as a
+        // native edit, so React sees it). Other text fields swallow
+        // the drop rather than typing into a hidden pane.
+        if (active?.classList.contains('helm-composer-editor')) {
+          document.execCommand('insertText', false, text)
+          return
+        }
         if (
           active &&
           !active.classList.contains('xterm-helper-textarea') &&
@@ -277,9 +275,7 @@ export function App() {
         ) {
           return
         }
-        const paths = event.payload.paths
-        if (!paths || paths.length === 0) return
-        void sendInput(hostId, paneId, paths.map(escapeShellPath).join(' ') + ' ')
+        void sendInput(hostId, paneId, text)
       })
       if (cancelled) {
         fn()
@@ -294,79 +290,28 @@ export function App() {
     }
   }, [activeHostId, activePane])
 
-  // ---------- latency probe ----------
-  // Round-trip to the host's daemon (measured in Rust, so it's the real
-  // transport, not webview IPC). Only for connected remote hosts —
-  // local is always ~0.
-  useEffect(() => {
-    if (!activeHostId) return
-    const host = hosts.get(activeHostId)
-    if (!host || host.port === 0) return
-    if (activeStatus !== 'connected' && activeStatus !== 'idle') return
-    const observe = useStore.getState().observeHostLatency
-    const probe = async () => {
-      const res = await commands.sessionPing(activeHostId)
-      if (res.status === 'ok') observe(activeHostId, res.data)
-    }
-    void probe()
-    const id = window.setInterval(() => void probe(), 4000)
-    return () => window.clearInterval(id)
-  }, [activeHostId, activeStatus, hosts])
-
   // Self-update: non-null when a newer signed release is available.
   const appUpdate = useAppUpdate()
 
+  const title = [activeHost?.name, activeWindow?.name].filter(Boolean).join(' — ')
+
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-text-primary">
-      {/* drag bar — title centered to the geometric middle of the window
-          (macOS convention) via absolute positioning so the traffic-light
-          reservation and right-side affordances don't bias it off-center.
-          `data-tauri-drag-region` makes the bar draggable; with the Overlay
-          title-bar style the OS has no native title bar to grab, so this
-          attribute is what lets the user move the window. */}
-      <div
-        data-tauri-drag-region
-        className="relative flex h-10 items-center justify-end border-b border-white/[0.06] bg-sidebar pl-[76px] pr-3"
-      >
-        <span
-          data-tauri-drag-region
-          className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-[12px] text-text-tertiary"
-        >
-          {activeHost?.name ?? '—'} · {activeWorkspace?.name ?? '—'} ·{' '}
-          {activeWindow?.name ?? '—'}
-        </span>
-        <span className="font-mono text-[10px] text-text-tertiary">
-          {bootstrap.ready ? '⌘K Search' : '…booting'}
-        </span>
-      </div>
+    <div className="flex h-screen w-screen overflow-hidden bg-canvas text-text-primary">
+      <Sidebar
+        onAddHost={() => {
+          setEditing(null)
+          setEditorOpen(true)
+        }}
+        onEditHost={(h) => {
+          setEditing(h)
+          setEditorOpen(true)
+        }}
+        onDeleteHost={(h) => void deleteHost(h)}
+      />
 
-      <div className="relative flex-1 overflow-hidden">
-        {/* The sidebar is styled as a floating panel (rounded, shadowed)
-            but its width still pushes the terminal pane: the shell's
-            cursor sits flush to the sidebar's right edge, not behind it.
-            Sidebar margins: left=8, width=collapsed?48:280, gap=8 →
-            terminal padding-left = 8 + W + 8 = W + 16. */}
-        <Sidebar
-          onAddHost={() => {
-            setEditing(null)
-            setEditorOpen(true)
-          }}
-          onEditHost={(h) => {
-            setEditing(h)
-            setEditorOpen(true)
-          }}
-          onDeleteHost={(h) => void deleteHost(h)}
-          onCreateWorkspace={(hostId) => void createWorkspace(hostId)}
-          onKillWorkspace={(hostId, w) => void killWorkspace(hostId, w)}
-        />
-
-        <main
-          className="absolute top-0 right-0 bottom-0 flex overflow-hidden"
-          style={{
-            left: sidebarCollapsed ? 64 : 296,
-            transition: 'left 180ms cubic-bezier(0.2, 0.7, 0.2, 1)',
-          }}
-        >
+      <div className="flex min-w-0 flex-1 flex-col">
+        <TopBar title={title} update={appUpdate} />
+        <main className="relative flex flex-1 overflow-hidden">
           {/* Keep-alive pane stack: one BlockPane per pane the user has
               ever visited; only the active one is visible. Hidden panes
               continue to receive live output and keep their xterm
@@ -404,82 +349,6 @@ export function App() {
           <NotificationPeek />
         </main>
       </div>
-
-      <footer className="flex h-8 items-center border-t border-white/[0.08] bg-sidebar px-1">
-        <StatusBarHostSegment
-          hostName={activeHost?.name ?? '—'}
-          state={
-            activeHost
-              ? displayedHostStatus(activeHost, activeStatus)
-              : 'disconnected'
-          }
-        />
-        <StatusBarDivider />
-        <StatusBarSegment>
-          <span className="font-mono text-[12px] text-text-secondary">◫</span>
-          <span className="text-[12px] text-text-primary">{activeWorkspace?.name ?? '—'}</span>
-        </StatusBarSegment>
-        <StatusBarDivider />
-        <StatusBarSegment>
-          <span className="font-mono text-[12px] text-text-secondary">▢</span>
-          <span className="text-[12px] text-text-primary">{activeWindow?.name ?? '—'}</span>
-        </StatusBarSegment>
-        {activePane?.cwd && (
-          <>
-            <StatusBarDivider />
-            <StatusBarSegment
-              onClick={
-                activeHost?.port === 0
-                  ? () => void commands.revealInFinder(activePane.cwd!)
-                  : undefined
-              }
-              title={activeHost?.port === 0 ? 'Reveal in Finder' : undefined}
-            >
-              <span className="font-mono text-[12px] text-text-secondary">
-                {prettyPath(activePane.cwd)}
-              </span>
-            </StatusBarSegment>
-          </>
-        )}
-        <span className="flex-1" />
-        {appUpdate && (
-          <>
-            <StatusBarSegment
-              onClick={appUpdate.installing ? undefined : appUpdate.install}
-              title={`Install Helm ${appUpdate.version} and relaunch — your sessions survive`}
-            >
-              <span className="font-mono text-[12px] text-text-secondary">⬆</span>
-              <span className="text-[12px] text-text-primary">
-                {appUpdate.installing
-                  ? `installing ${appUpdate.version}…`
-                  : `${appUpdate.version} available`}
-              </span>
-            </StatusBarSegment>
-            <StatusBarDivider />
-          </>
-        )}
-        {activePane?.branch && (
-          <>
-            <StatusBarSegment>
-              <span className="font-mono text-[12px] text-text-secondary">⎇</span>
-              <span className="font-mono text-[12px] text-text-tertiary">
-                {activePane.branch}
-              </span>
-            </StatusBarSegment>
-            <StatusBarDivider />
-          </>
-        )}
-        {activeHost && (activeStatus === 'connected' || activeStatus === 'idle') && (
-          <StatusBarSegment>
-            <span className="font-mono text-[12px] text-text-secondary">⇄</span>
-            <span className="font-mono text-[12px] text-text-tertiary">
-              {activeHost.port === 0
-                ? 'local'
-                : formatLatency(hostLatencies.get(activeHost.id))}
-            </span>
-          </StatusBarSegment>
-        )}
-      </footer>
 
       <HostEditorModal
         open={editorOpen}
@@ -543,18 +412,6 @@ async function deleteHost(host: Host): Promise<void> {
  * so they don't render as a flickery "0ms". Anything ≥ 1s switches to
  * seconds with one decimal — at that point the user cares about magnitude
  * more than precision. Pre-first-sample shows an em-dash. */
-function formatLatency(ms: number | undefined): string {
-  if (ms === undefined) return '—'
-  if (ms < 1) return '<1ms'
-  if (ms < 1000) return `${Math.round(ms)}ms`
-  return `${(ms / 1000).toFixed(1)}s`
-}
-
-/** Backslash-escape characters in a filesystem path that would otherwise
- * be interpreted by a POSIX shell — spaces, quotes, parens, glob metas,
- * etc. Mirrors iTerm2's default drag-drop escaping. Non-shell receivers
- * (Claude Code, REPLs) still parse this fine because they normalize
- * backslash escapes when extracting paths from typed input. */
 function escapeShellPath(p: string): string {
   return p.replace(/([ '"\\$`!*?(){}[\]<>;&|#~])/g, '\\$1')
 }
@@ -564,14 +421,6 @@ function escapeShellPath(p: string): string {
  * roots; that covers macOS and Linux for both local and remote hosts.
  * Anything else (Windows paths, jails, weird mount points) falls
  * through unchanged. */
-function prettyPath(p: string): string {
-  if (!p) return ''
-  const m = p.match(/^\/(?:Users|home|root)\/[^/]+(\/.*)?$/)
-  if (m) return '~' + (m[1] ?? '')
-  if (p === '/root' || p.startsWith('/Users/') || p.startsWith('/home/')) return p
-  return p
-}
-
 function emptyStateText(hs: HostSessions | undefined): string {
   if (!hs) return 'Opening session…'
   if (hs.workspaces.size === 0) return 'No workspaces yet.'
