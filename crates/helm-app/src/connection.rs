@@ -264,6 +264,9 @@ async fn pump(
                 emit(SessionEvent::PaneExited { pane_id: pane.to_string(), status });
             }
             DaemonMsg::Notification { note } => {
+                if matches!(note.kind, helm_proto::NotificationKind::Bell) {
+                    emit(SessionEvent::Bell { pane_id: note.pane.to_string() });
+                }
                 notifications::process_daemon_notification(&notif_ctx, &event_tx, host_id, &note);
             }
             DaemonMsg::Error { req_id: None, context, message } => {

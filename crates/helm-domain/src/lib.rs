@@ -155,6 +155,12 @@ pub enum SessionEvent {
     /// Full tree snapshot after any lifecycle change.
     Tree { tree: SessionTree },
     PaneExited { pane_id: String, status: Option<i32> },
+    /// The pane rang its bell. Emitted for every bell — including ones
+    /// the inbox suppresses because the window is focused — so the pane
+    /// view can react (an agent waiting on a choice) without depending
+    /// on the notification queue. helmd strips BEL from the byte stream,
+    /// so this is the only way the pane hears it.
+    Bell { pane_id: String },
 }
 
 // ---------- Host ----------
