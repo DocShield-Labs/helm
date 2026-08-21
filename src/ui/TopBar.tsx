@@ -24,11 +24,12 @@ export function TopBar({ title, update }: { title: string; update: AvailableUpda
       </span>
       <button
         type="button"
-        onClick={() => openPalette()}
+        onClick={() => openPalette('/')}
+        title="Search output across hosts (⌘K then /)"
         className="absolute left-1/2 top-1/2 flex h-6 w-[300px] max-w-[40vw] -translate-x-1/2 -translate-y-1/2 items-center gap-2 rounded-md bg-[var(--stroke-subtle)] px-2.5 text-text-tertiary hover:bg-[var(--stroke-default)]"
       >
         <SearchIcon size={13} />
-        <span className="flex-1 truncate text-left text-[12px]">Search sessions, agents, output…</span>
+        <span className="flex-1 truncate text-left text-[12px]">Search output across hosts…</span>
         <span className="font-mono text-[10px] text-text-disabled">⌘K</span>
       </button>
       <span className="flex-1" />
