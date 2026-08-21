@@ -31,7 +31,7 @@ import {
   type Sigil,
   type SubModeResult,
 } from '@lib/actions/dynamic'
-import { buildSearchActions } from '@lib/actions/search'
+import { buildSearchActions, useSearchVersion, clearSearchCache } from '@lib/actions/search'
 import { Palette } from '@ui'
 import { Row, Kbd } from './Row'
 import { SectionHeader } from './SectionHeader'
@@ -202,6 +202,8 @@ export function PaletteHost() {
       setQuery(initialQuery)
       setSelected(0)
       setDrilled(null)
+    } else {
+      clearSearchCache()
     }
   }, [open, initialQuery])
 
@@ -220,9 +222,13 @@ export function PaletteHost() {
     [open, searchMode, query],
   )
 
+  // Results arrive asynchronously from the daemons; the version bump
+  // re-runs this memo when a fetch lands.
+  const searchVersion = useSearchVersion()
   const searchActions = useMemo<readonly Action[]>(
     () => (searchMode ? buildSearchActions(searchTerm) : []),
-    [searchMode, searchTerm],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [searchMode, searchTerm, searchVersion],
   )
 
   // Source list:

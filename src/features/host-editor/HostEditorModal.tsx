@@ -129,7 +129,6 @@ export function HostEditorModal({ open, initial, onClose, onSaved }: HostEditorM
         user: user.trim(),
         auth,
         jump_host: initial?.jump_host ?? null,
-        tmux_integration: true,
         default_workspace: defaultWorkspace.trim(),
         startup_commands: initial?.startup_commands ?? [],
       }

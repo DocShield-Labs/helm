@@ -1,83 +1,111 @@
 /**
- * Cross-window search (the `/` mode of the command palette).
+ * Cross-host scrollback search (the `/` mode of the command palette).
  *
- * Greps the pre-hydrated pane captures across *every* window on *every*
- * connected host for the typed term and turns each hit into a palette
- * action that jumps to the originating window. This is the "where did I
- * see that?" companion to the per-pane Cmd+F find.
- *
- * Scope/limits (v1):
- *   - Searches `paneCaptures` (the snapshots taken on connect / refetch),
- *     not live xterm buffers — so the active pane's most recent lines may
- *     lag. The active pane is the one you're already looking at; Cmd+F
- *     covers it. Other windows' captures are fresh enough to locate.
- *   - Capped per-pane and overall so a broad term can't flood the list.
- *   - Jumps to the window; it does not yet scroll to the exact line.
+ * Runs `session_search` on every connected host — the daemon greps its
+ * ring buffers server-side and returns matches with exact seq anchors
+ * — and turns each hit into a palette action that jumps to the window
+ * and scrolls to the block. Results are cached per term and fetched
+ * with a short debounce; `useSearchVersion` lets the palette re-render
+ * when a fetch lands.
  */
 
-import { useStore } from '@lib/store'
-import { selectWorkspace } from '@lib/host'
+import { useSyncExternalStore } from 'react'
 import { commands } from '@lib/ipc'
+import { selectWindow } from '@lib/host'
+import { locatePane, useStore } from '@lib/store'
+import { requestJump } from '@lib/session/blocks'
+import type { SearchHit } from '@bindings'
 import type { Action } from './types'
 
-// Strip CSI/SGR sequences and OSC strings so we match (and show) clean
-// text rather than the escape-laden bytes `capture-pane -e` returns.
-const ANSI =
-  // eslint-disable-next-line no-control-regex
-  /[\x1b\x9b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-PR-TZcf-ntqry=><~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g
+const MIN_TERM = 2
+const MAX_PER_HOST = 40
+const DEBOUNCE_MS = 150
 
-function stripAnsi(s: string): string {
-  return s.replace(ANSI, '')
+let version = 0
+const listeners = new Set<() => void>()
+const cache = new Map<string, Action[]>()
+const inflight = new Set<string>()
+let timer: number | null = null
+
+export function useSearchVersion(): number {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb)
+      return () => listeners.delete(cb)
+    },
+    () => version,
+    () => version,
+  )
 }
 
-const MIN_TERM = 2
-const MAX_RESULTS = 60
-const MAX_PER_PANE = 5
-
-/** Build palette actions for every line matching `term` across all
- * connected hosts' captured panes. Case-insensitive substring match.
- * Returns [] for terms shorter than MIN_TERM. */
+/** Synchronous view of the results for `term` (possibly still empty
+ * while the fetch is in flight). Kicks off the fetch as a side effect. */
 export function buildSearchActions(term: string): Action[] {
-  const trimmed = term.trim()
-  if (trimmed.length < MIN_TERM) return []
-  const needle = trimmed.toLowerCase()
+  const t = term.trim()
+  if (t.length < MIN_TERM) return []
+  const hit = cache.get(t)
+  if (!hit && !inflight.has(t)) schedule(t)
+  return hit ?? []
+}
 
-  const { sessions, paneCaptures, hosts } = useStore.getState()
-  const out: Action[] = []
+function schedule(t: string) {
+  if (timer !== null) window.clearTimeout(timer)
+  timer = window.setTimeout(() => {
+    timer = null
+    void run(t)
+  }, DEBOUNCE_MS)
+}
 
-  for (const [hostId, hs] of sessions) {
-    const hostName = hosts.get(hostId)?.name ?? '?'
-    for (const ws of hs.workspaces.values()) {
-      for (const win of ws.windows.values()) {
-        for (const [paneId, pane] of ws.panes) {
-          if (pane.windowId !== win.id) continue
-          const cap = paneCaptures.get(`${hostId}::${paneId}`)
-          if (!cap || cap.data.length === 0) continue
-          const lines = stripAnsi(cap.data).split('\n')
-          let perPane = 0
-          for (let li = 0; li < lines.length; li++) {
-            if (!lines[li].toLowerCase().includes(needle)) continue
-            const snippet = lines[li].trim().slice(0, 120)
-            out.push({
-              id: `search.${hostId}.${win.id}.${paneId}.${li}`,
-              kind: 'window',
-              label: snippet || '(blank match)',
-              sublabel: `${hostName} · ${ws.name} · ${win.name}`,
-              icon: '⌕',
-              run: () => {
-                const store = useStore.getState()
-                store.setActiveHost(hostId)
-                store.setActiveWindow(hostId, ws.id, win.id)
-                void selectWorkspace(hostId, ws.id)
-                void commands.tmuxSelectWindow(hostId, win.id)
-              },
-            })
-            if (++perPane >= MAX_PER_PANE) break
-            if (out.length >= MAX_RESULTS) return out
-          }
-        }
+async function run(t: string) {
+  if (cache.has(t) || inflight.has(t)) return
+  inflight.add(t)
+  try {
+    const s = useStore.getState()
+    const hostIds = [...s.hosts.keys()].filter((id) => {
+      const st = s.statuses.get(id)
+      return st === 'connected' || st === 'idle'
+    })
+    const perHost = await Promise.all(
+      hostIds.map(async (hostId) => {
+        const res = await commands.sessionSearch(hostId, t, false, false, null, null, MAX_PER_HOST)
+        return { hostId, hits: res.status === 'ok' ? res.data.matches : ([] as SearchHit[]) }
+      }),
+    )
+    const out: Action[] = []
+    const state = useStore.getState()
+    for (const { hostId, hits } of perHost) {
+      const host = state.hosts.get(hostId)
+      const hs = state.sessions.get(hostId)
+      if (!host || !hs) continue
+      for (const hit of hits) {
+        const located = locatePane(hs, hit.pane_id)
+        if (!located) continue
+        const { workspace, pane, window: win } = located
+        const snippet = hit.line_text.trim().slice(0, 120)
+        out.push({
+          id: `search.${hostId}.${hit.pane_id}.${hit.line_seq}`,
+          kind: 'window',
+          label: snippet || '(blank match)',
+          sublabel: `${host.name} · ${workspace.name} · ${win?.name ?? ''}`,
+          icon: '⌕',
+          run: () => {
+            selectWindow(hostId, workspace.id, pane.windowId)
+            // The pane consumes this once it's mounted and hydrated.
+            requestJump({ hostId, paneId: hit.pane_id, blockId: hit.block_id, lineSeq: hit.line_seq })
+          },
+        })
       }
     }
+    cache.set(t, out)
+    version++
+    for (const cb of listeners) cb()
+  } finally {
+    inflight.delete(t)
   }
-  return out
+}
+
+/** Drop cached results (called when the palette closes so a reopened
+ * search reflects new output). */
+export function clearSearchCache(): void {
+  cache.clear()
 }

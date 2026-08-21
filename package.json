@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:helmd": "bash scripts/build-helmd.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

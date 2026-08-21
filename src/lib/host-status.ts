@@ -1,7 +1,7 @@
 /**
  * Shared host-status helpers.
  *
- * `hostRowStatus` collapses the raw HostStatus + detached reason into the
+ * `hostRowStatus` collapses the raw HostStatus into the
  * 4-state visual vocabulary the dot uses (connected / connecting /
  * disconnected / error). `displayedHostStatus` is the localhost-aware
  * wrapper: localhost stays green for the steady state since
@@ -34,11 +34,7 @@ export const STATUS_LABEL: Record<HostDisplayStatus, string> = {
   error: 'ERROR',
 }
 
-export function hostRowStatus(
-  status: HostStatus,
-  detached: string | null,
-): HostDisplayStatus {
-  if (detached) return 'disconnected'
+export function hostRowStatus(status: HostStatus): HostDisplayStatus {
   if (status === 'connected' || status === 'idle') return 'connected'
   // `reconnecting` collapses to the amber `connecting` color — the
   // overlay tells the user *why*; the dot just signals "in flight".
@@ -50,9 +46,8 @@ export function hostRowStatus(
 export function displayedHostStatus(
   host: Host,
   status: HostStatus | undefined,
-  detached: string | null,
 ): HostDisplayStatus {
-  // Localhost: the dot stays green when the tmux client is healthy
+  // Localhost: the dot stays green when the daemon link is healthy
   // (or we haven't heard otherwise yet). Real trouble (Reconnecting
   // because tmux died, Error because it can't be brought up) falls
   // through to the regular status mapping so the user can see + act.
@@ -60,7 +55,7 @@ export function displayedHostStatus(
     if (status === undefined || status === 'connected' || status === 'idle') {
       return 'connected'
     }
-    return hostRowStatus(status, detached)
+    return hostRowStatus(status)
   }
-  return hostRowStatus(status ?? 'disconnected', detached)
+  return hostRowStatus(status ?? 'disconnected')
 }

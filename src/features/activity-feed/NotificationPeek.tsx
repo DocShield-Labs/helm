@@ -7,13 +7,13 @@
  * Dismisses on mouse-leave with a short grace period so quickly moving
  * between rows doesn't make it flicker.
  *
- * Source data is `paneCaptures` — already populated on connect by
- * helm-host's prehydrate pass and kept warm by live %output events,
- * so the peek is essentially free to render.
+ * Source data is the pane's byte stream (`lib/session/stream`) — the
+ * same buffer the pane renders from, so the peek is essentially free
+ * and always current.
  *
  * Click-to-merge: when the user clicks the inbox row, the active pane
  * synchronously switches to the notification's source window. The new
- * pane is already mounted (TmuxPane keep-alive) sitting underneath
+ * pane is already mounted (BlockPane keep-alive) sitting underneath
  * the peek. Instead of dismissing the peek instantly, we hold it
  * visible and animate scale 1→1.02 + opacity 1→0 over 380ms so the
  * peek visually dissolves to reveal the live pane. The user perceives
@@ -22,8 +22,9 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { commands } from '@lib/ipc'
 import { useStore } from '@lib/store'
+import * as stream from '@lib/session/stream'
+import { lastLines, linesToText, renderAnsi } from '@lib/session/ansi'
 
 const PEEK_CLOSE_GRACE_MS = 120
 const PEEK_MERGE_MS = 460
@@ -34,7 +35,6 @@ export function NotificationPeek() {
   const mergingInboxId = useStore((s) => s.mergingInboxId)
   const setMergingInboxId = useStore((s) => s.setMergingInboxId)
   const notifications = useStore((s) => s.notifications)
-  const paneCaptures = useStore((s) => s.paneCaptures)
   const sessions = useStore((s) => s.sessions)
   const hosts = useStore((s) => s.hosts)
   const activeHostId = useStore((s) => s.activeHostId)
@@ -56,36 +56,33 @@ export function NotificationPeek() {
 
   const notif = peekedId ? notifications.get(peekedId) : undefined
   const host = notif ? hosts.get(notif.host_id) : undefined
-  const captureKey = notif ? `${notif.host_id}::${notif.pane_id}` : ''
-  // The store's paneCaptures are populated on connect by the prehydrate
-  // pass — they're a snapshot from then, not live. Live `%output` bytes
-  // stream into xterm but don't write back here. Show the cached
-  // capture for instant perceived response, then issue a fresh
-  // tmux_capture_pane when the peek opens and swap in the up-to-date
-  // text. The fetch is one cheap IPC call (single-digit ms locally,
-  // RTT remote) so it's fine to fire on every hover.
-  const cached = paneCaptures.get(captureKey)
-  const [fresh, setFresh] = useState<{ key: string; data: string } | null>(null)
-
+  // Re-render as the pane's stream grows while the peek is open, and
+  // pull the pane's history if this is the first time we look at it.
+  const [tick, setTick] = useState(0)
+  const peekHost = notif?.host_id
+  const peekPane = notif?.pane_id
   useEffect(() => {
-    if (!notif) return
-    const key = `${notif.host_id}::${notif.pane_id}`
+    if (!peekHost || !peekPane) return
     let cancelled = false
-    void commands.tmuxCapturePane(notif.host_id, notif.pane_id, 0).then((res) => {
-      if (cancelled) return
-      if (res.status === 'ok') setFresh({ key, data: res.data })
+    const unsub = stream.subscribeTail(peekHost, peekPane, () => setTick((t) => t + 1))
+    void stream.ensureHistory(peekHost, peekPane).then(() => {
+      if (!cancelled) setTick((t) => t + 1)
     })
-    return () => { cancelled = true }
-  }, [notif?.id, notif?.host_id, notif?.pane_id])
+    return () => {
+      cancelled = true
+      unsub()
+    }
+  }, [peekHost, peekPane])
 
-  const data =
-    fresh && fresh.key === captureKey
-      ? fresh.data
-      : cached?.data ?? ''
-  // Take a generous slice — the panel itself caps the visible height
-  // via maxHeight + flex-col-reverse + overflow-hidden, so extra
-  // lines just fill the buffer that gets clipped from the top.
-  const text = data ? lastLines(stripAnsi(data), 60) : ''
+  const text = useMemo(() => {
+    if (!peekHost || !peekPane) return ''
+    const end = stream.head(peekHost, peekPane)
+    const from = Math.max(stream.start(peekHost, peekPane), end - 8192)
+    const bytes = stream.slice(peekHost, peekPane, from, end)
+    if (!bytes || bytes.length === 0) return ''
+    return linesToText(lastLines(renderAnsi(new TextDecoder().decode(bytes)), 60))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [peekHost, peekPane, tick])
 
   // Resolve a friendly "workspace · window" label from the live tree.
   let windowLabel = ''
@@ -203,30 +200,11 @@ export function NotificationPeek() {
               panel auto-sizes to content (no empty space). */}
           <div className="flex min-h-0 flex-col-reverse overflow-hidden">
             <pre className="m-0 whitespace-pre px-4 py-3 font-mono text-[11px] leading-[1.55] text-text-secondary">
-              {text || 'No capture available yet.'}
+              {text || 'No output yet.'}
             </pre>
           </div>
         </motion.div>
       )}
     </AnimatePresence>
   )
-}
-
-/** Strip the most common ANSI sequences (CSI for color/cursor, OSC for
- * titles/hyperlinks) so the capture renders as plain text. We don't try
- * to be exhaustive — anything we miss just shows up as a control glyph,
- * which is rare in practice and only in edge cases like custom prompts
- * with unusual escape patterns. */
-function stripAnsi(s: string): string {
-  return s
-    .replace(/\x1b\[[\d;?]*[a-zA-Z]/g, '')
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
-    .replace(/\x1b[()][0-9A-Z]/g, '')
-    .replace(/\r/g, '')
-}
-
-function lastLines(s: string, n: number): string {
-  const lines = s.split('\n')
-  while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop()
-  return lines.slice(-n).join('\n')
 }

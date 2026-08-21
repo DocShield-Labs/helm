@@ -40,15 +40,18 @@ export interface Theme {
 
 export const THEMES: readonly Theme[] = [
   {
-    name: 'Phenomenon',
-    bg: '#121212',
-    fg: '#faf9f6',
-    accent: '#2e5d9e',
+    // Helm 2.0 default — near-black with warm white, helm blue accent,
+    // Warp-style luminous ANSI pastels. Mirrors `ANSI16` in
+    // lib/session/ansi.ts so DOM blocks and the xterm tail agree.
+    name: 'Helm',
+    bg: '#0C0C0E',
+    fg: '#F5F4F0',
+    accent: '#4B8BF5',
     ansi: {
-      black: '#121212', red: '#d22d1e', green: '#1ca05a', yellow: '#e5a01a',
-      blue: '#3780e9', magenta: '#bf409d', cyan: '#799c92', white: '#faf9f6',
-      brightBlack: '#292929', brightRed: '#ae756f', brightGreen: '#789b88', brightYellow: '#bd9f65',
-      brightBlue: '#6f839f', brightMagenta: '#a57899', brightCyan: '#bfc5c3', brightWhite: '#ffffff',
+      black: '#3A3A3E', red: '#E0564A', green: '#3DBA7E', yellow: '#E8B04B',
+      blue: '#4B8BF5', magenta: '#C678DD', cyan: '#56B6C2', white: '#D7D6D2',
+      brightBlack: '#6B6B70', brightRed: '#FF7B70', brightGreen: '#5ED39A', brightYellow: '#F5C56B',
+      brightBlue: '#7AA8FF', brightMagenta: '#D98FE8', brightCyan: '#7BD0DA', brightWhite: '#F5F4F0',
     },
   },
   {
@@ -149,7 +152,7 @@ export const THEMES: readonly Theme[] = [
   },
 ]
 
-export const DEFAULT_THEME_NAME = 'Phenomenon'
+export const DEFAULT_THEME_NAME = 'Helm'
 
 export function getTheme(name: string | undefined): Theme {
   if (name) {

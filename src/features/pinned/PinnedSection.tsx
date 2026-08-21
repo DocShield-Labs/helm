@@ -19,11 +19,10 @@
  *   - offline: host is reachable in principle but not connected (remote
  *              that hasn't been clicked yet, or disconnected)
  *   - stale: host's tree is loaded but the workspace/window aren't
- *            there — user killed it elsewhere or tmux server restarted
+ *            there — user killed it elsewhere or the daemon restarted
  */
 
 import { useMemo, useState } from 'react'
-import { commands } from '@lib/ipc'
 import {
   isWindowRunning,
   notificationsForWindow,
@@ -33,7 +32,7 @@ import {
   type TmuxWindow,
   type TmuxWorkspace,
 } from '@lib/store'
-import { connectHost, selectWorkspace } from '@lib/host'
+import { connectHost, selectWindow } from '@lib/host'
 import { killWindow } from '@lib/actions/window'
 import type { Host, HostStatus, Notification } from '@bindings'
 import {
@@ -168,11 +167,7 @@ function PinnedRow({
       return
     }
     if (stale || !workspace || !window) return
-    const store = useStore.getState()
-    store.setActiveHost(host.id)
-    store.setActiveWindow(host.id, workspace.id, window.id)
-    void selectWorkspace(host.id, workspace.id)
-    void commands.tmuxSelectWindow(host.id, window.id)
+    selectWindow(host.id, workspace.id, window.id)
   }
 
   const menuItems: Array<ContextMenuItem | 'separator'> = [

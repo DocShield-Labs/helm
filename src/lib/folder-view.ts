@@ -14,7 +14,7 @@
  * sampled yet; it sorts to the bottom under a `(no cwd)` label.
  */
 
-import type { HostSessions, TmuxWindow, TmuxWorkspace } from './store'
+import { compareIds, type HostSessions, type TmuxWindow, type TmuxWorkspace } from './store'
 import { paneCwdFor, prettyCwd } from './path'
 
 export interface FolderEntry {
@@ -51,7 +51,7 @@ export function groupHostByFolder(hs: HostSessions): FolderGroup[] {
   }
   const groups: FolderGroup[] = []
   for (const [path, entries] of buckets) {
-    entries.sort((a, b) => a.window.id.localeCompare(b.window.id))
+    entries.sort((a, b) => compareIds(a.window.id, b.window.id))
     groups.push({
       path,
       label: path === '' ? NO_CWD_LABEL : prettyCwd(path),

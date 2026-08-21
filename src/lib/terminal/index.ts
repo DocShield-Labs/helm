@@ -2,7 +2,7 @@
  * xterm.js + WebGL renderer wrapper. Thin and unopinionated:
  * the consumer creates a div, hands it to `attachTerminal`, and we wire up
  * the renderer + addons. Backpressure (`xon`/`xoff` via Terminal.write())
- * happens implicitly — see crates/helm-pty for the producer-side batching.
+ * happens implicitly — helmd batches on the producer side.
  */
 
 import { Terminal } from '@xterm/xterm'
@@ -123,10 +123,10 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     linkHandler: {
       activate: (_event, uri) => openLink(uri),
     },
-    // tmux's protocol output uses bare LF, not CRLF — xterm needs to translate
-    // so the cursor returns to column 0 on each newline. Disable this and
-    // every line drifts right by the previous line's length.
-    convertEol: true,
+    // helmd forwards raw PTY bytes (real CRLF from the line discipline),
+    // so no LF→CRLF translation: doing it would double-space output
+    // from programs that already emit CRLF.
+    convertEol: false,
     scrollback: 10_000,
     // When a TUI like Claude Code or vim turns on mouse capture
     // (DECSET 1000/1006), xterm forwards every click to the app and
@@ -145,9 +145,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   term.loadAddon(search)
 
   // WebLinks: detect http(s) URLs in output and make them clickable.
-  // Phase 4F polish: a custom matcher for `path:line` references is
-  // layered on top in the consuming pane (TmuxPane) so we keep this
-  // wrapper generic.
   //
   // The default handler routes through the Rust `open_url` command —
   // Tauri's webview blocks `window.open`, so without this, clicking
@@ -278,8 +275,9 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   measureCellSize()
   const onWheel = (e: WheelEvent) => {
     if (e.ctrlKey || e.metaKey) return
-    e.preventDefault()
-    e.stopPropagation()
+    // Alt-screen TUIs own the wheel (xterm converts it to arrow keys or
+    // mouse reports for them) — don't intercept.
+    if (term.buffer.active.type === 'alternate') return
 
     let rowDelta: number
     switch (e.deltaMode) {
@@ -294,6 +292,19 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
         rowDelta = e.deltaY / cachedCellH
         break
     }
+
+    // At the edges of xterm's own scrollback, let the event bubble so
+    // the enclosing block list scrolls instead (the tail sits at the
+    // bottom of a larger document).
+    const buf = term.buffer.active
+    const atTop = buf.viewportY <= 0
+    const atBottom = buf.viewportY >= buf.baseY
+    if ((rowDelta < 0 && atTop) || (rowDelta > 0 && atBottom)) {
+      scrollAccum = 0
+      return
+    }
+    e.preventDefault()
+    e.stopPropagation()
 
     scrollAccum += rowDelta
     const intRows = Math.trunc(scrollAccum)

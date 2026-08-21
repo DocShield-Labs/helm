@@ -1,10 +1,11 @@
 /**
  * Client-side projection of the Rust workspace tree.
  *
- * Each host has multiple *workspaces* (= tmux sessions). Each workspace
- * owns a set of windows and panes. One workspace per host is the active
- * one (drives the rendered pane); one host is the active one (drives the
- * sidebar selection).
+ * Each host has multiple *workspaces*. Each workspace owns a set of
+ * windows and panes (helmd's tree, stringified ids). One workspace per
+ * host is the active one (drives the rendered pane); one host is the
+ * active one (drives the sidebar selection). `active` flags on windows
+ * and panes are purely frontend selection state.
  *
  * The Rust side emits a single tagged `HostEvent` stream. `lib/host.ts`
  * routes those events into the actions on this store.
@@ -50,7 +51,7 @@ export interface TmuxPane {
 }
 
 export interface TmuxWorkspace {
-  /** tmux session id, e.g. `$3` */
+  /** helmd workspace id, stringified ("3"). */
   id: string
   name: string
   windows: Map<string, TmuxWindow>
@@ -70,8 +71,6 @@ export interface HostSessions {
    * opt-out semantics of collapsedWorkspaces — newly-observed folders
    * appear expanded by default. In-memory only. */
   collapsedFolders: Set<string>
-  /** Populated from a tmux `%exit` notification — null while live. */
-  detachedReason: string | null
 }
 
 export const emptyHostSessions = (): HostSessions => ({
@@ -79,7 +78,6 @@ export const emptyHostSessions = (): HostSessions => ({
   activeWorkspaceId: null,
   collapsedWorkspaces: new Set(),
   collapsedFolders: new Set(),
-  detachedReason: null,
 })
 
 /** Pending host-key prompt — surfaced when the SSH server's key is
@@ -268,28 +266,13 @@ interface HelmState {
   hostLatencies: Map<HostId, number>
   observeHostLatency: (id: HostId, ms: number) => void
 
-  // ---------- pane capture cache ----------
-  /** Cached `tmux capture-pane` buffer per pane, keyed by
-   * `${hostId}::${paneId}`. Pre-fetched after host connect so opening
-   * a pane for the first time is instant — no round-trip to capture
-   * historic content. Live updates flow through `subscribePaneOutput`
-   * once the xterm mounts.
-   *
-   * `hasScrollback` distinguishes the cheap-but-partial pre-hydrate
-   * (visible buffer only) from a full-history capture. TmuxPane uses
-   * the partial for instant first paint, then upgrades to full
-   * scrollback in the background. */
-  paneCaptures: Map<string, { data: string; hasScrollback: boolean }>
-  setPaneCapture: (host: HostId, paneId: string, data: string, hasScrollback: boolean) => void
-  clearPaneCapturesForHost: (host: HostId) => void
-
   // ---------- per-host sessions ----------
   sessions: Map<HostId, HostSessions>
 
   setActiveWorkspace: (host: HostId, workspaceId: string) => void
-  /** Wholesale replace a host's workspaces from a refetch. Preserves
-   * activeWorkspaceId if the workspace still exists; otherwise picks the
-   * first available one (or null if none). Honours `pendingWindowKills`:
+  /** Wholesale replace a host's workspaces from a daemon tree. Preserves
+   * activeWorkspaceId and per-workspace window/pane selection where the
+   * ids still exist; otherwise picks the first. Honours `pendingWindowKills`:
    * any window whose kill is mid-undo gets stripped from the incoming
    * tree (along with its panes) so a refetch in that 5s window can't
    * resurrect it. */
@@ -300,17 +283,15 @@ interface HelmState {
   setActiveWindow: (host: HostId, workspaceId: string, windowId: string) => void
   /** Flag the active pane within a window; demote others in that window. */
   setActivePane: (host: HostId, workspaceId: string, windowId: string, paneId: string) => void
-  /** Update a single pane's cwd (and branch) in place. Driven by the
-   * OSC 133 `prompt_start` marker stream so the sidebar's folder
-   * grouping reflects user `cd`s without waiting for the next tree
-   * refetch. No-op when the pane isn't in the tree yet — a marker
-   * arriving before the next setWorkspaces refetch is a benign race. */
+  /** Update a single pane's cwd (and branch) in place. Driven by
+   * block events (each prompt reports cwd/branch) so the sidebar's
+   * folder grouping reflects user `cd`s live. No-op when the pane
+   * isn't in the tree yet. */
   updatePaneCwd: (host: HostId, paneId: string, cwd: string, branch: string) => void
   /** Toggle whether a workspace's window list is visible. */
   toggleWorkspaceCollapsed: (host: HostId, workspaceId: string) => void
   /** Toggle whether a folder's window list is visible (folder view). */
   toggleFolderCollapsed: (host: HostId, folderPath: string) => void
-  markDetached: (host: HostId, reason: string | null) => void
 
   // ---------- pending window kills (5s undo) ----------
   /** Snapshots of windows that have been optimistically removed from
@@ -338,17 +319,15 @@ interface HelmState {
   commitPendingWorkspaceKill: (key: string) => void
 
   // ---------- live running indicator ----------
-  /** Panes whose most recent OSC 133 marker was `B` (CommandStart) and
-   * which haven't yet received a matching `D` (CommandDone). Sourced
-   * from the same `output` events that drive BlockTracker — the
-   * sidebar dot rolls this up to "is anything in this window/workspace
-   * currently busy?" so the user sees a spinner on rows where work is
-   * happening live. Keyed by `${hostId}::${paneId}`. */
+  /** Panes with an open block (command accepted, not yet finished).
+   * Sourced from `SessionEvent.Block`. The sidebar dot rolls this up
+   * to "is anything in this window/workspace busy?". Keyed by
+   * `${hostId}::${paneId}`. */
   runningPanes: Map<string, { hostId: HostId; startedAt: number; command: string | null }>
   markPaneRunning: (host: HostId, paneId: string, command: string | null) => void
   markPaneIdle: (host: HostId, paneId: string) => void
   /** Drop every running entry for a host. Called on disconnect and
-   * host removal so a stale spinner doesn't outlive its tmux server. */
+   * host removal so a stale spinner doesn't outlive its daemon. */
   clearRunningForHost: (host: HostId) => void
 
   // ---------- confirm dialog ----------
@@ -483,17 +462,52 @@ export interface PinnedWindow {
 }
 
 /** Stable key for a pin. Using both ids keeps localhost+remote pins
- * distinct even if their tmux ids happen to collide (they won't, but
- * defensive). */
+ * distinct even though daemon ids collide across hosts. */
 export function pinnedKey(hostId: HostId, workspaceName: string, windowId: string): string {
   return `${hostId}::${workspaceName}::${windowId}`
 }
 
-/** Sort a collection of `{id: string}` items ascending by id. Used
- * everywhere we want a stable, sidebar-matching order for windows
- * and similar tmux objects. */
+/** Sort a collection of `{id: string}` items ascending by id. helmd
+ * ids are monotonic integers stringified, so compare numerically
+ * ("10" after "9"); non-numeric ids fall back to string order. */
+export function compareIds(a: string, b: string): number {
+  const na = Number(a), nb = Number(b)
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb
+  return a.localeCompare(b)
+}
+
 export function sortById<T extends { id: string }>(items: Iterable<T>): T[] {
-  return [...items].sort((a, b) => a.id.localeCompare(b.id))
+  return [...items].sort((a, b) => compareIds(a.id, b.id))
+}
+
+/** Carry selection (`active` flags) from a previous projection of a
+ * workspace onto a fresh one from the daemon. The daemon knows nothing
+ * about selection, so every incoming tree arrives with all flags
+ * false; without this, each Tree event would reset the user's focus. */
+function withSelection(incoming: TmuxWorkspace, prev: TmuxWorkspace | undefined): TmuxWorkspace {
+  const windows = new Map<string, TmuxWindow>()
+  const sortedWins = sortById(incoming.windows.values())
+  const prevActiveWin = prev ? [...prev.windows.values()].find((w) => w.active)?.id : undefined
+  const activeWin =
+    prevActiveWin && incoming.windows.has(prevActiveWin) ? prevActiveWin : sortedWins[0]?.id
+  for (const w of sortedWins) windows.set(w.id, { ...w, active: w.id === activeWin })
+
+  const panes = new Map<string, TmuxPane>()
+  const byWindow = new Map<string, TmuxPane[]>()
+  for (const p of sortById(incoming.panes.values())) {
+    const list = byWindow.get(p.windowId) ?? []
+    list.push(p)
+    byWindow.set(p.windowId, list)
+  }
+  for (const [wid, list] of byWindow) {
+    const prevActivePane = prev
+      ? [...prev.panes.values()].find((p) => p.windowId === wid && p.active)?.id
+      : undefined
+    const activePane =
+      prevActivePane && list.some((p) => p.id === prevActivePane) ? prevActivePane : list[0]?.id
+    for (const p of list) panes.set(p.id, { ...p, active: p.id === activePane })
+  }
+  return { ...incoming, windows, panes }
 }
 
 /** Best-effort localStorage JSON read. Returns `fallback` on missing
@@ -750,8 +764,8 @@ export const useStore = create<HelmState>((set, get) => ({
       const nextExpanded = new Set(s.expandedHosts)
       nextExpanded.delete(id)
 
-      // Notifications, pane captures, running panes, and tool
-      // suggestions are all keyed by string compounds that include
+      // Notifications, running panes, and tool suggestions are all
+      // keyed by string compounds that include
       // the host id — walk each and drop matching entries. The
       // hostId-prefixed key formats are documented at the field
       // declarations above.
@@ -763,10 +777,6 @@ export const useStore = create<HelmState>((set, get) => ({
       const nextRunning = new Map(s.runningPanes)
       for (const k of s.runningPanes.keys()) {
         if (k.startsWith(prefix)) nextRunning.delete(k)
-      }
-      const nextCaptures = new Map(s.paneCaptures)
-      for (const k of s.paneCaptures.keys()) {
-        if (k.startsWith(prefix)) nextCaptures.delete(k)
       }
       const nextSuggestions = s.toolSuggestions.filter((t) => t.hostId !== id)
       const nextPinned = s.pinnedWindows.filter((p) => p.hostId !== id)
@@ -785,7 +795,6 @@ export const useStore = create<HelmState>((set, get) => ({
         expandedHosts: nextExpanded,
         notifications: nextNotifications,
         runningPanes: nextRunning,
-        paneCaptures: nextCaptures,
         toolSuggestions: nextSuggestions,
         pinnedWindows: nextPinned,
         activeHostId: s.activeHostId === id ? null : s.activeHostId,
@@ -827,25 +836,6 @@ export const useStore = create<HelmState>((set, get) => ({
       return { hostLatencies: map }
     }),
 
-  paneCaptures: new Map(),
-
-  setPaneCapture: (host, paneId, data, hasScrollback) =>
-    set((s) => {
-      const next = new Map(s.paneCaptures)
-      next.set(`${host}::${paneId}`, { data, hasScrollback })
-      return { paneCaptures: next }
-    }),
-
-  clearPaneCapturesForHost: (host) =>
-    set((s) => {
-      const prefix = `${host}::`
-      const next = new Map<string, { data: string; hasScrollback: boolean }>()
-      for (const [k, v] of s.paneCaptures) {
-        if (!k.startsWith(prefix)) next.set(k, v)
-      }
-      return next.size === s.paneCaptures.size ? {} : { paneCaptures: next }
-    }),
-
   sessions: new Map(),
 
   setActiveWorkspace: (host, workspaceId) =>
@@ -859,8 +849,8 @@ export const useStore = create<HelmState>((set, get) => ({
   setWorkspaces: (host, workspaces) =>
     set((s) => {
       // Strip windows AND workspaces whose kill is mid-undo. Without
-      // this filter, any refetch in the 5s window (e.g. from a
-      // `%window-add` event in another workspace) would resurrect a row
+      // this filter, any tree event in the 5s window (e.g. a window
+      // added in another workspace) would resurrect a row
       // the user just killed, and the deferred kill would still fire —
       // so the row would die again 5s later with no visible cause. Both
       // the window/workspace AND any associated panes are removed;
@@ -902,15 +892,15 @@ export const useStore = create<HelmState>((set, get) => ({
             return { ...ws, windows, panes }
           })
 
-      const incoming = new Map<string, TmuxWorkspace>()
-      for (const w of filtered) incoming.set(w.id, w)
       const cur = s.sessions.get(host) ?? emptyHostSessions()
+      const incoming = new Map<string, TmuxWorkspace>()
+      for (const w of filtered) incoming.set(w.id, withSelection(w, cur.workspaces.get(w.id)))
       // Keep the existing active selection if the workspace still exists;
       // otherwise pick the first incoming one (or null if zero workspaces).
       const stillThere = cur.activeWorkspaceId && incoming.has(cur.activeWorkspaceId)
       const nextActive = stillThere
         ? cur.activeWorkspaceId
-        : filtered[0]?.id ?? null
+        : sortById(filtered)[0]?.id ?? null
       const next = new Map(s.sessions)
       next.set(host, {
         ...cur,
@@ -931,9 +921,8 @@ export const useStore = create<HelmState>((set, get) => ({
     set((s) => ({
       sessions: withHostSessions(s.sessions, host, (cur) =>
         withWorkspace(cur, workspaceId, (w) => {
-          // Don't early-return if `windowId` isn't in the map yet — tmux
-          // sometimes fires `%session-window-changed` BEFORE `%window-add`.
-          // The next refetch will pick it up.
+          // Don't early-return if `windowId` isn't in the map yet —
+          // a selection can race the tree event that adds the window.
           const next = new Map<string, TmuxWindow>()
           for (const [wid, win] of w.windows) {
             next.set(wid, { ...win, active: wid === windowId })
@@ -969,17 +958,10 @@ export const useStore = create<HelmState>((set, get) => ({
       // low tens), so this scan is cheap relative to the cost of a
       // re-render. Bail if the pane isn't in the tree yet (race with
       // tree refetch).
-      let targetWsId: string | undefined
-      let prev: TmuxPane | undefined
-      for (const ws of hs.workspaces.values()) {
-        const p = ws.panes.get(paneId)
-        if (p) {
-          targetWsId = ws.id
-          prev = p
-          break
-        }
-      }
-      if (!targetWsId || !prev) return {}
+      const located = locatePane(hs, paneId)
+      if (!located) return {}
+      const targetWsId = located.workspace.id
+      const prev = located.pane
       // Skip the re-render if nothing actually changed — `prompt_start`
       // fires on every prompt redraw, so the same cwd+branch arrives
       // many times in a row inside one folder.
@@ -1015,14 +997,6 @@ export const useStore = create<HelmState>((set, get) => ({
         else next.add(folderPath)
         return { ...cur, collapsedFolders: next }
       }),
-    })),
-
-  markDetached: (host, reason) =>
-    set((s) => ({
-      sessions: withHostSessions(s.sessions, host, (cur) => ({
-        ...cur,
-        detachedReason: reason,
-      })),
     })),
 
   pendingWindowKills: new Map(),
@@ -1377,6 +1351,21 @@ export const useStore = create<HelmState>((set, get) => ({
 
 // ---------- selector helpers ----------
 
+/** Locate a pane within a host's tree: its workspace, its window, and
+ * the pane record. The one lookup every "which window is pane X in"
+ * question goes through. */
+export function locatePane(
+  hs: HostSessions | undefined,
+  paneId: string,
+): { workspace: TmuxWorkspace; window: TmuxWindow | undefined; pane: TmuxPane } | undefined {
+  if (!hs) return undefined
+  for (const ws of hs.workspaces.values()) {
+    const pane = ws.panes.get(paneId)
+    if (pane) return { workspace: ws, window: ws.windows.get(pane.windowId), pane }
+  }
+  return undefined
+}
+
 /** Find which workspace owns a given window id (within a host). */
 export function workspaceForWindow(
   hs: HostSessions | undefined,
@@ -1425,14 +1414,8 @@ export function notificationsForWindow(
       continue
     }
     // Backend hadn't resolved the window yet — try the local tree.
-    if (n.window_id === '' && hostSessions) {
-      for (const ws of hostSessions.workspaces.values()) {
-        const pane = ws.panes.get(n.pane_id)
-        if (pane && pane.windowId === windowId) {
-          out.push(n)
-          break
-        }
-      }
+    if (n.window_id === '' && locatePane(hostSessions, n.pane_id)?.pane.windowId === windowId) {
+      out.push(n)
     }
   }
   out.sort((a, b) => a.created_at - b.created_at)

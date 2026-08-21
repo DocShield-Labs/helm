@@ -9,8 +9,8 @@
  * `color-mix`, so swapping the theme re-skins every surface in the
  * app at once.
  *
- * The default values below approximate Warp's "Phenomenon" theme so
- * the first paint (before App.tsx's theme effect fires) looks right.
+ * The default values below are the "Helm" theme so the first paint
+ * (before App.tsx's theme effect fires) looks right.
  *
  * Surfaces lighten as you go up the elevation stack on DARK themes;
  * they darken on LIGHT themes. JS sets `data-theme-mode="dark|light"`
@@ -20,12 +20,12 @@
 
 :root {
   /* ---------- Theme bases (overridden by JS at runtime) ---------- */
-  --terminal-bg:      #121212;
-  --terminal-fg:      #faf9f6;
-  --terminal-accent:  #3780e9;
-  --terminal-failed:  #d22d1e;
-  --terminal-success: #1ca05a;
-  --terminal-warning: #e5a01a;
+  --terminal-bg:      #0C0C0E;
+  --terminal-fg:      #F5F4F0;
+  --terminal-accent:  #4B8BF5;
+  --terminal-failed:  #E0564A;
+  --terminal-success: #3DBA7E;
+  --terminal-warning: #E8B04B;
 
   /* ---------- Text (universal — opacity tiers on the theme fg) ---------- */
   --text-primary:   var(--terminal-fg);
@@ -133,7 +133,7 @@
  * elevated surfaces read as raised. On a LIGHT theme we mix toward
  * black instead so the same hierarchy holds visually. The default
  * (no `data-theme-mode` set yet) follows the dark recipe so first
- * paint matches Phenomenon. */
+ * paint matches the Helm theme. */
 :root,
 [data-theme-mode='dark'] {
   --bg-canvas:   var(--terminal-bg);

@@ -20,7 +20,7 @@ import { useMemo, useRef } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import { commands } from '@lib/ipc'
 import { useStore, workspaceForWindow, type HostSessions } from '@lib/store'
-import { selectWorkspace } from '@lib/host'
+import { selectWindow } from '@lib/host'
 import { prettyCwd } from '@lib/path'
 import type { Host, Notification, NotificationId, NotificationKind } from '@bindings'
 
@@ -29,7 +29,6 @@ export function InboxSection() {
   const hosts = useStore((s) => s.hosts)
   const sessions = useStore((s) => s.sessions)
   const setActiveHost = useStore((s) => s.setActiveHost)
-  const setActiveWindow = useStore((s) => s.setActiveWindow)
   const activeHostId = useStore((s) => s.activeHostId)
 
   // Hover-peek glue: a single shared close timer at the section level
@@ -90,7 +89,7 @@ export function InboxSection() {
   const hasItems = list.length > 0
 
   const onJump = (n: Notification) => {
-    // Schedule failures aren't tied to a tmux pane — clicking the row
+    // Schedule failures aren't tied to a pane — clicking the row
     // opens the schedule editor for the failing schedule so the user
     // can fix the underlying problem (bad cwd, disconnected host, …)
     // and dismisses the row.
@@ -134,9 +133,7 @@ export function InboxSection() {
       workspaceId = ws?.id ?? null
     }
     if (workspaceId && windowId) {
-      setActiveWindow(n.host_id, workspaceId, windowId)
-      void selectWorkspace(n.host_id, workspaceId)
-      void commands.tmuxSelectWindow(n.host_id, windowId)
+      selectWindow(n.host_id, workspaceId, windowId)
     }
   }
 

@@ -7,12 +7,12 @@
  */
 
 import { commands } from '@lib/ipc'
-import { selectWorkspace } from '@lib/host'
+import { selectWindow } from '@lib/host'
 import { useStore, pinnedKey, sortById, type TmuxWindow, type TmuxWorkspace } from '@lib/store'
 import { groupHostByFolder } from '@lib/folder-view'
 import type { Action } from './types'
 import type { HostId } from '@bindings'
-import { activeHostId, activeWorkspace, createFolderWindow, HOME_START_DIR } from './workspace'
+import { activeHostId, activeWorkspace, createFolderWindow } from './workspace'
 
 function activeWindow(): TmuxWindow | undefined {
   const ws = activeWorkspace()
@@ -59,10 +59,7 @@ export async function cyclePinnedWindow(dir: 1 | -1): Promise<void> {
     const win = ws?.windows.get(target.windowId)
     if (!ws || !win) continue
 
-    state.setActiveHost(target.hostId)
-    state.setActiveWindow(target.hostId, ws.id, win.id)
-    await selectWorkspace(target.hostId, ws.id)
-    void commands.tmuxSelectWindow(target.hostId, win.id)
+    selectWindow(target.hostId, ws.id, win.id)
     return
   }
 }
@@ -88,7 +85,7 @@ export function killWindow(hostId: HostId, workspaceId: string, window: TmuxWind
     message: `Killed window "${window.name}"`,
     durationMs: 5_000,
     deferredAction: () => {
-      void commands.tmuxKillWindow(hostId, window.id)
+      void commands.windowKill(hostId, window.id)
       useStore.getState().commitPendingWindowKill(key)
     },
     action: {
@@ -110,8 +107,8 @@ export function killWindow(hostId: HostId, workspaceId: string, window: TmuxWind
  * In folder view we cycle within the active folder instead — folder
  * grouping is what the user actually sees in the sidebar, and stepping
  * across the underlying workspace would jump them to siblings that
- * aren't visible. Crossing workspace boundaries is fine because the
- * window-click path already handles `selectWorkspace` + `tmuxSelectWindow`. */
+ * aren't visible. Crossing workspace boundaries is fine — selection is
+ * local state (`selectWindow`). */
 async function stepWindow(direction: 1 | -1): Promise<void> {
   const state = useStore.getState()
   const hostId = state.activeHostId
@@ -137,23 +134,14 @@ async function stepWindow(direction: 1 | -1): Promise<void> {
     const idx = group.entries.findIndex((e) => e.window.id === win.id)
     if (idx < 0) return
     const next = group.entries[(idx + direction + group.entries.length) % group.entries.length]
-    state.setActiveHost(hostId)
-    state.setActiveWindow(hostId, next.workspace.id, next.window.id)
-    await selectWorkspace(hostId, next.workspace.id)
-    const res = await commands.tmuxSelectWindow(hostId, next.window.id)
-    if (res.status !== 'ok') {
-      console.warn('tmux_select_window failed:', res.error)
-    }
+    selectWindow(hostId, next.workspace.id, next.window.id)
     return
   }
 
   if (!ws) return
   const next = neighbourWindowId(ws, win?.id, direction)
   if (!next) return
-  const res = await commands.tmuxSelectWindow(hostId, next)
-  if (res.status !== 'ok') {
-    console.warn('tmux_select_window failed:', res.error)
-  }
+  selectWindow(hostId, ws.id, next)
 }
 
 export const windowActions: Action[] = [
@@ -180,7 +168,13 @@ export const windowActions: Action[] = [
         return
       }
       const ws = activeWorkspace()
-      if (ws) void commands.tmuxNewWindow(hostId, ws.id, null, HOME_START_DIR)
+      if (ws) {
+        void commands.windowNew(hostId, ws.id, null, null, null).then((res) => {
+          if (res.status === 'ok' && res.data.window_id) {
+            selectWindow(hostId, ws.id, res.data.window_id)
+          }
+        })
+      }
     },
   },
   {

@@ -4,15 +4,14 @@
  * deliberately out of scope this phase.
  */
 
-import { commands } from '@lib/ipc'
-import { selectWorkspace } from '@lib/host'
+import { selectWindow } from '@lib/host'
 import { useStore, workspaceForWindow } from '@lib/store'
 import type { Action } from './types'
 
 /** Cmd+Shift+I — switch host if needed, then focus the window owning
  * the oldest live notification. Doesn't dismiss the notification;
  * dismissal happens when the user types into the focused pane (handled
- * inside TmuxPane). */
+ * inside BlockPane). */
 export function jumpToOldestNotification(): void {
   const state = useStore.getState()
   let oldest: { hostId: string; windowId: string; createdAt: number } | null = null
@@ -22,14 +21,10 @@ export function jumpToOldestNotification(): void {
     }
   }
   if (!oldest) return
-  state.setActiveHost(oldest.hostId)
   const hs = state.sessions.get(oldest.hostId)
   const ws = workspaceForWindow(hs, oldest.windowId)
-  if (ws) {
-    state.setActiveWindow(oldest.hostId, ws.id, oldest.windowId)
-    void selectWorkspace(oldest.hostId, ws.id)
-  }
-  void commands.tmuxSelectWindow(oldest.hostId, oldest.windowId)
+  if (ws) selectWindow(oldest.hostId, ws.id, oldest.windowId)
+  else state.setActiveHost(oldest.hostId)
 }
 
 export const inboxActions: Action[] = [

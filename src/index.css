@@ -56,12 +56,9 @@ button:not(:disabled),
 }
 
 /*
- * Hide xterm's native scrollbar entirely. We render our own React
- * scrollbar (`TerminalScrollbar`) that lives outside xterm's screen
- * layer and isn't visually overlapped by selections or block chrome.
- * Keep `width: 0` so xterm-viewport's overflow:scroll still functions
- * (xterm relies on the scrollable element internally) — just no
- * visible affordance.
+ * Hide xterm's native scrollbar. The live tail sits inside the pane's
+ * block-list scroll container, which owns the visible scrollbar; xterm
+ * keeps its internal viewport (width 0) for its own scrollback.
  */
 .xterm-viewport::-webkit-scrollbar {
   width: 0;
@@ -87,4 +84,55 @@ button:not(:disabled),
 }
 @media (prefers-reduced-motion: reduce) {
   .activity-running-pulse { animation: none; opacity: 0.6; }
+}
+
+/*
+ * Block-native pane. Finished commands render as DOM; the live tail is
+ * one xterm at the bottom of the same scroll container.
+ */
+.helm-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.helm-scroll::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--terminal-fg) 14%, transparent);
+  border-radius: 4px;
+}
+.helm-scroll::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--terminal-fg) 24%, transparent);
+}
+.helm-block-output {
+  margin: 0;
+  padding: 2px 20px 10px 44px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+}
+.helm-block-failed {
+  background: color-mix(in srgb, var(--terminal-failed) 8%, transparent);
+}
+@keyframes helm-block-flash {
+  0%   { background-color: color-mix(in srgb, var(--terminal-accent) 22%, transparent); }
+  100% { background-color: transparent; }
+}
+.helm-block-flash {
+  animation: helm-block-flash 1.2s ease-out;
+}
+.helm-block-header {
+  /* Sticky command line (Warp's "snackbar" header): paint an opaque
+     background so output scrolling beneath it doesn't bleed through. */
+  background: var(--terminal-bg);
+}
+.helm-block-failed > .helm-block-header {
+  background: color-mix(in srgb, var(--terminal-failed) 8%, var(--terminal-bg));
+}
+/* Cmd+F matches inside DOM blocks (CSS Custom Highlight API). */
+::highlight(helm-find) {
+  background-color: color-mix(in srgb, var(--terminal-accent) 35%, transparent);
+}
+::highlight(helm-find-active) {
+  background-color: var(--terminal-warning);
+  color: var(--terminal-bg);
 }

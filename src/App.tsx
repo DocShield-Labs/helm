@@ -2,15 +2,15 @@
  * Phase 2 / multi-workspace landing.
  *
  * Boots the global event channel, lists hosts, picks localhost as the
- * active host, connects, and renders each host's tmux workspaces in the
- * sidebar. Each host can have many workspaces (= tmux sessions); each
- * workspace owns its windows; one window in the active workspace renders
- * its active pane through xterm.
+ * active host, connects, and renders each host's workspaces in the
+ * sidebar. Each host can have many workspaces; each workspace owns its
+ * windows; one window in the active workspace renders its active pane
+ * as a block list + live tail (BlockPane).
  *
- * Selection model (all in store.ts):
+ * Selection model (all in store.ts, purely frontend):
  *   - activeHostId            — which host's tree drives the sidebar
  *   - per-host activeWorkspaceId — within a host, which workspace's windows show
- *   - per-window active flag  — tmux's own notion, surfaced via notifications
+ *   - per-window / per-pane active flags
  */
 
 import { useEffect, useMemo, useState } from 'react'
@@ -32,7 +32,8 @@ import {
   setThemeForAllTerminals,
 } from '@lib/terminal'
 import { createWorkspace, killWorkspace } from '@lib/actions/workspace'
-import { TmuxPane } from '@features/shell/TmuxPane'
+import { BlockPane } from '@features/shell/BlockPane'
+import { sendInput } from '@lib/session/stream'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
 import { ScheduleEditorModal } from '@features/schedule/ScheduleEditorModal'
 import { HostKeyPromptModal } from '@features/host-key/HostKeyPromptModal'
@@ -54,8 +55,8 @@ import type { Host, HostStatus } from '@bindings'
 // component-scoped `useRef` doesn't work here because React 19's
 // StrictMode mounts → unmounts → re-mounts the component in dev,
 // creating a fresh ref on the second mount; the boot chain would
-// then run twice and spawn two `tmux -CC` clients on localhost in
-// parallel. Module state survives mount/unmount cycles within the
+// then run twice and double-connect localhost. Module state survives
+// mount/unmount cycles within the
 // same process, so the second mount's effect sees `true` and bails.
 let bootStarted = false
 
@@ -76,7 +77,7 @@ export function App() {
   // (or null for "add new").
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<Host | null>(null)
-  // Panes the user has activated at least once. Mounted TmuxPane instances
+  // Panes the user has activated at least once. Mounted BlockPane instances
   // for these are kept alive across workspace/window switches — switching
   // back to a previously-visited pane is instant because its xterm buffer
   // still has all the prior content (and the subscription kept consuming
@@ -135,7 +136,7 @@ export function App() {
     return activeHostSessions.workspaces.get(id)
   }, [activeHostSessions])
 
-  // Stable order by tmux id within a workspace.
+  // Stable order by id within a workspace.
   const windowList = useMemo(
     () => (activeWorkspace ? sortById(activeWorkspace.windows.values()) : []),
     [activeWorkspace],
@@ -171,7 +172,7 @@ export function App() {
     })
   }, [activePaneKey])
 
-  // Garbage-collect mounted panes whose tmux pane id no longer exists
+  // Garbage-collect mounted panes whose pane id no longer exists
   // (workspace killed, window closed, host removed, etc.). Without this
   // we'd leak xterm instances every time the user kills something.
   useEffect(() => {
@@ -248,7 +249,7 @@ export function App() {
   // ---------- file drag-and-drop → active pane ----------
   // Tauri's WebView swallows native HTML5 drop events and re-emits them
   // as `tauri://drag-drop` carrying real filesystem paths. Type each
-  // dropped path into the active pane via the same `tmux_send_keys`
+  // dropped path into the active pane via the same `session_input`
   // path as a keystroke, with iTerm2-style backslash escaping so a
   // shell or a TUI like Claude Code both receive it as if typed.
   //
@@ -278,13 +279,7 @@ export function App() {
         }
         const paths = event.payload.paths
         if (!paths || paths.length === 0) return
-        const text = paths.map(escapeShellPath).join(' ') + ' '
-        const bytes = Array.from(new TextEncoder().encode(text))
-        void commands.tmuxSendKeys(hostId, paneId, bytes).then((res) => {
-          if (res.status !== 'ok') {
-            console.warn('drag-drop tmux_send_keys failed:', res.error)
-          }
-        })
+        void sendInput(hostId, paneId, paths.map(escapeShellPath).join(' ') + ' ')
       })
       if (cancelled) {
         fn()
@@ -300,10 +295,9 @@ export function App() {
   }, [activeHostId, activePane])
 
   // ---------- latency probe ----------
-  // Time a cheap tmux command (list-sessions with the smallest possible
-  // format) to gauge round-trip on the active host. Only run for remote
-  // hosts that are actually connected — local is always ~0 and a probe
-  // on a disconnected host would just queue up failures.
+  // Round-trip to the host's daemon (measured in Rust, so it's the real
+  // transport, not webview IPC). Only for connected remote hosts —
+  // local is always ~0.
   useEffect(() => {
     if (!activeHostId) return
     const host = hosts.get(activeHostId)
@@ -311,11 +305,8 @@ export function App() {
     if (activeStatus !== 'connected' && activeStatus !== 'idle') return
     const observe = useStore.getState().observeHostLatency
     const probe = async () => {
-      const start = performance.now()
-      const res = await commands.tmuxListSessions(activeHostId, '#{session_id}')
-      if (res.status === 'ok') {
-        observe(activeHostId, performance.now() - start)
-      }
+      const res = await commands.sessionPing(activeHostId)
+      if (res.status === 'ok') observe(activeHostId, res.data)
     }
     void probe()
     const id = window.setInterval(() => void probe(), 4000)
@@ -376,7 +367,7 @@ export function App() {
             transition: 'left 180ms cubic-bezier(0.2, 0.7, 0.2, 1)',
           }}
         >
-          {/* Keep-alive pane stack: one TmuxPane per pane the user has
+          {/* Keep-alive pane stack: one BlockPane per pane the user has
               ever visited; only the active one is visible. Hidden panes
               continue to receive live output and keep their xterm
               buffer warm, so switching back is instant. */}
@@ -395,7 +386,7 @@ export function App() {
                 // keep working in memory.
                 style={{ display: isVisible ? 'flex' : 'none' }}
               >
-                <TmuxPane hostId={hostId} paneId={paneId} isVisible={isVisible} />
+                <BlockPane hostId={hostId} paneId={paneId} isVisible={isVisible} />
               </div>
             )
           })}
@@ -419,7 +410,7 @@ export function App() {
           hostName={activeHost?.name ?? '—'}
           state={
             activeHost
-              ? displayedHostStatus(activeHost, activeStatus, activeHostSessions?.detachedReason ?? null)
+              ? displayedHostStatus(activeHost, activeStatus)
               : 'disconnected'
           }
         />
@@ -455,7 +446,7 @@ export function App() {
           <>
             <StatusBarSegment
               onClick={appUpdate.installing ? undefined : appUpdate.install}
-              title={`Install Helm ${appUpdate.version} and relaunch — tmux sessions survive`}
+              title={`Install Helm ${appUpdate.version} and relaunch — your sessions survive`}
             >
               <span className="font-mono text-[12px] text-text-secondary">⬆</span>
               <span className="text-[12px] text-text-primary">
@@ -522,7 +513,7 @@ async function deleteHost(host: Host): Promise<void> {
   const ok = await useStore.getState().requestConfirm({
     title: `Delete host "${host.name}"?`,
     message:
-      'This removes it from your saved list and clears any stored password. tmux sessions on the remote machine are unaffected.',
+      'This removes it from your saved list and clears any stored password. Sessions on the remote machine are unaffected.',
     confirmLabel: 'Delete',
     destructive: true,
   })
@@ -547,7 +538,7 @@ async function deleteHost(host: Host): Promise<void> {
   }
 }
 
-/** Render a tmux-command round-trip latency for the connection segment.
+/** Render a round-trip latency for the connection segment.
  * Sub-millisecond samples (effectively in-process queue) show as `<1ms`
  * so they don't render as a flickery "0ms". Anything ≥ 1s switches to
  * seconds with one decimal — at that point the user cares about magnitude

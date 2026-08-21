@@ -21,13 +21,14 @@ import {
   type HostSessions,
   type TmuxWindow,
   type TmuxWorkspace,
+  sortById,
 } from '@lib/store'
-import { connectHost, selectWorkspace } from '@lib/host'
+import { connectHost, selectWindow, selectWorkspace } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
 import { paneCwdFor, prettyCwd } from '@lib/path'
 import { groupHostByFolder, type FolderGroup } from '@lib/folder-view'
 import { killWindow } from '@lib/actions/window'
-import { createFolderWindow, HOME_START_DIR } from '@lib/actions/workspace'
+import { createFolderWindow } from '@lib/actions/workspace'
 import type { Host, HostId } from '@bindings'
 import { StatusDot } from './StatusDot'
 import { SidebarHostRow } from './SidebarHostRow'
@@ -161,9 +162,8 @@ function ExpandedSidebar({
         const hostNotifs = notificationsForHost(notifications, h.id)
 
         // Render a single window row. Identical between workspace and
-        // folder mode — selection still flips the underlying tmux
-        // session (entry.workspace) regardless of which header it
-        // sits beneath.
+        // folder mode — selection still targets the owning workspace
+        // (entry.workspace) regardless of which header it sits beneath.
         const renderWindow = (w: TmuxWorkspace, win: TmuxWindow) => {
           const isActiveWs = isActive && hs?.activeWorkspaceId === w.id
           const isFocused = isActive && isActiveWs && win.active
@@ -192,16 +192,10 @@ function ExpandedSidebar({
               onUnpin={() => {
                 removePinnedWindow(`${h.id}::${w.name}::${win.id}`)
               }}
-              onClick={() => {
-                const store = useStore.getState()
-                store.setActiveHost(h.id)
-                store.setActiveWindow(h.id, w.id, win.id)
-                void selectWorkspace(h.id, w.id)
-                void commands.tmuxSelectWindow(h.id, win.id)
-              }}
+              onClick={() => selectWindow(h.id, w.id, win.id)}
               onRename={(newName) => {
                 if (newName && newName !== win.name) {
-                  void commands.tmuxRenameWindow(h.id, win.id, newName)
+                  void commands.windowRename(h.id, win.id, newName)
                 }
               }}
               onKill={() => killWindow(h.id, w.id, win)}
@@ -219,7 +213,7 @@ function ExpandedSidebar({
           <div key={h.id} className="flex flex-col gap-1">
             <SidebarHostRow
               name={h.name}
-              status={displayedHostStatus(h, status, hs?.detachedReason ?? null)}
+              status={displayedHostStatus(h, status)}
               state={isActive ? 'active' : 'rest'}
               expanded={hostExpanded}
               onToggleExpand={() => toggleHostExpanded(h.id)}
@@ -244,9 +238,7 @@ function ExpandedSidebar({
               workspaceList.map((w) => {
                 const isActiveWs = isActive && hs?.activeWorkspaceId === w.id
                 const expanded = !(hs?.collapsedWorkspaces.has(w.id) ?? false)
-                const winsForWs = [...w.windows.values()].sort((a, b) =>
-                  a.id.localeCompare(b.id),
-                )
+                const winsForWs = sortById(w.windows.values())
                 const wsNotifs = notificationsForWorkspace(notifications, hs, h.id, w.id)
                 return (
                   <div key={w.id} className="flex flex-col gap-1">
@@ -264,7 +256,7 @@ function ExpandedSidebar({
                       onToggleExpand={() => toggleWorkspaceCollapsed(h.id, w.id)}
                       onRename={(newName) => {
                         if (newName && newName !== w.name) {
-                          void commands.tmuxRenameSession(h.id, w.id, newName)
+                          void commands.workspaceRename(h.id, w.id, newName)
                         }
                       }}
                       onKill={() => onKillWorkspace(h.id, w)}
@@ -273,7 +265,11 @@ function ExpandedSidebar({
                         // workspace and pin selection on it.
                         useStore.getState().setActiveHost(h.id)
                         void selectWorkspace(h.id, w.id)
-                        void commands.tmuxNewWindow(h.id, w.id, null, HOME_START_DIR)
+                        void commands.windowNew(h.id, w.id, null, null, null).then((res) => {
+                          if (res.status === 'ok' && res.data.window_id) {
+                            selectWindow(h.id, w.id, res.data.window_id)
+                          }
+                        })
                       }}
                     />
                     {expanded && (
@@ -481,11 +477,7 @@ function CollapsedSidebar({
             return
           }
           if (stale || !resolved.workspace || !resolved.window) return
-          const store = useStore.getState()
-          store.setActiveHost(pin.hostId)
-          store.setActiveWindow(pin.hostId, resolved.workspace.id, resolved.window.id)
-          void selectWorkspace(pin.hostId, resolved.workspace.id)
-          void commands.tmuxSelectWindow(pin.hostId, resolved.window.id)
+          selectWindow(pin.hostId, resolved.workspace.id, resolved.window.id)
         }
 
         return (
@@ -537,7 +529,7 @@ function CollapsedSidebar({
               isActive ? 'bg-accent-muted' : 'hover:bg-white/[0.04]'
             }`}
           >
-            <StatusDot state={displayedHostStatus(h, status, sessions.get(h.id)?.detachedReason ?? null)} />
+            <StatusDot state={displayedHostStatus(h, status)} />
           </button>
         )
       })}
@@ -612,7 +604,7 @@ function HostPeekPopover({
   const statuses = useStore((s) => s.statuses)
   const sidebarViewMode = useStore((s) => s.sidebarViewMode)
   const status = statuses.get(host.id) ?? 'disconnected'
-  const displayed = displayedHostStatus(host, status, hs?.detachedReason ?? null)
+  const displayed = displayedHostStatus(host, status)
 
   const workspaceList = useMemo(() => {
     if (!hs) return []
@@ -662,7 +654,7 @@ function HostPeekPopover({
           {connecting
             ? 'connecting…'
             : offline
-              ? hs?.detachedReason ?? 'disconnected'
+              ? 'disconnected'
               : totalWindows === 1
                 ? '1 window'
                 : `${totalWindows} windows`}
@@ -689,9 +681,7 @@ function HostPeekPopover({
           </div>
         ) : sidebarViewMode === 'workspace' ? (
           workspaceList.map((w) => {
-            const winsForWs = [...w.windows.values()].sort((a, b) =>
-              a.id.localeCompare(b.id),
-            )
+            const winsForWs = sortById(w.windows.values())
             return (
               <div key={w.id} className="pb-1">
                 <div
@@ -856,7 +846,7 @@ function ChevronsRightIcon({ size = 18 }: { size?: number }) {
 // ---------------------------------------------------------------------------
 // Hover-peek window button — shared between the workspace and folder
 // branches of HostPeekPopover. Kept local since the click semantics
-// pin selection on the underlying tmux session regardless of which
+// pin selection on the owning workspace regardless of which
 // header it sat under.
 function PeekWindowButton({
   hostId,
@@ -875,11 +865,7 @@ function PeekWindowButton({
     <button
       type="button"
       onClick={() => {
-        const store = useStore.getState()
-        store.setActiveHost(hostId)
-        store.setActiveWindow(hostId, ws.id, win.id)
-        void selectWorkspace(hostId, ws.id)
-        void commands.tmuxSelectWindow(hostId, win.id)
+        selectWindow(hostId, ws.id, win.id)
         onClose()
       }}
       className={`flex h-7 w-full items-center gap-2 px-3 ${

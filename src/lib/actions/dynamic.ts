@@ -15,7 +15,7 @@
  */
 
 import { commands } from '@lib/ipc'
-import { connectHost, selectWorkspace } from '@lib/host'
+import { connectHost, selectWindow, selectWorkspace } from '@lib/host'
 import { useStore, pinnedKey, sortById, type TmuxWindow, type TmuxWorkspace } from '@lib/store'
 import {
   displayedHostStatus,
@@ -119,8 +119,8 @@ function foldersAsActions(): SubModeResult {
     for (const fg of folderGroups) {
       const id = `folder.${host.id}.${fg.path}`
       // Jump to the first window in the folder. Folders aren't a
-      // selectable tmux unit on their own, so "switching" means
-      // landing on a window inside it.
+      // selectable unit on their own, so "switching" means landing on
+      // a window inside it.
       const first = fg.entries[0]
       actions.push({
         id,
@@ -130,10 +130,7 @@ function foldersAsActions(): SubModeResult {
         icon: '▦',
         run: () => {
           if (!first) return
-          state.setActiveHost(host.id)
-          state.setActiveWindow(host.id, first.workspace.id, first.window.id)
-          void selectWorkspace(host.id, first.workspace.id)
-          void commands.tmuxSelectWindow(host.id, first.window.id)
+          selectWindow(host.id, first.workspace.id, first.window.id)
         },
       })
       groups.set(id, header)
@@ -154,10 +151,7 @@ function windowSubActions(host: Host, ws: TmuxWorkspace, win: TmuxWindow): Actio
       label: 'Jump to window',
       icon: '⏵',
       run: () => {
-        state.setActiveHost(host.id)
-        state.setActiveWindow(host.id, ws.id, win.id)
-        void selectWorkspace(host.id, ws.id)
-        void commands.tmuxSelectWindow(host.id, win.id)
+        selectWindow(host.id, ws.id, win.id)
       },
     },
     isPinned
@@ -217,8 +211,7 @@ export function windowsAsActions(): SubModeResult {
         )
         // Sublabel reflects current grouping: folder-of-cwd in folder
         // view, workspace name in workspace view. The action's run is
-        // identical either way — selection still flips the underlying
-        // tmux session.
+        // identical either way.
         const tail = folderMode
           ? (() => {
               const cwd = paneCwdFor(win.id, ws)
@@ -233,10 +226,7 @@ export function windowsAsActions(): SubModeResult {
           icon: isPinned ? '★' : '▢',
           weight: isPinned ? 5 : 0,
           run: () => {
-            state.setActiveHost(host.id)
-            state.setActiveWindow(host.id, ws.id, win.id)
-            void selectWorkspace(host.id, ws.id)
-            void commands.tmuxSelectWindow(host.id, win.id)
+            selectWindow(host.id, ws.id, win.id)
           },
           subActions: () => windowSubActions(host, ws, win),
         })
@@ -285,7 +275,7 @@ function hostSubActions(host: Host, display: HostDisplayStatus): Action[] {
           const ok = await useStore.getState().requestConfirm({
             title: `Delete host "${host.name}"?`,
             message:
-              'This removes it from your saved list and clears any stored password. tmux sessions on the remote machine are unaffected.',
+              'This removes it from your saved list and clears any stored password. Sessions on the remote machine are unaffected.',
             confirmLabel: 'Delete',
             destructive: true,
           })
@@ -326,8 +316,7 @@ export function hostsAsActions(): SubModeResult {
   const sorted = [...state.hosts.values()]
     .map((h) => {
       const status = state.statuses.get(h.id)
-      const detached = state.sessions.get(h.id)?.detachedReason ?? null
-      return { host: h, display: displayedHostStatus(h, status, detached) }
+      return { host: h, display: displayedHostStatus(h, status) }
     })
     .sort((a, b) => {
       const r = STATUS_RANK[a.display] - STATUS_RANK[b.display]
