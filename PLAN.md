@@ -162,17 +162,21 @@ command — is a known coding agent (`claude`, `codex`, `gemini`, `aider`).
 | non-agent TUI (vim, htop)    | —           | plain terminal, no composer                    | native                                           |
 
 Blocked is Warp's behaviour (the agent input closes while the agent is
-`Blocked`, reopens when it resumes). We detect it from the Claude Code
-hooks (Notification + Stop → BEL on `$HELM_TTY`): helmd strips BEL from
-the stream and the inbox suppresses the focused window, so the pump now
-also emits `SessionEvent::Bell` for every bell and the pane counts them.
+`Blocked`, reopens when it resumes). The Claude Code hooks tell them
+apart: `Notification` for a permission prompt / elicitation rings BEL
+(blocked); `Stop` and other notifications write an OSC 9 message
+(`ESC ] 9 ; Claude finished BEL`) — an inbox row, no blocking. helmd
+strips BEL from the stream and the inbox suppresses the focused window,
+so the pump also emits `SessionEvent::Bell` for every bell and the pane
+counts them. OSC 9 is the iTerm2 / Windows Terminal convention, so any
+CLI can post to the inbox the same way.
 
 Known limits: no shell completion in the composer (the shell isn't
 involved until ⏎); Claude's own input box stays visible in the TUI (we
 don't parse or re-skin it — its permission prompt is its own text);
-`Stop` also rings the bell, so the composer closes at the end of every
-turn until ⏎/click reopens it. The agent command is a constant for now
-(`AGENT_LAUNCH_COMMAND`), to become a per-host setting.
+`clear` hides the blocks (the bytes stay for search); the agent command
+is a constant for now (`AGENT_LAUNCH_COMMAND`), to become a per-host
+setting.
 
 ## Risks / open questions
 
@@ -295,5 +299,4 @@ turn until ⏎/click reopens it. The agent command is a constant for now
       Remaining polish: list virtualization past 250 blocks, settings
       surface (agent command per host), regex search daemon-side (M6),
       foreground-process tracking in helmd, cross-platform helmd bundles
-      for heterogeneous fleets, a real "agent is waiting vs done"
-      distinction (separate hook payloads).
+      for heterogeneous fleets.

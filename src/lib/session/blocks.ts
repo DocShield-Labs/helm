@@ -21,9 +21,18 @@ export interface PaneBlocks {
   /** Count of bells the pane has rung since the frontend started.
    * Consumers compare against the count they last acknowledged. */
   bells: number
+  /** Blocks starting before this seq are hidden (`clear`). */
+  clearedBefore: number
 }
 
-const EMPTY: PaneBlocks = { blocks: [], altScreen: false, exited: false, loaded: false, bells: 0 }
+const EMPTY: PaneBlocks = {
+  blocks: [],
+  altScreen: false,
+  exited: false,
+  loaded: false,
+  bells: 0,
+  clearedBefore: 0,
+}
 
 const panes = new Map<string, PaneBlocks>()
 const subs = new Map<string, Set<() => void>>()
@@ -57,6 +66,12 @@ export function setAltScreen(hostId: HostId, paneId: string, on: boolean): void 
 
 export function ringBell(hostId: HostId, paneId: string): void {
   update(key(hostId, paneId), (cur) => ({ ...cur, bells: cur.bells + 1 }))
+}
+
+/** `clear`: hide every block that started before `seq`. The bytes stay
+ * in the stream (search, replay); only the list forgets them. */
+export function clearBefore(hostId: HostId, paneId: string, seq: number): void {
+  update(key(hostId, paneId), (cur) => ({ ...cur, clearedBefore: Math.max(cur.clearedBefore, seq) }))
 }
 
 export function setExited(hostId: HostId, paneId: string): void {

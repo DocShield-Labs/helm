@@ -16,11 +16,13 @@ interface BlockListProps {
   hostId: HostId
   paneId: string
   blocks: readonly BlockInfo[]
+  /** Blocks starting before this seq were cleared. */
+  clearedBefore: number
 }
 
-export function BlockList({ hostId, paneId, blocks }: BlockListProps) {
+export function BlockList({ hostId, paneId, blocks, clearedBefore }: BlockListProps) {
   const [extra, setExtra] = useState(0)
-  const finished = blocks.filter(isRenderable)
+  const finished = blocks.filter((b) => b.start_seq >= clearedBefore && isRenderable(b))
   const limit = MAX_RENDERED + extra
   const hidden = Math.max(0, finished.length - limit)
   const shown = hidden > 0 ? finished.slice(hidden) : finished
