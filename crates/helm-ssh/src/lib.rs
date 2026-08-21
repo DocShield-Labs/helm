@@ -31,7 +31,7 @@
 use async_trait::async_trait;
 use helm_domain::{HostKeyDecision, HostKeyPromptKind};
 use russh::client::{self, Handle, Msg};
-use russh::{ChannelStream, Pty};
+use russh::ChannelStream;
 use russh_keys::agent::client::AgentClient;
 use russh_keys::key;
 use std::io::{PipeReader, PipeWriter, Read, Write};
@@ -61,43 +61,6 @@ pub trait HostKeyPrompter: Send + Sync {
     ) -> HostKeyDecision;
 }
 
-/// Raw-mode terminal settings sent with `request_pty`. Mirrors `cfmakeraw(3)`:
-/// disable canonical mode, echo, signal generation, CR/NL translation, flow
-/// control, and output post-processing.
-///
-/// Notes on portability:
-/// - `IUCLC` (lowercase-to-uppercase translation) is Linux-only. Including
-///   it can cause some sshd implementations to silently reject the entire
-///   modes list, so we leave it out.
-/// - Whether sshd honors any of these on a non-interactive `exec` channel
-///   is server-dependent. We don't rely on tabs round-tripping cleanly as
-///   a result — see the `|` delimiter in `lib/host.ts::refetchTree`.
-const RAW_TERMINAL_MODES: &[(Pty, u32)] = &[
-    // input flags
-    (Pty::IGNPAR, 1),
-    (Pty::INPCK, 0),
-    (Pty::ISTRIP, 0),
-    (Pty::INLCR, 0),
-    (Pty::IGNCR, 0),
-    (Pty::ICRNL, 0),
-    (Pty::IXON, 0),
-    (Pty::IXANY, 0),
-    (Pty::IXOFF, 0),
-    // local flags
-    (Pty::ISIG, 0),
-    (Pty::ICANON, 0),
-    (Pty::ECHO, 0),
-    (Pty::ECHOE, 0),
-    (Pty::ECHOK, 0),
-    (Pty::ECHONL, 0),
-    (Pty::IEXTEN, 0),
-    // output flags
-    (Pty::OPOST, 0),
-    (Pty::ONLCR, 0),
-    (Pty::OCRNL, 0),
-    (Pty::ONOCR, 0),
-    (Pty::ONLRET, 0),
-];
 
 #[derive(Debug, Error)]
 pub enum SshError {
@@ -167,8 +130,8 @@ pub struct SshSession {
 }
 
 /// Request from the caller's thread to the I/O thread. The I/O thread
-/// dispatches based on variant — `Exec` opens a long-lived PTY channel
-/// for tmux to drive, `OneShot` runs a non-PTY command and captures
+/// dispatches based on variant — `Exec` opens a long-lived no-PTY
+/// stream channel, `OneShot` runs a command and captures
 /// its full stdout/stderr/exit_code. Shape lets the I/O thread report
 /// errors back without the caller blocking on a tokio runtime.
 enum SessionRequest {
@@ -205,16 +168,16 @@ pub struct OneShotResult {
 }
 
 impl SshSession {
-    /// Open a new long-lived exec channel on this session. Reuses the
-    /// existing TCP + auth + russh `Handle`; only the per-channel
-    /// `request_pty` + `exec` runs over the wire. Cheap (a couple of
-    /// round-trips) so it's fine to call once per workspace at connect
-    /// time.
+    /// Open a long-lived exec channel on this session with NO PTY — a
+    /// clean 8-bit byte stream both ways, which is what the helmd stdio
+    /// bridge (and any binary upload) needs. A PTY's line discipline can
+    /// rewrite bytes (`\n`→`\r\n`, flow-control chars) and sshd does
+    /// not reliably honor requested raw modes on exec channels, so
+    /// there is deliberately no PTY variant.
     ///
     /// Sync-blocking with a 15s timeout. If the I/O thread has died
-    /// (transport drop, cleanup in flight), returns
-    /// `SshError::Thread`. Subject to the server's `MaxSessions` limit
-    /// (OpenSSH default 10) — surfaces as a channel-open error.
+    /// (transport drop, cleanup in flight), returns `SshError::Thread`.
+    /// Subject to the server's `MaxSessions` limit (OpenSSH default 10).
     pub fn open_exec(&self, command: String) -> Result<OpenedChannel, SshError> {
         let (tx, rx) = sync_mpsc::sync_channel(1);
         self.request_tx
@@ -433,9 +396,8 @@ fn session_io_thread(
     });
 }
 
-/// Open a russh exec channel on `handle`, request a PTY, exec the
-/// command, set up the duplex pumps, and return the caller-side pipe
-/// halves. The pump tasks are spawned on the current runtime and live
+/// Open a russh exec channel on `handle` (no PTY), exec the command,
+/// set up the duplex pumps, and return the caller-side pipe halves. The pump tasks are spawned on the current runtime and live
 /// until either side of the duplex closes (channel EOF or app pipe drop).
 async fn open_exec_channel(
     handle: &Handle<Client>,
@@ -445,20 +407,6 @@ async fn open_exec_channel(
         .channel_open_session()
         .await
         .map_err(|e| SshError::Channel(format!("open session: {e}")))?;
-
-    // PTY is required because tmux calls `tcgetattr` on startup. 80×24 is a
-    // placeholder; the frontend resizes immediately on TmuxPane mount.
-    //
-    // Terminal modes disable the line discipline so the remote PTY is
-    // byte-clean for tmux's stdin: no canonical mode, no echo, no signal
-    // generation, no \r↔\n translation, no flow control, no output post-
-    // processing. Without this, sshd's default cooked-mode PTY rewrites
-    // `\t` (and other control bytes) on its way into the tmux process,
-    // corrupting our format-string round-trips.
-    channel
-        .request_pty(false, "xterm-256color", 80, 24, 0, 0, RAW_TERMINAL_MODES)
-        .await
-        .map_err(|e| SshError::Channel(format!("request_pty: {e}")))?;
 
     channel
         .exec(false, command.into_bytes())
@@ -607,21 +555,26 @@ async fn auth_handshake(
     auth: SshAuth,
     prompter: Option<Arc<dyn HostKeyPrompter>>,
 ) -> Result<Handle<Client>, SshError> {
-    // Keepalive is what surfaces a dead connection. Without it, a socket
-    // left half-open by laptop sleep (or any silent network drop) is never
-    // probed: reads block forever with no EOF and writes just buffer into
-    // the frozen kernel send queue, so the channel never errors, the
-    // supervisor never sees ClientDied, and the UI keeps showing
-    // "connected" while keystrokes vanish. With an interval set, russh
-    // sends SSH global keepalives when idle and — after `keepalive_max`
-    // (default 3) go unanswered — tears the session down, which errors the
-    // channel and triggers reconnect. The timer is frozen during sleep, so
-    // detection lands ~interval × max seconds after wake (~45s here). This
-    // is the equivalent of OpenSSH's ServerAliveInterval/ServerAliveCountMax.
-    let config = Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(15)),
-        ..Default::default()
-    });
+    // NO keepalive_interval — deliberately. russh 0.46 sends
+    // `keepalive@openssh.com` global requests but never resets its
+    // unanswered-keepalive counter when the server replies, so the count
+    // climbs on any *idle* session until it trips `keepalive_max` and
+    // russh kills a perfectly healthy connection:
+    //
+    //   russh::client: Timeout, server not responding to keepalives
+    //   russh::client: disconnected: Error(KeepaliveTimeout)
+    //
+    // Observed against OpenSSH 10.0: connection established, sat idle,
+    // torn down 76s later with the server answering the whole time. The
+    // user-visible result was a terminal that froze roughly a minute
+    // after you stopped typing — every reconnect buying another ~76s.
+    //
+    // The dead-socket-after-sleep case that motivated adding this is
+    // covered by the wake probe in helm-app's `power.rs`, which is both
+    // faster (fires on the wake itself) and correct. Silent drops with
+    // no wake event (WiFi/VPN) fall back to the reconnect ladder once a
+    // channel errors. Revisit only if russh fixes the counter upstream.
+    let config = Arc::new(client::Config::default());
 
     let handle = if let Some(jump) = target.jump.as_deref() {
         let jump_client = Client::new(jump.hostname.clone(), jump.port, prompter.clone());
