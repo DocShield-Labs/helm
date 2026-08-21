@@ -28,7 +28,7 @@ use helm_domain::{
     AuthMethod, BlockInfo, Host, HostEvent, HostId, HostStatus, PaneInfo, SearchHit, SessionEvent,
     SessionTree, WindowInfo, WorkspaceInfo,
 };
-use helm_proto::client::{connect_io, connect_or_spawn_unix, Connected};
+use helm_proto::client::{connect_io, connect_or_spawn_unix, ClientError, Connected};
 use helm_proto::{DaemonMsg, TreeSnapshot};
 use helm_ssh::{HostKeyPrompter, SshAuth, SshTarget};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -451,12 +451,25 @@ async fn establish_local() -> Result<Established, String> {
     let socket = helmd_socket_path();
     let name = format!("helm-app {}", env!("CARGO_PKG_VERSION"));
     let connected = tokio::task::spawn_blocking(move || {
-        connect_or_spawn_unix(&socket, &bin, &name)
+        match connect_or_spawn_unix(&socket, &bin, &name) {
+            // A daemon from another build owns the socket. Its sessions
+            // are unreachable to us either way; replace it with ours.
+            Err(ClientError::HandshakeRejected(m)) if is_protocol_mismatch(&m) => {
+                tracing::warn!("local helmd is stale ({m}); restarting it");
+                helm_proto::shutdown_socket(&socket)?;
+                connect_or_spawn_unix(&socket, &bin, &name)
+            }
+            r => r,
+        }
     })
     .await
     .map_err(|e| format!("connect join: {e}"))?
     .map_err(|e| e.to_string())?;
     Ok(Established { connected, ssh: None })
+}
+
+fn is_protocol_mismatch(rejection: &str) -> bool {
+    rejection.contains("protocol mismatch")
 }
 
 fn helmd_socket_path() -> PathBuf {
@@ -537,16 +550,22 @@ async fn establish_remote(
         ensure_remote_helmd(&session)?;
 
         // The bridge channel. No PTY — this is a binary frame stream.
-        let opened = session
-            .open_exec(r#"exec "$HOME/.helm/bin/helmd" stdio"#.to_string())
-            .map_err(|e| e.to_string())?;
-        let connected = connect_io(
-            Box::new(opened.reader),
-            Box::new(opened.writer),
-            &name,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+        // A daemon left running from an older binary rejects our hello;
+        // stop it and let the bridge spawn the current one.
+        let bridge = |session: &Arc<helm_ssh::SshSession>| -> Result<Connected, ClientError> {
+            let opened = session
+                .open_exec(r#"exec "$HOME/.helm/bin/helmd" stdio"#.to_string())
+                .map_err(|e| ClientError::Io(std::io::Error::other(e.to_string())))?;
+            connect_io(Box::new(opened.reader), Box::new(opened.writer), &name, None)
+        };
+        let connected = match bridge(&session) {
+            Err(ClientError::HandshakeRejected(m)) if is_protocol_mismatch(&m) => {
+                tracing::warn!("remote helmd is stale ({m}); restarting it");
+                shutdown_remote_helmd(&session)?;
+                bridge(&session).map_err(|e| e.to_string())?
+            }
+            r => r.map_err(|e| e.to_string())?,
+        };
         Ok(Established { connected, ssh: Some(session) })
     })
     .await
@@ -626,7 +645,21 @@ fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String
             "helmd upload verification failed (got {verified:?}, wanted {expected:?})"
         ));
     }
+    // The binary changed under whatever daemon is running; the next
+    // `stdio` bridge spawns the new one once the old has exited.
+    if !installed.is_empty() {
+        shutdown_remote_helmd(session)?;
+    }
     Ok(())
+}
+
+/// Stop the daemon on the remote (`helmd shutdown`, which also pkills
+/// daemons too old to take the frame).
+fn shutdown_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String> {
+    session
+        .run_oneshot(r#""$HOME/.helm/bin/helmd" shutdown 2>/dev/null || pkill -f "helmd serve" || true"#.to_string())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// `helmd --version` on the remote (empty string when not installed).

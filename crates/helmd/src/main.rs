@@ -4,6 +4,8 @@
 //!   helmd stdio [--socket PATH]   bridge stdio ⇄ the daemon socket,
 //!                                 spawning `serve` if absent — what helm
 //!                                 runs over an SSH exec channel
+//!   helmd shutdown [--socket PATH] stop the running daemon (used when
+//!                                 the binary was upgraded under it)
 //!   helmd --version               print version + protocol version
 
 use std::path::PathBuf;
@@ -41,13 +43,18 @@ fn main() -> anyhow::Result<()> {
                 .build()?
                 .block_on(helmd::server::serve(&socket))
         }
+        Some("shutdown") => {
+            let socket = socket_arg(&args);
+            helm_proto::shutdown_socket(&socket)?;
+            Ok(())
+        }
         Some("stdio") => {
             // No stdout logging — stdout IS the protocol stream.
             let socket = socket_arg(&args);
             helmd::server::stdio_bridge(&socket)
         }
         _ => {
-            eprintln!("usage: helmd serve|stdio [--socket PATH] | helmd --version");
+            eprintln!("usage: helmd serve|stdio|shutdown [--socket PATH] | helmd --version");
             std::process::exit(2);
         }
     }

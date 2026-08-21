@@ -413,6 +413,49 @@ pub fn connect_or_spawn_socket(
     ))
 }
 
+/// Ask the daemon on `socket` to exit and make sure it did. A
+/// `Shutdown` frame first (any client may send one — it's the user's
+/// own daemon), then a `pkill` of `helmd serve --socket <socket>` for
+/// daemons too old to understand the frame, then the socket path is
+/// unlinked so a fresh `serve` can bind. Used when a running daemon
+/// speaks another protocol version than the app: the sessions inside
+/// it are unreachable either way, so restarting loses nothing usable.
+#[cfg(unix)]
+pub fn shutdown_socket(socket: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let alive = || UnixStream::connect(socket).is_ok();
+    let wait_dead = || {
+        for _ in 0..20 {
+            if !alive() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        !alive()
+    };
+    if let Ok(mut s) = UnixStream::connect(socket) {
+        if let Ok(frame) = encode_frame(&ClientMsg::Shutdown) {
+            let _ = s.write_all(&frame);
+            let _ = s.flush();
+        }
+    }
+    if !wait_dead() {
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(format!("helmd serve --socket {}", socket.display()))
+            .status();
+        if !wait_dead() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("helmd on {} would not exit", socket.display()),
+            ));
+        }
+    }
+    let _ = std::fs::remove_file(socket);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
