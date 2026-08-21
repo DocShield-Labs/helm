@@ -7,7 +7,7 @@
  * bar renders an "update available" segment — nothing installs without
  * a click, so a live SSH session is never yanked out from under the
  * user by a surprise relaunch. Install = download + verify signature +
- * swap the .app + relaunch; tmux servers (local and remote) survive the
+ * swap the .app + relaunch; helmd (local and remote) survives the
  * restart, so sessions reattach exactly where they were.
  *
  * Check failures (offline, rate-limited, endpoint missing) are
