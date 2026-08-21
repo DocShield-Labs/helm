@@ -8,10 +8,27 @@
  *   Agent     → the agent running in this pane, or — from a shell —
  *               launches one with the text as its prompt
  *
- * The editor is a textarea (native selection, paste, undo, IME); the
- * few terminal keys that make sense on an empty editor (^C ^D ^L, Esc
- * for an agent) pass straight through to the pane.
+ * The editor is a textarea (native selection, paste, undo, IME). An
+ * EMPTY editor is transparent to the agent: arrows, Tab, ⏎, Home/End,
+ * PageUp/Down go to the TUI, so Claude's menus (the --resume picker,
+ * option lists) work without leaving the composer; typing anything
+ * makes the same keys edit the draft. ^C ^D ^L and Esc pass through
+ * on an empty editor in either mode.
  */
+
+/** Keys an empty agent composer forwards, as the TUI expects them. */
+const PASSTHROUGH: Record<string, string> = {
+  ArrowUp: '\x1b[A',
+  ArrowDown: '\x1b[B',
+  ArrowRight: '\x1b[C',
+  ArrowLeft: '\x1b[D',
+  Home: '\x1b[H',
+  End: '\x1b[F',
+  PageUp: '\x1b[5~',
+  PageDown: '\x1b[6~',
+  Tab: '\t',
+  Enter: '\r',
+}
 
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { homeRelative } from '@lib/path'
@@ -76,8 +93,8 @@ export function Composer({
   const send = () => {
     const t = text.replace(/\s+$/, '')
     if (t === '') {
-      // Bare ⏎ at a shell prompt is a fresh prompt; to an agent it's a no-op.
-      if (mode === 'terminal') onRaw('\r')
+      // Bare ⏎: a fresh prompt from a shell, "confirm" to an agent's menu.
+      onRaw('\r')
       return
     }
     onSend(t)
@@ -105,6 +122,14 @@ export function Composer({
       e.preventDefault()
       onRaw('\x1b')
       return
+    }
+    if (mode === 'agent' && kind === 'agent' && text === '' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const seq = e.key === 'Tab' && e.shiftKey ? '\x1b[Z' : PASSTHROUGH[e.key]
+      if (seq) {
+        e.preventDefault()
+        onRaw(seq)
+        return
+      }
     }
     if (mode !== 'terminal' || history.length === 0) return
     const caret = ta.selectionStart
@@ -135,7 +160,11 @@ export function Composer({
       : 'Type a command…'
 
   const hints =
-    mode === 'agent' ? '⏎ send · ⇧⏎ newline' : '⏎ run · ⇧⏎ newline · ↑ history'
+    mode === 'agent'
+      ? kind === 'agent'
+        ? '⏎ send · ⇧⏎ newline · ↑↓⇥ reach the TUI when empty'
+        : '⏎ send · ⇧⏎ newline'
+      : '⏎ run · ⇧⏎ newline · ↑ history'
 
   return (
     <div
