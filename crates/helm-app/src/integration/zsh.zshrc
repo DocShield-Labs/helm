@@ -1,10 +1,15 @@
 # Helm zsh integration — auto-sourced when ZDOTDIR points here.
 #
-# tmux sets ZDOTDIR=~/.helm/integration/zsh in its server env, which makes
-# zsh read THIS .zshrc instead of the user's. We restore the user's
-# real ZDOTDIR (captured into HELM_USER_ZDOTDIR before we clobbered it),
-# source their actual .zshrc, and then install the OSC 133 prompt
-# integration hooks helm uses for the inbox + blocks UI.
+# The host session manager sets ZDOTDIR=~/.helm/integration/zsh in its server
+# env, which makes zsh read THIS .zshrc instead of the user's. We restore the
+# user's real ZDOTDIR (captured into HELM_USER_ZDOTDIR before we clobbered
+# it), source their actual .zshrc, and then install the OSC 133 marker hooks.
+#
+# This integration is PASSIVE: it only emits invisible OSC 133 markers
+# (command boundaries + cwd/branch/cmdline metadata) that helm consumes as
+# signals — for the inbox, the sidebar, and block segmentation. It never
+# touches PROMPT, prints no output of its own, and injects no SGR state.
+# The user's prompt and output render exactly as they would in any terminal.
 #
 # Safe to source twice — the precmd/preexec registration is idempotent
 # (we check before appending to the *_functions arrays).
@@ -14,6 +19,7 @@ if [[ -z "$HELM_INTEGRATION" ]]; then
     # zsh startup will handle everything.
     return 0
 fi
+
 
 # Restore the user's real dotfile location so any hooks they add to
 # precmd_functions / preexec_functions resolve relative to their config.
@@ -49,49 +55,9 @@ __helm_b64() {
 # emit `D` if we never emitted `B`).
 __helm_command_started=0
 
-# Phase 4F: helm renders block headers (cwd · branch) inline as ANSI
-# output on each new prompt and uses a minimal `❯ ` PROMPT, so the
-# Warp-style block list looks right out of the box. Set HELM_KEEP_PROMPT=1
-# to opt out and keep your real prompt + skip the header.
-if [[ -z "$HELM_KEEP_PROMPT" ]]; then
-    # Empty PROMPT — Warp-style "single clean pane." The cwd · branch
-    # header printed by precmd above the prompt already tells you
-    # where you are; the blinking cursor tells you where you'll type.
-    # No leading chevron, no decoration on the input row.
-    PROMPT=''
-    RPROMPT=''
-fi
-
-# Print one helm-styled block header line: "<cwd> · <branch>" in dim.
-# Called from __helm_precmd before the prompt itself prints. Using
-# `print -P` so zsh's prompt expansion handles colour codes for us.
-__helm_emit_block_header() {
-    if [[ -n "$HELM_KEEP_PROMPT" ]]; then
-        return
-    fi
-    local cwd_pretty branch
-    cwd_pretty="${PWD/#$HOME/~}"
-    branch=$(command git symbolic-ref --short HEAD 2>/dev/null)
-    if [[ -n "$branch" ]]; then
-        print -P "%F{244}${cwd_pretty} · ${branch}%f"
-    else
-        print -P "%F{244}${cwd_pretty}%f"
-    fi
-}
-
 __helm_precmd() {
     local exit_code=$?
-    # Reset SGR — preexec tinted command output dim grey, so without
-    # this the prompt below would inherit the dim colour.
-    if [[ -z "$HELM_KEEP_PROMPT" ]]; then
-        printf '\e[0m'
-    fi
     if [[ "$__helm_command_started" -eq 1 ]]; then
-        # No blank before D: prev block ends on whatever row the
-        # command's trailing \n left the cursor on. The blank
-        # produced by the `print` below belongs solely to the new
-        # block as its top padding, so consecutive blocks (including
-        # two reds in a row) don't double-tint a shared row.
         __helm_emit "D;$exit_code"
         __helm_command_started=0
     fi
@@ -102,16 +68,7 @@ __helm_precmd() {
     local cwd_b64 branch_b64
     cwd_b64=$(__helm_b64 "$cwd")
     branch_b64=$(__helm_b64 "$branch")
-    # Two blank rows of breathing room ABOVE A — they sit in the gap
-    # between blocks (no block "owns" them). Putting them BEFORE A means
-    # A captures the row where the cwd · branch header is about to
-    # print, so the block's startLine == its visible header row. This
-    # makes BlockOverlay's chip + divider math anchor off a single
-    # row (no "blank top-pad row inside the block" to count past).
-    print
-    print
     __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
-    __helm_emit_block_header
 }
 
 __helm_preexec() {
@@ -122,13 +79,6 @@ __helm_preexec() {
     cmdline_b64=$(__helm_b64 "$1")
     __helm_emit "B;cmdline_b64=${cmdline_b64}"
     __helm_emit "C"
-    # Tint output dim grey for the command's lifetime. Programs that
-    # emit their own SGR overrides win as usual; programs without
-    # explicit colour render dim, putting visual emphasis on the
-    # typed command + prompt above. Reset happens in precmd.
-    if [[ -z "$HELM_KEEP_PROMPT" ]]; then
-        printf '\e[38;5;245m'
-    fi
     __helm_command_started=1
 }
 

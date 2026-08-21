@@ -1,7 +1,7 @@
 //! Helm — Tauri entry crate.
 //!
-//! Wires helm-pty / helm-tmux / helm-ssh into the Tauri runtime, owns the
-//! global app state, and exposes commands + channels to the frontend.
+//! Wires helmd (via helm-proto) and helm-ssh into the Tauri runtime, owns
+//! the global app state, and exposes commands + channels to the frontend.
 
 mod commands;
 mod connection;
@@ -13,6 +13,7 @@ mod power;
 mod reachability;
 mod scheduler;
 mod schedules;
+mod shell;
 mod state;
 mod tool_integrations;
 
@@ -36,23 +37,19 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::host::host_connect,
         commands::host::host_disconnect,
         commands::host::host_key_prompt_response,
-        commands::tmux::tmux_send_keys,
-        commands::tmux::tmux_resize_pane,
-        commands::tmux::tmux_new_window,
-        commands::tmux::tmux_split_pane,
-        commands::tmux::tmux_kill_window,
-        commands::tmux::tmux_select_window,
-        commands::tmux::tmux_select_pane,
-        commands::tmux::tmux_rename_window,
-        commands::tmux::tmux_list_windows,
-        commands::tmux::tmux_list_panes,
-        commands::tmux::tmux_list_sessions,
-        commands::tmux::tmux_new_session,
-        commands::tmux::tmux_kill_session,
-        commands::tmux::tmux_rename_session,
-        commands::tmux::tmux_switch_client,
-        commands::tmux::tmux_capture_pane,
-        commands::tmux::tmux_resize_client,
+        commands::session::session_tree,
+        commands::session::session_input,
+        commands::session::session_resize,
+        commands::session::session_replay,
+        commands::session::workspace_new,
+        commands::session::workspace_kill,
+        commands::session::workspace_rename,
+        commands::session::window_new,
+        commands::session::window_kill,
+        commands::session::window_rename,
+        commands::session::session_search,
+        commands::session::session_blocks,
+        commands::session::session_ping,
         commands::notifications::notifications_list,
         commands::notifications::notification_dismiss,
         commands::notifications::notification_dismiss_for_window,
@@ -98,37 +95,11 @@ pub fn run() {
         .init();
 
     // Refresh the on-disk integration scripts to whatever this build
-    // shipped. Idempotent overwrite — cheap, and keeps the user's
-    // ~/.helm/integration tree in lockstep with the binary they just
-    // launched. Soft failure: if HOME is missing or the directory
-    // can't be created, we just log and continue without integration
-    // (bell detection still works).
+    // shipped. Idempotent overwrite — keeps ~/.helm/integration in
+    // lockstep with the binary. helmd points every shell it spawns at
+    // these via ZDOTDIR. Soft failure: log and continue.
     if let Err(e) = integration::install_local() {
         tracing::warn!("shell integration install failed: {e}");
-    }
-
-    // Set the integration env vars in helm's own process env so the
-    // *very first* tmux server we spawn inherits them at server start.
-    // Without this, the bootstrap session's first pane (which gets
-    // launched as part of tmux server startup, before we can
-    // `set-environment` anything) wouldn't have ZDOTDIR set and would
-    // miss zsh integration. configure_tmux_env still runs on every
-    // connect to keep tmux's server-global env in sync for later
-    // panes, but this is the only way to reach the bootstrap pane.
-    //
-    // Safety: std::env::set_var mutates only this process's env block
-    // — not the user's shell. tmux + spawn_local inherit our env, so
-    // the value flows through.
-    if let Some(home) = dirs::home_dir() {
-        let zsh_dir = home.join(".helm").join("integration").join("zsh");
-        let user_zdotdir = std::env::var("ZDOTDIR")
-            .unwrap_or_else(|_| home.to_string_lossy().into_owned());
-        // SAFETY: single-threaded boot, no env iteration in flight.
-        unsafe {
-            std::env::set_var("HELM_INTEGRATION", "1");
-            std::env::set_var("HELM_USER_ZDOTDIR", &user_zdotdir);
-            std::env::set_var("ZDOTDIR", &zsh_dir);
-        }
     }
 
     let specta = specta_builder();
@@ -171,11 +142,9 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } = event {
-            // Drop every host's tmux client so each `Drop` impl SIGKILLs its
-            // `-CC` process. The tmux *server* (and SSH session) keeps
-            // running with state intact for the next launch. Also abort
-            // any reconnect supervisors so they don't try to revive
-            // connections during shutdown.
+            // Drop every host's helmd session (the daemon and its
+            // processes keep running for the next launch) and abort
+            // reconnect supervisors so nothing revives during shutdown.
             let state: tauri::State<state::AppState> = app_handle.state();
             for entry in state.hosts.iter() {
                 if let Ok(mut guard) = entry.value().try_lock() {
@@ -183,7 +152,7 @@ pub fn run() {
                     if let Some(handle) = guard.supervisor.take() {
                         handle.abort();
                     }
-                    guard.shutdown_clients();
+                    guard.shutdown_session();
                 }
             }
         }

@@ -55,104 +55,106 @@ impl HostId {
     }
 }
 
-// ---------- tmux notifications (cross the IPC boundary) ----------
+// ---------- session events (helmd → frontend, cross the IPC boundary) ----------
+//
+// The Rust side talks to a helmd daemon per host (see `helm-proto` /
+// `helmd`); these are the frontend-facing mirrors of that protocol.
+// Ids are the daemon's u64s stringified ("1", "2", …) — string-keyed
+// maps are what the frontend store wants, and the ids stay opaque.
 
-/// In-band markers extracted from a pane's `%output` byte stream before
-/// the bytes are forwarded to xterm. Used to drive notifications
-/// (bell, command-completion) and — once the blocks UI lands — to record
-/// prompt/output spans against the xterm buffer.
-///
-/// Bell is a single 0x07 byte; the rest are OSC 133 sequences emitted by
-/// shells with helm's integration script sourced. We strip both from the
-/// forwarded bytes so xterm doesn't actually beep or render the escape
-/// sequences as glyphs.
-///
-/// `PromptStart` and `CommandStart` carry optional metadata (cwd, branch,
-/// command line) shipped by helm's integration scripts as base64 params on
-/// the OSC 133 envelope. None when the shell's integration is older than
-/// 4F or running under `HELM_KEEP_PROMPT=1`.
+/// The workspace → window → pane tree for one host, as reported by its
+/// daemon. Sent whole on every change — small, and keeps the frontend
+/// trivially convergent (no delta bookkeeping).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum OutputMarker {
-    /// BEL (0x07) seen in pane output. Most CLI tools (Claude Code,
-    /// finished long-running commands, IRC pings) emit this when they
-    /// want the user's attention.
-    Bell,
-    /// `OSC 133;A[;cwd_b64=…;branch_b64=…]` — the shell is about to
-    /// print a new prompt.
-    PromptStart {
-        /// Working directory at prompt time, decoded from `cwd_b64`.
-        cwd: Option<String>,
-        /// Current git branch (if cwd is inside a repo), decoded from
-        /// `branch_b64`. None when not in a repo or the integration
-        /// script couldn't run `git`.
-        branch: Option<String>,
-    },
-    /// `OSC 133;B[;cmdline_b64=…]` — the prompt has finished printing;
-    /// what follows is the user's typed command.
-    CommandStart {
-        /// The command line the user is about to run, decoded from
-        /// `cmdline_b64`. None when emitted from an older integration
-        /// script.
-        command: Option<String>,
-    },
-    /// `OSC 133;C` — the user pressed Enter; what follows is command
-    /// output.
-    OutputStart,
-    /// `OSC 133;D[;<exit_code>]` — the previous command finished with the
-    /// given exit code. None when the shell didn't include a code (older
-    /// integration scripts, partial sequences).
-    CommandDone { exit_code: Option<i32> },
+pub struct SessionTree {
+    pub workspaces: Vec<WorkspaceInfo>,
 }
 
-/// One marker, paired with the byte offset into the cleaned `%output`
-/// chunk where it was extracted.
-///
-/// Without offsets, multiple markers in a single chunk (e.g. `D` from
-/// the previous command + `A` for the new prompt + bytes between)
-/// can't be correlated to xterm rows on the frontend — the cursor
-/// would be sampled at the *end* of the whole chunk for every marker
-/// and block boundaries would land on the wrong line. The frontend
-/// uses these offsets to slice the byte stream and sample the cursor
-/// in xterm at each marker's position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-pub struct MarkerAt {
-    pub marker: OutputMarker,
-    /// Byte offset into the *cleaned* `bytes` field of
-    /// `TmuxNotification::Output`. The marker itself was stripped from
-    /// that buffer; this offset is the position where the marker would
-    /// have started.
-    pub offset: u32,
+pub struct WorkspaceInfo {
+    pub id: String,
+    pub name: String,
+    pub windows: Vec<WindowInfo>,
 }
 
-/// Wire format for tmux state deltas. Mirrors `helm-tmux::parse::Notification`
-/// — kept here so the type lives next to the rest of the IPC vocabulary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct WindowInfo {
+    pub id: String,
+    pub name: String,
+    pub panes: Vec<PaneInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct PaneInfo {
+    pub id: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub alt_screen: bool,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    /// argv[0] basename of what was spawned, when not the default shell.
+    pub command: Option<String>,
+    /// Next byte offset the pane will produce. The frontend records the
+    /// last seq it has applied per pane and resumes from there.
+    pub head_seq: u64,
+    /// Oldest byte still in the daemon's ring buffer.
+    pub buffer_start_seq: u64,
+}
+
+/// One command block, segmented daemon-side from OSC 133 markers. The
+/// block-native frontend renders these as first-class list items.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct BlockInfo {
+    pub id: String,
+    /// Byte offsets into the pane stream (prompt start / command
+    /// accepted / output begins / finished).
+    pub start_seq: u64,
+    pub cmd_seq: Option<u64>,
+    pub output_seq: Option<u64>,
+    pub end_seq: Option<u64>,
+    pub cmdline: Option<String>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub exit_code: Option<i32>,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+}
+
+/// One scrollback-search hit with an exact jump anchor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SearchHit {
+    pub pane_id: String,
+    pub block_id: Option<String>,
+    /// Seq of the first byte of the matched line.
+    pub line_seq: u64,
+    /// The matched line, ANSI-stripped.
+    pub line_text: String,
+    pub match_start: u32,
+    pub match_end: u32,
+}
+
+/// Per-host session events streamed from the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TmuxNotification {
-    /// `bytes` is the cleaned output stream — bells and OSC 133 markers
-    /// have been stripped (and surfaced separately in `markers`) so xterm
-    /// doesn't beep on every notification or render the escape sequences.
+pub enum SessionEvent {
+    /// Pane bytes (live tail or replay). `seq` is the absolute offset
+    /// of the first byte; `data` is base64 — one string field instead
+    /// of a JSON `number[]`, which was a 3-4× wire bloat.
     Output {
         pane_id: String,
-        bytes: Vec<u8>,
-        markers: Vec<MarkerAt>,
+        seq: u64,
+        data: String,
     },
-    WindowAdded { window_id: String },
-    WindowClosed { window_id: String },
-    WindowRenamed { window_id: String, name: String },
-    SessionChanged { session_id: String, name: String },
-    SessionRenamed { session_id: String, name: String },
-    SessionsChanged,
-    SessionWindowChanged { session_id: String, window_id: String },
-    LayoutChanged { window_id: String, layout: String },
-    WindowPaneChanged { window_id: String, pane_id: String },
-    PaneModeChanged { pane_id: String },
-    Continue { pane_id: String },
-    Pause { pane_id: String },
-    ClientDetached { client: String },
-    Exit { reason: Option<String> },
-    Unknown { name: String, args: String },
+    /// End of a replay burst; the pane is live from `at_seq`.
+    ReplayDone { pane_id: String, at_seq: u64 },
+    /// A block started / gained its command / finished.
+    Block { pane_id: String, block: BlockInfo },
+    /// The pane entered or left the alternate screen (TUI mode). The
+    /// frontend swaps block-list ⇄ grid rendering on this.
+    ModeChange { pane_id: String, alt_screen: bool },
+    /// Full tree snapshot after any lifecycle change.
+    Tree { tree: SessionTree },
+    PaneExited { pane_id: String, status: Option<i32> },
 }
 
 // ---------- Host ----------
@@ -162,7 +164,7 @@ pub enum TmuxNotification {
 pub enum HostStatus {
     Connected,
     Connecting,
-    /// Transport dropped or tmux server bounced; the supervisor is
+    /// Transport dropped or the daemon bounced; the supervisor is
     /// running its backoff ladder. Distinct from `Connecting` so the UI
     /// can render a different overlay (the user's panes stay mounted
     /// with their last frozen frame instead of being torn down).
@@ -172,15 +174,15 @@ pub enum HostStatus {
     Error,
 }
 
-/// Single event channel from Rust to the frontend. Tmux notifications,
+/// Single event channel from Rust to the frontend. Session events,
 /// host-status transitions, and registry mutations interleave on the same
 /// stream so the frontend sees them in order with everything else.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEvent {
-    Tmux {
+    Session {
         host_id: HostId,
-        notification: TmuxNotification,
+        event: SessionEvent,
     },
     Status {
         host_id: HostId,
@@ -267,7 +269,7 @@ pub enum HostEvent {
         run_id: ScheduleRunId,
         /// Unix ms when the run started.
         started_at: u64,
-        /// tmux window id the run landed in.
+        /// Window id the run landed in.
         window_id: String,
         manual: bool,
     },
@@ -283,15 +285,15 @@ pub enum HostEvent {
 pub struct Notification {
     pub id: NotificationId,
     pub host_id: HostId,
-    /// tmux session id (`$N`). Optional because the bell may arrive
-    /// before our workspace tree is hydrated; the frontend can fill in
-    /// the breadcrumb from the window id alone.
+    /// Workspace id (daemon id, stringified). Optional because the event
+    /// may arrive before the tree is known; the frontend can fill in the
+    /// breadcrumb from the window id alone.
     pub workspace_id: Option<String>,
-    /// tmux window id (`@N`).
+    /// Window id (daemon id, stringified).
     pub window_id: String,
-    /// tmux pane id (`%N`) — the pane the marker came from. A window
-    /// can hold multiple panes; we surface the originating pane so the
-    /// inbox row can route the user to the exact one.
+    /// Pane id (daemon id, stringified) — the pane the event came from,
+    /// so the inbox row can route the user to the exact one. Schedule
+    /// failures use a synthetic `schedule:<id>` here.
     pub pane_id: String,
     pub kind: NotificationKind,
     /// Unix ms when this notification was first created.
@@ -394,7 +396,6 @@ pub struct Host {
     pub user: String,
     pub auth: AuthMethod,
     pub jump_host: Option<HostId>,
-    pub tmux_integration: bool,
     pub default_workspace: String,
     pub startup_commands: Vec<String>,
 }
@@ -410,7 +411,6 @@ impl Host {
             user: whoami_or_unknown(),
             auth: AuthMethod::Agent,
             jump_host: None,
-            tmux_integration: true,
             default_workspace: "default".into(),
             startup_commands: vec![],
         }
@@ -476,12 +476,12 @@ pub struct Pane {
 /// A user-defined scheduled run. Local-only in v1: persisted in
 /// `schedules.json` next to `hosts.json`, fired by an in-process
 /// supervisor on whichever helm instance saved them. Each fire opens a
-/// new tmux window on `host_id`, cd's to `cwd`, and runs the body.
+/// new window on `host_id`, cd's to `cwd`, and runs the body.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Schedule {
     pub id: ScheduleId,
     /// Human label shown in the palette and used as the new window's
-    /// tmux name when fired.
+    /// window name when fired.
     pub name: String,
     pub host_id: HostId,
     /// Absolute path on the target host. Validated locally at save time
@@ -490,8 +490,8 @@ pub struct Schedule {
     pub cwd: String,
     pub body: ScheduleBody,
     pub trigger: Trigger,
-    /// Workspace (tmux session) to land the new window in. `Named`
-    /// creates if missing; the sentinel "scheduled" is the default.
+    /// Workspace to land the new window in. `Named` creates if
+    /// missing; the sentinel "scheduled" is the default.
     pub workspace_target: WorkspaceTarget,
     /// When false, the supervisor skips this schedule. The user can
     /// still fire it manually via `schedule_run_now`.
@@ -554,9 +554,9 @@ pub enum Trigger {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceTarget {
-    /// Resolve by tmux session name; create the workspace if no session
-    /// matches. Default `Named { name: "scheduled" }` keeps cron output
-    /// out of the user's day-to-day workspaces.
+    /// Resolve by workspace name; create it if nothing matches. Default
+    /// `Named { name: "scheduled" }` keeps cron output out of the user's
+    /// day-to-day workspaces.
     Named { name: String },
 }
 
@@ -570,7 +570,7 @@ pub struct ScheduleRun {
     /// Unix ms when the spawn completed (success) or failed.
     pub finished_at: u64,
     pub status: ScheduleRunStatus,
-    /// Tmux window id when the run successfully spawned a window.
+    /// Window id when the run successfully spawned a window.
     pub window_id: Option<String>,
 }
 
@@ -583,25 +583,4 @@ pub enum ScheduleRunStatus {
     Failed { reason: String },
     /// User triggered `schedule_run_now` while the schedule was disabled.
     Manual,
-}
-
-// ---------- Errors ----------
-
-#[derive(Debug, thiserror::Error, Serialize, Type)]
-#[serde(tag = "kind", content = "message")]
-pub enum DomainError {
-    #[error("host not found")]
-    HostNotFound,
-    #[error("workspace not found")]
-    WorkspaceNotFound,
-    #[error("window not found")]
-    WindowNotFound,
-    #[error("pane not found")]
-    PaneNotFound,
-    #[error("transport: {0}")]
-    Transport(String),
-    #[error("tmux: {0}")]
-    Tmux(String),
-    #[error("io: {0}")]
-    Io(String),
 }

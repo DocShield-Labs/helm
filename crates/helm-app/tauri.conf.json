@@ -5,7 +5,7 @@
   "identifier": "com.docshield.helm",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "beforeBuildCommand": "bun run build",
+    "beforeBuildCommand": "bun run build:helmd && bun run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../../dist"
   },
@@ -48,7 +48,10 @@
       "icons/128x128@2x.png"
     ],
     "category": "DeveloperTool",
-    "shortDescription": "A modern terminal that happens to use tmux.",
-    "longDescription": "Helm is a personal, GUI-first terminal that uses tmux as its persistence engine."
+    "shortDescription": "Mission control for terminals and agents across machines.",
+    "longDescription": "Helm is a GUI-first terminal: persistent sessions on every machine via its own daemon (helmd), block-native output, and an inbox for the agents you run.",
+    "externalBin": [
+      "binaries/helmd"
+    ]
   }
 }

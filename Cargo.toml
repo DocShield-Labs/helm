@@ -3,8 +3,9 @@ resolver = "2"
 members = [
   "crates/helm-app",
   "crates/helm-domain",
-  "crates/helm-tmux",
   "crates/helm-ssh",
+  "crates/helm-proto",
+  "crates/helmd",
 ]
 
 [workspace.package]
@@ -16,8 +17,9 @@ authors = ["Azhar Hussain <azhar@docshield.com>"]
 [workspace.dependencies]
 # internal
 helm-domain = { path = "crates/helm-domain" }
-helm-tmux   = { path = "crates/helm-tmux" }
 helm-ssh    = { path = "crates/helm-ssh" }
+helm-proto  = { path = "crates/helm-proto" }
+helmd       = { path = "crates/helmd" }
 
 # async
 tokio = { version = "1", features = ["full"] }
@@ -26,6 +28,7 @@ async-trait = "0.1"
 # serialization + types
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = "1"
 specta = { version = "2.0.0-rc.22", features = ["derive", "uuid"] }
 specta-typescript = "0.0.9"
 
@@ -56,6 +59,7 @@ dirs = "5"
 security-framework = "2"
 ssh2-config = "0.7"
 base64 = "0.22"
+libc = "0.2"
 cron = "0.12"
 chrono = "0.4"
 chrono-tz = "0.9"

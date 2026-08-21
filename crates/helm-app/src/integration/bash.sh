@@ -15,6 +15,7 @@ if [ -z "$HELM_INTEGRATION" ]; then
     return 0 2>/dev/null
 fi
 
+
 __helm_emit() {
     printf '\033]133;%s\a' "$1"
 }

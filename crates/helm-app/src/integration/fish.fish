@@ -14,6 +14,7 @@ if test -z "$HELM_INTEGRATION"
     exit 0
 end
 
+
 function __helm_emit
     printf '\e]133;%s\a' $argv[1]
 end

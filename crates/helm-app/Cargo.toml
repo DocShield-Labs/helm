@@ -3,7 +3,7 @@ name = "helm-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Helm — a modern terminal that happens to use tmux"
+description = "Helm — a terminal that is mission control for agents across machines"
 default-run = "helm"
 
 [lib]
@@ -23,7 +23,7 @@ tauri-build.workspace = true
 
 [dependencies]
 helm-domain.workspace = true
-helm-tmux.workspace = true
+helm-proto = { workspace = true, features = ["client"] }
 helm-ssh.workspace = true
 
 tauri.workspace = true

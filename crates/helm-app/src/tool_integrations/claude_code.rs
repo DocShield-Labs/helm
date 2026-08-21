@@ -9,16 +9,18 @@
 //!   - `Stop` — Claude finished a turn. Surfaces "task done" without
 //!     the user having to keep that pane focused.
 //!
-//! Both hooks resolve Claude's tmux pane (`$TMUX_PANE`, which tmux sets
-//! for every process in a pane) to its tty and write a BEL there; tmux
-//! relays the BEL as `%output`, which the inbox picks up.
+//! Both hooks write a BEL to `$HELM_TTY` — the pane's tty, exported by
+//! helm's shell integration when the shell starts, so every process in
+//! the pane (Claude included) inherits it. helmd sees the BEL on the
+//! pane's PTY and turns it into a notification.
 //!
 //! NB: we deliberately do *not* use `printf '\a' > /dev/tty`. Claude
 //! runs hook commands with **no controlling terminal**, so `/dev/tty`
 //! doesn't exist and the write silently fails — earlier versions
 //! shipped exactly that and the bell never fired. Writing to the pane's
-//! tty (resolved via tmux) is the reliable path. See `HOOK_CMD`.
-//! Install migrates those legacy broken hooks away (`LEGACY_HOOK_CMDS`).
+//! tty by path is the reliable route. See `HOOK_CMD`. Install migrates
+//! legacy hooks (the `/dev/tty` one and the tmux-era `$TMUX_PANE` one)
+//! away via `command_is_ours`.
 //!
 //! ## Idempotency strategy
 //!
@@ -55,28 +57,25 @@ use std::sync::Arc;
 
 use helm_domain::Host;
 use helm_ssh::SshSession;
-use helm_tmux::TmuxClient;
 
 use super::ToolIntegration;
 
 /// Sentinel embedded as a trailing comment in our hook command so we
-/// can recognize hooks we wrote regardless of the exact tmux path the
-/// rest of the line resolves to. Bump only if the recognition scheme
-/// changes — not for ordinary command tweaks.
-const HOOK_SENTINEL: &str = "helm-claude-notify";
+/// can recognize hooks we wrote. Versioned: v1 was the tmux-era hook
+/// (`$TMUX_PANE` → `display-message`), which must be migrated now that
+/// there is no tmux.
+const HOOK_SENTINEL: &str = "helm-notify:v2";
+/// The v1 sentinel — recognized as ours for migration, never as current.
+const LEGACY_SENTINEL: &str = "helm-claude-notify";
 
 /// The hook command we install for both `Notification` and `Stop`.
 ///
-/// Resolves `$TMUX_PANE` (set by tmux for every process in a pane) to
-/// the pane's tty via `tmux display-message`, then writes a BEL to that
-/// tty. tmux relays the BEL as `%output`, which the inbox picks up.
-///
-/// `command -v tmux` covers the common case; the fallback loop handles a
-/// minimal hook `PATH`. The leading `[ -n "$p" ]` guard makes this a
-/// no-op outside tmux, and the trailing `; true` keeps the hook's exit
-/// status 0 so a miss never disrupts Claude's flow. The trailing comment
-/// is the recognition sentinel — see `HOOK_SENTINEL`.
-const HOOK_CMD: &str = r#"p="$TMUX_PANE"; [ -n "$p" ] && { tm=$(command -v tmux 2>/dev/null); [ -z "$tm" ] && for c in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do [ -x "$c" ] && tm="$c" && break; done; t=$("$tm" display-message -p -t "$p" '#{pane_tty}' 2>/dev/null) && [ -n "$t" ] && printf '\a' > "$t" 2>/dev/null; }; true # helm-claude-notify"#;
+/// `$HELM_TTY` is exported by helm's shell integration (`zsh.zshrc`,
+/// `bash.sh`, `fish.fish`) as the pane's tty path. Writing a BEL there
+/// lands on the pane's PTY, where helmd picks it up. The guard makes
+/// this a no-op outside helm; the trailing `; true` keeps the hook's
+/// exit status 0 so a miss never disrupts Claude's flow.
+const HOOK_CMD: &str = r#"[ -n "$HELM_TTY" ] && printf '\a' > "$HELM_TTY" 2>/dev/null; true # helm-notify:v2"#;
 
 /// Hook commands we wrote in earlier versions and should clean up on
 /// install/uninstall. The `/dev/tty` line is the broken one that never
@@ -91,7 +90,7 @@ fn command_is_current(cmd: &str) -> bool {
 /// True if `cmd` is any hook we own — the current one or a legacy
 /// version we should migrate away.
 fn command_is_ours(cmd: &str) -> bool {
-    command_is_current(cmd) || LEGACY_HOOK_CMDS.contains(&cmd)
+    command_is_current(cmd) || cmd.contains(LEGACY_SENTINEL) || LEGACY_HOOK_CMDS.contains(&cmd)
 }
 
 pub struct ClaudeCodeIntegration;
@@ -116,51 +115,19 @@ impl ToolIntegration for ClaudeCodeIntegration {
         &["claude", "claude-code"]
     }
 
-    /// Claude Code mutates `process.title` to its version string
-    /// (e.g. `"2.1.126"`), so tmux's `pane_current_command` for an
-    /// active Claude pane returns the version rather than `"claude"`.
-    /// Match the binary name *or* a semver-shaped string. Vanishingly
-    /// rare for an unrelated process to carry a name like `1.2.3`,
-    /// and the install is gated on a user click anyway.
-    fn pane_matches(&self, current_command: &str) -> bool {
-        if self
-            .process_names()
-            .iter()
-            .any(|name| *name == current_command)
-        {
-            return true;
-        }
-        super::is_semver_like(current_command)
-    }
-
-    async fn is_installed(
-        &self,
-        host: &Host,
-        _primary: &Arc<TmuxClient>,
-        ssh: Option<&Arc<SshSession>>,
-    ) -> Result<bool, String> {
+    async fn is_installed(&self, host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<bool, String> {
         let value = read_settings(host, ssh).await?;
         Ok(has_hook(&value, "Notification") && has_hook(&value, "Stop"))
     }
 
-    async fn install(
-        &self,
-        host: &Host,
-        _primary: &Arc<TmuxClient>,
-        ssh: Option<&Arc<SshSession>>,
-    ) -> Result<(), String> {
+    async fn install(&self, host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<(), String> {
         let mut value = read_settings(host, ssh).await?;
         ensure_hook(&mut value, "Notification");
         ensure_hook(&mut value, "Stop");
         write_settings(host, ssh, &value).await
     }
 
-    async fn uninstall(
-        &self,
-        host: &Host,
-        _primary: &Arc<TmuxClient>,
-        ssh: Option<&Arc<SshSession>>,
-    ) -> Result<(), String> {
+    async fn uninstall(&self, host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<(), String> {
         let mut value = read_settings(host, ssh).await?;
         remove_hook(&mut value, "Notification");
         remove_hook(&mut value, "Stop");
@@ -432,12 +399,20 @@ mod tests {
     }
 
     #[test]
-    fn current_hook_writes_pane_tty_not_dev_tty() {
-        // Guard against regressing to the broken `/dev/tty` command.
-        assert!(HOOK_CMD.contains("$TMUX_PANE"));
-        assert!(HOOK_CMD.contains("pane_tty"));
+    fn current_hook_writes_helm_tty_not_dev_tty() {
+        // Guard against regressing to the broken `/dev/tty` command
+        // or the tmux-era one.
+        assert!(HOOK_CMD.contains("$HELM_TTY"));
         assert!(!HOOK_CMD.contains("/dev/tty"));
+        assert!(!HOOK_CMD.contains("TMUX"));
         assert!(command_is_current(HOOK_CMD));
+    }
+
+    #[test]
+    fn tmux_era_hook_is_ours_but_not_current() {
+        let v1 = r#"p="$TMUX_PANE"; [ -n "$p" ] && { printf '\a' > "$t"; }; true # helm-claude-notify"#;
+        assert!(command_is_ours(v1));
+        assert!(!command_is_current(v1));
     }
 
     #[test]
@@ -496,27 +471,5 @@ mod tests {
     fn parse_or_empty_handles_empty_file() {
         assert!(parse_or_empty("").unwrap().as_object().unwrap().is_empty());
         assert!(parse_or_empty("   \n").unwrap().as_object().unwrap().is_empty());
-    }
-
-    #[test]
-    fn semver_pattern_matches_claude_titles() {
-        use super::super::is_semver_like;
-        assert!(is_semver_like("2.1.126"));
-        assert!(is_semver_like("1.0.0"));
-        assert!(is_semver_like("0.0.1"));
-        assert!(is_semver_like("12.34.56"));
-    }
-
-    #[test]
-    fn semver_pattern_rejects_real_binaries() {
-        use super::super::is_semver_like;
-        assert!(!is_semver_like("claude"));
-        assert!(!is_semver_like("node"));
-        assert!(!is_semver_like("zsh"));
-        assert!(!is_semver_like("vim"));
-        assert!(!is_semver_like("npm"));
-        assert!(!is_semver_like(""));
-        assert!(!is_semver_like("123")); // no dot — could be a real name
-        assert!(!is_semver_like("foo.bar")); // letters present
     }
 }

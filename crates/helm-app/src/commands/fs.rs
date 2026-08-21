@@ -7,7 +7,7 @@
 //! attached for tmux.
 
 use helm_domain::HostId;
-use helm_tmux::quote_arg;
+use crate::shell::quote_arg;
 use serde::Serialize;
 use specta::Type;
 use std::path::{Path, PathBuf};

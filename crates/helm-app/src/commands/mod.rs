@@ -3,58 +3,68 @@
 //! Organization:
 //!   - [`host`]            — host registry, connect/disconnect, host-key
 //!                           prompts, `~/.ssh/config` autocomplete, ping
-//!   - [`tmux`]            — every `tmux_*` command (send_keys, list_*,
-//!                           kill_*, capture_pane, resize_client, …)
+//!   - [`session`]         — everything that talks to a host's helmd:
+//!                           input, resize, replay, workspace/window
+//!                           lifecycle, search
 //!   - [`notifications`]   — inbox: list/dismiss/dismiss-by-window, focus
 //!   - [`tools`]           — tool-integration framework commands
 //!
-//! The connection state machine (do_connect, supervise, per-client
-//! forwarders, multi-client connect helpers) lives in
-//! [`crate::connection`] — kept out of this tree so command modules
-//! stay focused on the IPC surface.
+//! The connection state machine (connect, pump, supervisor) lives in
+//! [`crate::connection`].
 
-use helm_domain::{HostEvent, HostId};
-use helm_tmux::TmuxClient;
+use helm_domain::{Host, HostEvent, HostId};
+use helm_ssh::SshSession;
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::mpsc;
 
-use crate::state::{AppState, SharedHostEntry};
+use crate::state::{AppState, SessionHandle, SharedHostEntry};
 
 pub mod fs;
 pub mod host;
 pub mod notifications;
 pub mod schedule;
+pub mod session;
 pub mod system;
-pub mod tmux;
 pub mod tools;
 
 /// Small fire-and-forget event emit. Skips silently when the channel
 /// hasn't been registered yet (frontend hasn't called `host_subscribe`)
-/// or has been dropped (webview reload). Callers expect "best-effort
-/// notify" semantics.
-pub(crate) fn emit_event(
-    tx: &Option<mpsc::UnboundedSender<HostEvent>>,
-    event: HostEvent,
-) {
+/// or has been dropped (webview reload).
+pub(crate) fn emit_event(tx: &Option<mpsc::UnboundedSender<HostEvent>>, event: HostEvent) {
     if let Some(tx) = tx {
         let _ = tx.send(event);
     }
 }
 
-/// Resolve the primary control client for a host. Multi-client model:
-/// every per-session control client can service global commands
-/// (pane/window/session ids are server-wide), so we just route through
-/// the primary. Returns "host not connected" when no clients exist.
-pub(crate) async fn tmux_for(
+/// Resolve the live helmd session for a host. "host not connected"
+/// when there isn't one.
+pub(crate) async fn session_for(
     state: &State<'_, AppState>,
     host_id: HostId,
-) -> Result<Arc<TmuxClient>, String> {
+) -> Result<Arc<SessionHandle>, String> {
     let entry: SharedHostEntry = state
         .entry(host_id)
         .ok_or_else(|| "unknown host".to_string())?;
     let guard = entry.lock().await;
     guard
-        .primary_client()
+        .session
+        .clone()
         .ok_or_else(|| "host not connected".to_string())
+}
+
+/// The host record + its SSH backing for a *connected* host — what
+/// integrations need to read/write files on the right side of the wire.
+pub(crate) async fn host_ctx(
+    state: &State<'_, AppState>,
+    host_id: HostId,
+) -> Result<(Host, Option<Arc<SshSession>>), String> {
+    let entry: SharedHostEntry = state
+        .entry(host_id)
+        .ok_or_else(|| "unknown host".to_string())?;
+    let guard = entry.lock().await;
+    if guard.session.is_none() {
+        return Err("host not connected".into());
+    }
+    Ok((guard.host.clone(), guard.ssh.clone()))
 }

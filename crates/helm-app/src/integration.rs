@@ -1,16 +1,15 @@
 //! Shell integration scripts (OSC 133 emitters).
 //!
 //! Embeds three scripts via `include_str!` and provides install helpers
-//! for both local (file-write) and remote (heredoc-into-SSH-command)
+//! for both local (file-write) and remote (base64-into-SSH-command)
 //! delivery. Once installed and sourced, each shell emits the OSC 133
-//! prompt-integration markers that the parser in `helm-tmux::parse`
-//! extracts into `OutputMarker`s — driving the inbox + (eventually)
-//! the blocks UI.
+//! prompt-integration markers that helmd segments into blocks and
+//! turns into notifications.
 //!
 //! Auto-injection model:
-//!   - **zsh** auto-injects via `ZDOTDIR`: tmux's server env points
-//!     ZDOTDIR at our wrapper directory; our `.zshrc` restores the
-//!     user's real ZDOTDIR (`HELM_USER_ZDOTDIR`), sources their real
+//!   - **zsh** auto-injects via `ZDOTDIR`: helmd sets ZDOTDIR on every
+//!     shell it spawns to our wrapper directory; our `.zshrc` restores
+//!     the user's real ZDOTDIR (`HELM_USER_ZDOTDIR`), sources their real
 //!     `.zshrc`, then installs the hooks. Zero user action.
 //!   - **bash / fish** have no equivalent of ZDOTDIR. The script is
 //!     written to disk; phase 4D will surface a one-time toast asking
@@ -19,10 +18,8 @@
 
 use std::path::{Path, PathBuf};
 
-use helm_tmux::TmuxClient;
-
-/// `~/.helm/integration/zsh/.zshrc` — sourced automatically when we set
-/// `ZDOTDIR=~/.helm/integration/zsh` in tmux's server env. Restores the
+/// `~/.helm/integration/zsh/.zshrc` — sourced automatically because
+/// helmd sets `ZDOTDIR=~/.helm/integration/zsh` on spawned shells. Restores the
 /// user's real ZDOTDIR (captured into HELM_USER_ZDOTDIR before we
 /// clobbered it) and sources their real `.zshrc`, then registers the
 /// OSC 133 hooks.
@@ -77,9 +74,8 @@ fn write_files(base: &Path) -> std::io::Result<()> {
 }
 
 /// Build the shell snippet that recreates the integration files at the
-/// far end of an SSH session. Used as a prefix to the existing
-/// `tmux -CC attach || new-session` script in `connect_for_host`. Idempotent
-/// overwrite — same rationale as the local install.
+/// far end of an SSH session. Run as a oneshot before the helmd bridge
+/// is opened. Idempotent overwrite — same rationale as the local install.
 ///
 /// Uses base64 + a bash decoding step so script content can contain
 /// arbitrary bytes (single quotes, dollar signs, the OSC 133 escape
@@ -97,70 +93,4 @@ echo "{zsh_b64}" | base64 -d > "$HOME/.helm/integration/zsh/.zshrc" && \
 echo "{bash_b64}" | base64 -d > "$HOME/.helm/integration/bash" && \
 echo "{fish_b64}" | base64 -d > "$HOME/.helm/integration/fish""#,
     )
-}
-
-/// Tell tmux's server-wide environment about the integration. Future
-/// shells started in tmux inherit `HELM_INTEGRATION=1` (the gate inside
-/// each script) and `ZDOTDIR=…` (zsh auto-injection).
-///
-/// `HELM_USER_ZDOTDIR` carries the user's pre-helm ZDOTDIR so our
-/// `.zshrc` can restore it before sourcing their real config. Default to
-/// `$HOME` if the user wasn't using a custom ZDOTDIR — that's where 99%
-/// of users keep their `.zshrc`.
-///
-/// Also sweeps every existing session and applies the same env so that
-/// new windows in pre-existing sessions pick up integration too. Without
-/// this, only sessions created *after* connect would have it.
-pub async fn configure_tmux_env(
-    client: &TmuxClient,
-    home: &Path,
-    user_zdotdir: &str,
-) -> Result<(), String> {
-    let zsh_path = home.join(".helm").join("integration").join("zsh");
-    let zsh_path = zsh_path.to_string_lossy();
-
-    // Server-global env: applies to sessions created from here on out.
-    let cmds = [
-        "set-environment -g HELM_INTEGRATION 1".to_string(),
-        format!("set-environment -g HELM_USER_ZDOTDIR '{}'", shell_quote(user_zdotdir)),
-        format!("set-environment -g ZDOTDIR '{}'", shell_quote(&zsh_path)),
-    ];
-    for cmd in &cmds {
-        client
-            .send_command(cmd.as_str())
-            .await
-            .map_err(|e| format!("set-environment: {e}"))?;
-    }
-
-    // Per-session env: needed because existing sessions snapshot env at
-    // creation time, so new panes/windows in them won't pick up the
-    // server-global update otherwise. tmux's list-sessions returns one
-    // session id per line.
-    let sessions_raw = client
-        .list_sessions("#{session_id}")
-        .await
-        .map_err(|e| format!("list-sessions: {e}"))?;
-    for sess in sessions_raw.split('\n').filter(|s| !s.is_empty()) {
-        let per_session = [
-            format!("set-environment -t {sess} HELM_INTEGRATION 1"),
-            format!(
-                "set-environment -t {sess} HELM_USER_ZDOTDIR '{}'",
-                shell_quote(user_zdotdir)
-            ),
-            format!("set-environment -t {sess} ZDOTDIR '{}'", shell_quote(&zsh_path)),
-        ];
-        for cmd in &per_session {
-            // Best-effort per session — a session may have been killed
-            // between list-sessions and this call.
-            let _ = client.send_command(cmd.as_str()).await;
-        }
-    }
-    Ok(())
-}
-
-/// POSIX single-quote escaping: wrap in single quotes, replace any
-/// embedded `'` with `'\''`. Same trick used elsewhere in the codebase
-/// for tmux command-string composition.
-fn shell_quote(s: &str) -> String {
-    s.replace('\'', "'\\''")
 }

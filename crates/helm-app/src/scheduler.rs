@@ -1,5 +1,5 @@
 //! Local scheduler — fires user-defined `Schedule` entries by opening a
-//! tmux window on the target host, cd'ing to the schedule's cwd, and
+//! window on the target host, cd'ing to the schedule's cwd, and
 //! sending the body command.
 //!
 //! v1 is local-only: schedules live in `schedules.json` next to
@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -43,13 +43,16 @@ use helm_domain::{
     HostEvent, HostId, Notification, NotificationId, NotificationKind, Schedule, ScheduleBody,
     ScheduleId, ScheduleRun, ScheduleRunId, ScheduleRunStatus, Trigger, WorkspaceTarget,
 };
-use helm_tmux::{quote_arg, TmuxClient};
+use helm_proto::{DaemonMsg, PaneId};
+
+use crate::shell::quote_arg;
 use tauri::{AppHandle, Manager};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::commands::emit_event;
+use crate::notifications::unix_ms;
 use crate::state::{AppState, NotificationsCtx, SCHEDULE_RUN_HISTORY_LIMIT};
 
 /// One signal into the supervisor's mpsc. Tells the loop to wake up and
@@ -373,8 +376,8 @@ async fn fire_one(app: &AppHandle, id: ScheduleId, manual: bool) {
 
 /// The actual spawn path: ensure the host is connected, resolve the
 /// target workspace (creating it if missing), open a new window at the
-/// schedule's cwd, materialize the body into a command line, and send
-/// it. Returns the new tmux window id on success.
+/// schedule's cwd running the materialized body. Returns the new window
+/// id on success.
 async fn spawn_scheduled_run(
     state: &tauri::State<'_, AppState>,
     schedule: &Schedule,
@@ -382,12 +385,9 @@ async fn spawn_scheduled_run(
     let entry = state
         .entry(schedule.host_id)
         .ok_or_else(|| "host not found".to_string())?;
-    let primary = {
-        let g = entry.lock().await;
-        g.primary_client()
-    };
-    let primary = match primary {
-        Some(p) => p,
+    let session = { entry.lock().await.session.clone() };
+    let session = match session {
+        Some(s) => s,
         None => {
             // Host disconnected — bring it up via the same path
             // `host_connect` uses (host-key prompts + reconnect ladder
@@ -403,103 +403,53 @@ async fn spawn_scheduled_run(
             entry
                 .lock()
                 .await
-                .primary_client()
-                .ok_or_else(|| "auto-connect produced no primary client".to_string())?
+                .session
+                .clone()
+                .ok_or_else(|| "auto-connect produced no session".to_string())?
         }
     };
 
-    // Materialize the rendered body onto the target host, then hand
-    // tmux a tiny shell-command that runs it via the user's
-    // interactive shell. `prepare_script` returns a ready-to-run
-    // invoker string for whichever path it took (local fs::write vs
-    // tmux paste-buffer roundtrip).
     let WorkspaceTarget::Named { name } = &schedule.workspace_target;
     let command = render_body(&schedule.body);
-    let host_port = entry.lock().await.host.port;
-    let invoker = prepare_script(&primary, host_port, &command).await?;
-    let window_id = ensure_window(&primary, schedule, name, &invoker).await?;
+    let (host_port, ssh) = {
+        let g = entry.lock().await;
+        (g.host.port, g.ssh.clone())
+    };
+    let invoker = prepare_script(host_port, ssh, &command).await?;
+    let (window_id, pane_id) = ensure_window(&session, schedule, name, &invoker).await?;
 
-    // Interactive Claude with a starter prompt: the prompt has been
-    // pre-filled into Claude's input box via its positional argument
-    // (`claude 'prompt'`), but Claude's TUI doesn't auto-submit — the
-    // user would still have to press Enter manually. We do that for
-    // them by polling `pane_current_command` until claude is the
-    // foreground process, then sending a single Enter.
-    //
-    // Polling rather than a fixed sleep because Claude's boot time
-    // varies wildly: <500ms when authenticated and warm, 5–10s on
-    // first-launch / network round-trip. A fixed delay either misses
-    // (TUI not up yet, keystroke buffered into a partially-mounted
-    // input) or overruns (Claude already submitted the prompt
-    // separately, our Enter creates an empty submission).
-    if let ScheduleBody::ClaudeCode {
-        prompt,
-        non_interactive,
-        ..
-    } = &schedule.body
-    {
+    // Interactive Claude with a starter prompt: the prompt is pre-filled
+    // via Claude's positional argument but the TUI doesn't auto-submit.
+    // Press Enter for the user once Claude has had a moment to mount
+    // its input. Best-effort; if Claude is slow the prompt stays
+    // pre-filled and the user hits Enter themselves.
+    if let ScheduleBody::ClaudeCode { prompt, non_interactive, .. } = &schedule.body {
         if !*non_interactive && !prompt.is_empty() {
-            // Best-effort — failure here logs and moves on; the user
-            // still has the prompt pre-filled and can hit Enter
-            // manually.
-            wait_and_press_enter(&primary, &window_id).await;
+            let client_session = session.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                if let Err(e) = client_session.client.input(pane_id, b"\r".to_vec()) {
+                    warn!("schedule: claude submit Enter failed: {e}");
+                }
+            });
         }
     }
 
     Ok(window_id)
 }
 
-/// Poll the window's active pane until `pane_current_command` reports
-/// `claude` (or its semver-shaped `process.title` rewrite), then send
-/// a single `\r` to submit the prompt that was pre-filled via Claude's
-/// positional-argv. 10s cap; if Claude hasn't booted by then, leave
-/// the prompt unsent rather than firing keystrokes blindly.
-async fn wait_and_press_enter(primary: &Arc<TmuxClient>, window_id: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if std::time::Instant::now() >= deadline {
-            warn!("schedule: claude didn't reach foreground within 10s — leaving prompt unsent");
-            return;
-        }
-        let probe = primary
-            .send_command(format!(
-                "display-message -p -t {} '#{{pane_current_command}}'",
-                window_id
-            ))
-            .await
-            .ok();
-        let process = probe.as_deref().unwrap_or("").trim();
-        if process == "claude" || crate::tool_integrations::is_semver_like(process) {
-            // Small grace period so Claude's input handler is wired
-            // before we send Enter.
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            if let Err(e) = primary.send_keys(window_id, b"\r").await {
-                warn!("schedule: claude submit Enter failed: {e}");
-            }
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-
-/// Materialize the rendered command on the target host and return
-/// the shell-command tmux should run as the pane's initial process.
+/// Materialize the rendered command on the target host and return the
+/// shell-command the new window should run as its initial process.
 ///
 /// Local: `fs::write` to a `.sh` and invoke `$SHELL -i <script>`.
+/// Remote: ship the script base64-encoded over an SSH oneshot, decode
+/// at exec time with `base64 -d < FILE` (portable across BSD/GNU).
 ///
-/// Remote: write a base64 of the script to a `.b64` via tmux's
-/// paste-buffer (rides the existing control channel — see
-/// `write_file_via_buffer`), then decode at exec time using
-/// `base64 -d < FILE` (the stdin form is portable across BSD and
-/// GNU `base64`; the positional `base64 -d FILE` is GNU-only).
-///
-/// Both invokers run `$SHELL` with `-i` so the user's `.zshrc` /
-/// `.bashrc` is sourced and `claude` is on PATH. The trailing
-/// `rm -f` cleans up the temp file after the inner shell exits.
+/// Both invokers run `$SHELL -i` so the user's rc files are sourced
+/// and `claude` is on PATH. The trailing `rm -f` cleans up.
 async fn prepare_script(
-    primary: &Arc<TmuxClient>,
     host_port: u16,
+    ssh: Option<Arc<helm_ssh::SshSession>>,
     contents: &str,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().simple().to_string();
@@ -516,85 +466,65 @@ async fn prepare_script(
             p = quote_arg(&path)
         ));
     }
+    let ssh = ssh.ok_or_else(|| "remote host missing SSH session".to_string())?;
     let path = format!("/tmp/helm-sched-{id}.b64");
     let b64 = B64.encode(contents.as_bytes());
-    let buffer_name = format!("helm_sched_{id}");
-    primary
-        .write_file_via_buffer(&buffer_name, &path, &b64)
+    let cmd = format!("printf '%s' '{b64}' > {}", quote_arg(&path));
+    let out = tokio::task::spawn_blocking(move || ssh.run_oneshot(cmd))
         .await
-        .map_err(|e| format!("tmux buffer write: {e}"))?;
+        .map_err(|e| format!("ssh task: {e}"))?
+        .map_err(|e| format!("remote script write: {e}"))?;
+    if !matches!(out.exit_code, Some(0) | None) {
+        return Err(format!("remote script write failed: {}", out.stderr.trim()));
+    }
     let pq = quote_arg(&path);
     Ok(format!(
         r#"${{SHELL:-/bin/sh}} -i -c "$(base64 -d < {pq})"; rm -f {pq}"#
     ))
 }
 
-/// Resolve the tmux window the schedule should run in. If the target
-/// session already exists we open a fresh window inside it. If not, we
-/// create the session and adopt its auto-seeded first window (rather
-/// than spawning a second one and leaving the default zsh window
-/// orphaned next to ours).
-///
-/// The adopted window keeps the cwd we passed to `new-session`, gets
-/// renamed to the schedule's name (with `automatic-rename` disabled
-/// inside `rename_window` so the rename sticks past Claude's
-/// `process.title` rewrite), and sends-keys against its active pane
-/// using the window-id target.
+/// Resolve the workspace the schedule should run in (creating it by
+/// name if missing), then open a window there running `command`.
+/// Returns `(window_id, pane_id)`.
 async fn ensure_window(
-    primary: &Arc<TmuxClient>,
+    session: &Arc<crate::state::SessionHandle>,
     schedule: &Schedule,
-    session_name: &str,
+    workspace_name: &str,
     command: &str,
-) -> Result<String, String> {
-    // `list-sessions -F '#{session_id}|#{session_name}'` returns one
-    // session per line. We use `|` as the field separator to match the
-    // convention in `lib/host.ts` — TAB doesn't survive every SSH
-    // server's PTY terminal-mode handling (some sshd setups mangle
-    // control characters in non-interactive exec output), so any
-    // remote host whose SSHd doesn't honor IUCLC etc. would have its
-    // TABs silently rewritten and our parser would see one glued
-    // string per line and fail to match. `|` round-trips cleanly.
-    let raw = primary
-        .list_sessions("#{session_id}|#{session_name}")
-        .await
-        .map_err(|e| format!("list-sessions failed: {e}"))?;
-    let mut existing_session: Option<String> = None;
-    for line in raw.lines() {
-        let mut parts = line.splitn(2, '|');
-        let id = parts.next().unwrap_or("").trim();
-        let n = parts.next().unwrap_or("").trim();
-        if n == session_name {
-            existing_session = Some(id.to_string());
-            break;
+) -> Result<(String, PaneId), String> {
+    let existing = session
+        .tree
+        .lock()
+        .workspaces
+        .iter()
+        .find(|w| w.name == workspace_name)
+        .map(|w| w.id);
+    let workspace = match existing {
+        Some(id) => id,
+        None => {
+            let name = workspace_name.to_string();
+            match session
+                .request(|id| session.client.new_workspace(id, Some(name)))
+                .await
+                .map_err(|e| format!("creating workspace: {e}"))?
+            {
+                DaemonMsg::Created { workspace, .. } => workspace,
+                other => return Err(format!("unexpected reply creating workspace: {other:?}")),
+            }
         }
-    }
+    };
 
-    if let Some(session_id) = existing_session {
-        return primary
-            .new_window_with_command_returning_id(
-                Some(&session_id),
-                Some(&schedule.name),
-                Some(&schedule.cwd),
-                command,
-            )
-            .await
-            .map_err(|e| format!("new-window failed: {e}"));
-    }
-
-    // No matching session — create one with the command as its first
-    // window's initial process. tmux returns the new window id directly
-    // via `-P -F '#{window_id}'`, so we skip the previous list-windows
-    // + rename-window pair entirely (the window is named at create
-    // time via `-n`).
-    primary
-        .new_session_with_command_returning_window_id(
-            session_name,
-            &schedule.name,
-            &schedule.cwd,
-            command,
-        )
+    let name = Some(schedule.name.clone());
+    let cwd = Some(schedule.cwd.clone());
+    let argv = Some(vec!["/bin/sh".into(), "-c".into(), command.to_string()]);
+    match session
+        .request(|id| session.client.new_window(id, workspace, name, cwd, argv))
         .await
-        .map_err(|e| format!("new-session failed: {e}"))
+        .map_err(|e| format!("creating window: {e}"))?
+    {
+        DaemonMsg::Created { window: Some(w), pane: Some(p), .. } => Ok((w.to_string(), p)),
+        other => Err(format!("unexpected reply creating window: {other:?}")),
+    }
 }
 
 /// Render a schedule body into the literal command line that goes to
@@ -729,12 +659,6 @@ fn snapshot_schedules(state: &tauri::State<'_, AppState>) -> Vec<Schedule> {
     state.schedules.iter().map(|r| r.value().clone()).collect()
 }
 
-fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Helper used by `state.scheduler_tx` callers to nudge the supervisor
 /// without each call needing to handle the "supervisor not running yet"

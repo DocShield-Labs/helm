@@ -9,6 +9,7 @@ use serde::Serialize;
 use specta::Type;
 use tauri::State;
 
+use crate::commands::host_ctx;
 use crate::state::AppState;
 
 /// One row in the integration list returned to the frontend.
@@ -35,19 +36,12 @@ pub async fn tool_integrations_list(
     state: State<'_, AppState>,
     host_id: HostId,
 ) -> Result<Vec<ToolIntegrationStatus>, String> {
-    let entry = state
-        .entry(host_id)
-        .ok_or_else(|| "unknown host".to_string())?;
-    let (host, primary, ssh) = {
-        let g = entry.lock().await;
-        (g.host.clone(), g.primary_client(), g.ssh.clone())
-    };
-    let primary = primary.ok_or_else(|| "host not connected".to_string())?;
+    let (host, ssh) = host_ctx(&state, host_id).await?;
 
     let mut out = Vec::new();
     for integration in crate::tool_integrations::registry() {
         let installed = integration
-            .is_installed(&host, &primary, ssh.as_ref())
+            .is_installed(&host, ssh.as_ref())
             .await
             .unwrap_or(false);
         out.push(ToolIntegrationStatus {
@@ -71,17 +65,10 @@ pub async fn tool_integration_install(
     host_id: HostId,
     integration_id: String,
 ) -> Result<(), String> {
-    let entry = state
-        .entry(host_id)
-        .ok_or_else(|| "unknown host".to_string())?;
-    let (host, primary, ssh) = {
-        let g = entry.lock().await;
-        (g.host.clone(), g.primary_client(), g.ssh.clone())
-    };
-    let primary = primary.ok_or_else(|| "host not connected".to_string())?;
+    let (host, ssh) = host_ctx(&state, host_id).await?;
     let integration = crate::tool_integrations::find(&integration_id)
         .ok_or_else(|| format!("unknown integration: {integration_id}"))?;
-    integration.install(&host, &primary, ssh.as_ref()).await?;
+    integration.install(&host, ssh.as_ref()).await?;
     // Mark as seen so we don't re-prompt mid-session for the same
     // tool — install satisfies the "we've nagged the user" contract.
     state
@@ -98,17 +85,10 @@ pub async fn tool_integration_uninstall(
     host_id: HostId,
     integration_id: String,
 ) -> Result<(), String> {
-    let entry = state
-        .entry(host_id)
-        .ok_or_else(|| "unknown host".to_string())?;
-    let (host, primary, ssh) = {
-        let g = entry.lock().await;
-        (g.host.clone(), g.primary_client(), g.ssh.clone())
-    };
-    let primary = primary.ok_or_else(|| "host not connected".to_string())?;
+    let (host, ssh) = host_ctx(&state, host_id).await?;
     let integration = crate::tool_integrations::find(&integration_id)
         .ok_or_else(|| format!("unknown integration: {integration_id}"))?;
-    integration.uninstall(&host, &primary, ssh.as_ref()).await
+    integration.uninstall(&host, ssh.as_ref()).await
 }
 
 /// Suppress further suggestion toasts for `(host_id, integration_id)`

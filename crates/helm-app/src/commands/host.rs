@@ -68,7 +68,7 @@ pub async fn host_save(state: State<'_, AppState>, host: Host) -> Result<HostId,
     let is_replace = state.hosts.contains_key(&id);
 
     // If we're replacing, tear down the existing connection so stale
-    // tmux/ssh handles don't outlive their host record. Mark voluntary
+    // session/ssh handles don't outlive their host record. Mark voluntary
     // so the supervisor exits cleanly without running its reconnect
     // ladder against the old (now stale) settings.
     if is_replace {
@@ -78,7 +78,7 @@ pub async fn host_save(state: State<'_, AppState>, host: Host) -> Result<HostId,
             if let Some(handle) = guard.supervisor.take() {
                 handle.abort();
             }
-            guard.shutdown_clients();
+            guard.shutdown_session();
             guard.host = host;
         }
     } else {
@@ -162,7 +162,7 @@ pub async fn host_delete(state: State<'_, AppState>, host_id: HostId) -> Result<
             if let Some(handle) = guard.supervisor.take() {
                 handle.abort();
             }
-            guard.shutdown_clients();
+            guard.shutdown_session();
         });
     }
 
@@ -259,7 +259,7 @@ async fn persist_hosts(state: &State<'_, AppState>) -> Result<(), String> {
 
 // ---------- host event channel + connect lifecycle ----------
 
-/// Register the global event channel. Tmux notifications, host status
+/// Register the global event channel. Session events, host status
 /// transitions, notifications, and tool-integration suggestions stream
 /// through here, tagged by host id.
 ///
@@ -308,9 +308,9 @@ pub async fn host_subscribe(
     Ok(())
 }
 
-/// Connect to a host. Localhost spawns `tmux -CC` in a local PTY; remote
-/// hosts open an SSH session and run tmux on the far end with each
-/// per-session control client multiplexed over the same SSH session.
+/// Connect to a host. Localhost talks to helmd over its unix socket
+/// (spawning the daemon if needed); remote hosts open an SSH session
+/// and run `helmd stdio` on the far end.
 ///
 /// `bootstrap_workspace` overrides `Host.default_workspace` for this
 /// connect attempt. Useful when the user's "+ workspace" button needs to
@@ -318,9 +318,8 @@ pub async fn host_subscribe(
 /// requested workspace, we create the requested workspace directly as
 /// the bootstrap session.
 ///
-/// Idempotent: tearing down any prior clients SIGKILLs each `-CC`
-/// process / closes each SSH channel; the tmux *server* and sessions
-/// live on, so reattaching is a clean recovery.
+/// Idempotent: any prior session is dropped first; the daemon and its
+/// processes live on, so reattaching is a clean recovery.
 #[tauri::command]
 #[specta::specta]
 pub async fn host_connect(
@@ -349,7 +348,7 @@ pub(crate) async fn connect_host_impl(
     let prompter: Arc<dyn HostKeyPrompter> = Arc::new(AppHostKeyPrompter {
         host_id,
         event_tx: event_tx.clone(),
-        pending: state.inner().pending_host_key_prompts_handle(),
+        pending: state.pending_host_key_prompts.clone(),
     });
     let network_online = state.inner().network_online.clone();
     let wake_signal = state.inner().wake_signal.clone();
@@ -395,7 +394,7 @@ pub async fn host_disconnect(state: State<'_, AppState>, host_id: HostId) -> Res
         if let Some(handle) = guard.supervisor.take() {
             handle.abort();
         }
-        guard.shutdown_clients();
+        guard.shutdown_session();
         guard.status = HostStatus::Disconnected;
     }
     emit_event(&event_tx, HostEvent::Status {
