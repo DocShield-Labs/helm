@@ -69,24 +69,6 @@ button:not(:disabled),
 }
 
 /*
- * ActivityDot 'running' state — a slow opacity breathe on a soft grey
- * dot. Calm "work in progress" signal that doesn't compete with the
- * coloured attention/failed dots. Pure CSS, runs in the compositor so
- * per-row React renders stay idle even with many panes running at once.
- * Reduced-motion settles it to a steady, legible dot.
- */
-@keyframes activity-running-pulse {
-  0%, 100% { opacity: 0.35; }
-  50%      { opacity: 0.85; }
-}
-.activity-running-pulse {
-  animation: activity-running-pulse 1.6s ease-in-out infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .activity-running-pulse { animation: none; opacity: 0.6; }
-}
-
-/*
  * Block-native pane. Finished commands render as DOM; the live tail is
  * one xterm at the bottom of the same scroll container.
  */
@@ -100,9 +82,37 @@ button:not(:disabled),
 .helm-scroll::-webkit-scrollbar-thumb:hover {
   background: color-mix(in srgb, var(--terminal-fg) 24%, transparent);
 }
+/* Warp's block rhythm: 1.1 lines above the prompt row, half a line
+   between command and output, one line below; 16px sides. */
+.helm-divider {
+  height: 1px;
+  background: var(--terminal-divider);
+}
+.helm-block {
+  padding-bottom: 20px;
+}
+.helm-prompt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 22px 16px 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 18px;
+  color: var(--text-tertiary);
+}
+.helm-cmd-row {
+  padding: 0 16px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .helm-block-output {
   margin: 0;
-  padding: 2px 20px 10px 44px;
+  padding: 10px 16px 0;
   font-family: var(--font-mono);
   font-size: 13px;
   line-height: 20px;
@@ -111,7 +121,7 @@ button:not(:disabled),
   color: var(--text-primary);
 }
 .helm-block-failed {
-  background: color-mix(in srgb, var(--terminal-failed) 8%, transparent);
+  background: var(--terminal-failed-10);
 }
 @keyframes helm-block-flash {
   0%   { background-color: color-mix(in srgb, var(--terminal-accent) 22%, transparent); }
@@ -121,13 +131,91 @@ button:not(:disabled),
   animation: helm-block-flash 1.2s ease-out;
 }
 .helm-block-header {
-  /* Sticky command line (Warp's "snackbar" header): paint an opaque
-     background so output scrolling beneath it doesn't bleed through. */
+  /* Sticky command line: paint an opaque background so output
+     scrolling beneath it doesn't bleed through. */
+  position: relative;
   background: var(--terminal-bg);
 }
 .helm-block-failed > .helm-block-header {
-  background: color-mix(in srgb, var(--terminal-failed) 8%, var(--terminal-bg));
+  background: color-mix(in srgb, var(--terminal-failed) 10%, var(--terminal-bg));
 }
+/* Hover belt (copy command / copy output), Warp's top-right slot. */
+.helm-belt {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--stroke-default);
+}
+
+/* The composer: Warp's universal input, our palette. */
+.helm-composer {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  margin: 6px;
+  border-radius: 8px;
+  box-shadow: inset 0 0 0 1px var(--terminal-divider);
+  background: transparent;
+  transition: background var(--duration-fast) var(--easing-standard);
+}
+.helm-composer-focused {
+  background: var(--stroke-subtle);
+}
+.helm-composer-editor {
+  display: block;
+  width: 100%;
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  padding: 8px 12px 2px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-primary);
+  caret-color: var(--accent-default);
+}
+.helm-composer-editor::placeholder {
+  color: var(--text-disabled);
+}
+/* Slim bar in the composer's slot: agent blocked / native typing. */
+.helm-bar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 10px;
+  margin: 6px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 8px;
+  box-shadow: inset 0 0 0 1px var(--terminal-divider);
+}
+
+/* Sidebar rows (Warp's vertical tabs). */
+.helm-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 1px transparent;
+  cursor: pointer;
+  user-select: none;
+}
+.helm-row:hover {
+  background: var(--stroke-subtle);
+}
+.helm-row-selected,
+.helm-row-selected:hover {
+  background: var(--stroke-default);
+  box-shadow: inset 0 0 0 1px var(--stroke-strong);
+}
+
 /* Cmd+F matches inside DOM blocks (CSS Custom Highlight API). */
 ::highlight(helm-find) {
   background-color: color-mix(in srgb, var(--terminal-accent) 35%, transparent);

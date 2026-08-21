@@ -188,6 +188,9 @@ function handleSessionEvent(hostId: HostId, ev: SessionEvent): void {
       blocks.setExited(hostId, ev.pane_id)
       store.markPaneIdle(hostId, ev.pane_id)
       return
+    case 'bell':
+      blocks.ringBell(hostId, ev.pane_id)
+      return
   }
 }
 

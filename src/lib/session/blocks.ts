@@ -18,9 +18,12 @@ export interface PaneBlocks {
   exited: boolean
   /** `session_blocks` has been answered at least once. */
   loaded: boolean
+  /** Count of bells the pane has rung since the frontend started.
+   * Consumers compare against the count they last acknowledged. */
+  bells: number
 }
 
-const EMPTY: PaneBlocks = { blocks: [], altScreen: false, exited: false, loaded: false }
+const EMPTY: PaneBlocks = { blocks: [], altScreen: false, exited: false, loaded: false, bells: 0 }
 
 const panes = new Map<string, PaneBlocks>()
 const subs = new Map<string, Set<() => void>>()
@@ -50,6 +53,10 @@ export function upsertBlock(hostId: HostId, paneId: string, block: BlockInfo): v
 
 export function setAltScreen(hostId: HostId, paneId: string, on: boolean): void {
   update(key(hostId, paneId), (cur) => (cur.altScreen === on ? cur : { ...cur, altScreen: on }))
+}
+
+export function ringBell(hostId: HostId, paneId: string): void {
+  update(key(hostId, paneId), (cur) => ({ ...cur, bells: cur.bells + 1 }))
 }
 
 export function setExited(hostId: HostId, paneId: string): void {

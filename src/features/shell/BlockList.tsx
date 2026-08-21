@@ -1,8 +1,8 @@
 /**
  * The finished-command list above the live tail. Blocks are separated
- * by thin lines inset from the left (Warp). Render is capped to the
- * most recent blocks with a "show older" affordance — a full
- * virtualizer can come later if real usage demands it.
+ * by full-width hairlines (Warp). Render is capped to the most recent
+ * blocks with a "show older" affordance — a full virtualizer can come
+ * later if real usage demands it.
  */
 
 import { useState } from 'react'
@@ -26,23 +26,23 @@ export function BlockList({ hostId, paneId, blocks }: BlockListProps) {
   const shown = hidden > 0 ? finished.slice(hidden) : finished
   if (shown.length === 0) return null
   return (
-    <div className="pt-1">
+    <div>
       {hidden > 0 && (
         <button
           type="button"
           onClick={() => setExtra((e) => e + MAX_RENDERED)}
-          className="mx-5 my-2 rounded-md border border-white/[0.08] bg-elevated px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary"
+          className="mx-4 my-2 rounded-md border border-[var(--stroke-default)] px-2.5 py-1 text-[11px] text-text-secondary hover:text-text-primary"
         >
           show {Math.min(hidden, MAX_RENDERED)} older {hidden === 1 ? 'block' : 'blocks'}
         </button>
       )}
       {shown.map((b, i) => (
         <div key={b.id}>
-          {i > 0 && <div className="ml-5 h-px bg-[var(--stroke-subtle)]" />}
+          {i > 0 && <div className="helm-divider" />}
           <Block hostId={hostId} paneId={paneId} block={b} />
         </div>
       ))}
-      <div className="ml-5 h-px bg-[var(--stroke-subtle)]" />
+      <div className="helm-divider" />
     </div>
   )
 }

@@ -27,3 +27,12 @@ export function paneCwdFor(windowId: string, w: TmuxWorkspace): string {
   const active = inWindow.find((p) => p.active) ?? inWindow[0]
   return active?.cwd ?? ''
 }
+
+/** `/Users/azhar/Code/bento` → `~/Code/bento`. We don't know the
+ * remote $HOME, so this recognises the conventional home roots. */
+export function homeRelative(cwd: string | null | undefined): string {
+  if (!cwd) return ''
+  const m = /^(\/Users\/[^/]+|\/home\/[^/]+|\/root)(\/.*)?$/.exec(cwd)
+  if (!m) return cwd
+  return `~${m[2] ?? ''}`
+}

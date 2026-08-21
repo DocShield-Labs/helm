@@ -1,35 +1,49 @@
 /**
- * BlockPane — one pane: finished command blocks as DOM above a live
- * xterm tail, inside a single scroll container.
+ * BlockPane — one pane: finished command blocks as DOM, one live xterm,
+ * and the composer.
  *
  * Model: helmd segments the pane's byte stream into blocks (OSC 133).
  * Everything before the last finished block's `end_seq` is history and
  * renders as static DOM (`BlockList`: selectable, searchable, cheap).
- * Everything from that seq onward — the current prompt, the in-flight
- * command and its output — streams into one xterm instance. When a
- * block finishes, the xterm is reset and re-fed from the new `end_seq`
- * so the just-completed command "crystallizes" into a DOM block above
- * it with no visual discontinuity.
+ * Everything from that seq onward streams into one xterm instance.
+ * When a block finishes, the xterm is reset and re-fed from the new
+ * `end_seq` so the just-completed command "crystallizes" into a DOM
+ * block above it.
  *
- * Alt-screen (TUIs: Claude Code, vim, htop) hides the block list and
- * the xterm takes the whole pane — the terminal owns the grid exactly
- * as any other terminal would.
+ * Input is the composer, not the shell's prompt (see paneState.ts):
+ *   prompt   → xterm hidden, blocks pinned to the bottom, composer
+ *   running  → xterm shows the command; composer hidden for a shell,
+ *              shown in Agent mode for an agent (Claude Code)
+ *   alt      → the TUI owns the grid; agent composer if it's an agent
+ *   raw      → plain terminal (no integration, or the process exited)
+ * An agent that rings the bell is waiting on the user (permission
+ * prompt, end of turn): the composer closes and keys go straight to
+ * the TUI until the user answers or presses ⏎ to reply.
  *
- * Stays mounted across workspace/window switches: when `isVisible`
- * flips to false the parent hides us via `display: none`; the stream
- * keeps buffering, the xterm keeps consuming, switching back is instant.
+ * Stays mounted across switches: when `isVisible` flips to false the
+ * parent hides us via `display: none`; the stream keeps buffering.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { commands } from '@lib/ipc'
 import { attachTerminal, getTheme, type HelmTerminal } from '@lib/terminal'
 import { locatePane, useStore } from '@lib/store'
 import * as stream from '@lib/session/stream'
 import * as blocks from '@lib/session/blocks'
 import { consumeJump, lastFinished, usePaneBlocks, usePendingJump } from '@lib/session/blocks'
+import {
+  forgetPane,
+  reportEffective,
+  setComposerMode,
+  useComposerMode,
+  type ComposerMode,
+} from '@lib/session/composer'
+import { AGENT_LAUNCH_COMMAND, derivePaneState, shellQuote } from '@lib/session/paneState'
 import type { HostId } from '@bindings'
 import { BlockList } from './BlockList'
+import { Composer } from './Composer'
 import { SearchOverlay } from './SearchOverlay'
+import { ChevronDownIcon, SparkIcon } from '@features/sessions/icons'
 
 interface BlockPaneProps {
   hostId: HostId
@@ -37,11 +51,11 @@ interface BlockPaneProps {
   isVisible?: boolean
 }
 
-/** Insets around the xterm box inside its slot (top/right/bottom/left). */
-const XTERM_INSET = { top: 8, right: 8, bottom: 12, left: 20 }
+/** Insets around the xterm box inside its slot. Left matches the
+ * blocks' 16px text inset. */
+const XTERM_INSET = { top: 8, right: 16, bottom: 8, left: 16 }
 
 export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) {
-  const rootRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const xtermHostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<HelmTerminal | null>(null)
@@ -51,11 +65,47 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
 
   const [helmTerm, setHelmTerm] = useState<HelmTerminal | null>(null)
   const [ready, setReady] = useState(false)
-  const [rootHeight, setRootHeight] = useState(0)
+  const [slotHeight, setSlotHeight] = useState(0)
   const [searchOpen, setSearchOpen] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
+  const [focusKey, setFocusKey] = useState(0)
   const pb = usePaneBlocks(hostId, paneId)
   const jump = usePendingJump(hostId, paneId)
+
+  // Primitive selectors: zustand re-renders on reference change.
+  const paneCwd = useStore((s) => locatePane(s.sessions.get(hostId), paneId)?.pane.cwd ?? null)
+  const paneBranch = useStore((s) => locatePane(s.sessions.get(hostId), paneId)?.pane.branch ?? null)
+  const spawned = useStore((s) => locatePane(s.sessions.get(hostId), paneId)?.pane.command ?? null)
+
+  const ps = useMemo(() => derivePaneState(pb, spawned || null), [pb, spawned])
+  const mode = useComposerMode(hostId, paneId, ps.kind)
+  reportEffective(hostId, paneId, ps.kind, mode)
+
+  // Bells acknowledged so far; an agent pane with a newer bell is blocked.
+  const [ackedBells, setAckedBells] = useState(pb.bells)
+  const bellsRef = useRef(pb.bells)
+  bellsRef.current = pb.bells
+  const blocked = ps.kind === 'agent' && pb.bells > ackedBells
+  const blockedRef = useRef(blocked)
+  blockedRef.current = blocked
+  const ackBells = () => setAckedBells(bellsRef.current)
+
+  const xtermShown = ps.phase !== 'prompt'
+  const composerShown =
+    ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent' && !blocked)
+  /** Agent pane in Terminal mode: typing lands in the TUI; keep the
+   * mode control reachable. */
+  const nativeBar = ps.kind === 'agent' && mode === 'terminal' && !blocked
+
+  const history = useMemo(() => {
+    const out: string[] = []
+    for (const b of pb.blocks) {
+      const c = b.cmdline?.trim()
+      if (!c || b.end_seq === null) continue
+      if (out[out.length - 1] !== c) out.push(c)
+    }
+    return out.length > 200 ? out.slice(-200) : out
+  }, [pb.blocks])
 
   /** Point the xterm at stream position `from`: reset and re-feed
    * everything from there to the head. Used for first paint and each
@@ -95,14 +145,23 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
 
     const inputDisp = term.onData((data) => {
       if (ac.signal.aborted || !visibleRef.current) return
-      if (isUserKeystroke(data)) dismissNotificationsFor(hostId, paneId)
+      if (isUserKeystroke(data)) {
+        dismissNotificationsFor(hostId, paneId)
+        if (blockedRef.current) {
+          // The user answered the agent — or asked to reply (⏎).
+          ackBells()
+          if (data === '\r') {
+            setFocusKey((k) => k + 1)
+            return
+          }
+        }
+      }
       void stream.sendInput(hostId, paneId, data)
     })
     const resizeDisp = term.onResize(({ cols, rows }) => {
       if (ac.signal.aborted) return
       void commands.sessionResize(hostId, paneId, cols, rows)
     })
-    if (visibleRef.current) term.focus()
 
     return () => {
       ac.abort()
@@ -110,29 +169,30 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
       inputDisp.dispose()
       resizeDisp.dispose()
       dispose()
+      forgetPane(hostId, paneId)
       termRef.current = null
       tailFromRef.current = null
       setHelmTerm(null)
       setReady(false)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId, paneId])
 
-  // ---- sizing: the xterm slot is always exactly one pane tall ----
+  // ---- sizing: the xterm slot is exactly the scroll viewport ----
   useEffect(() => {
-    const root = rootRef.current
-    if (!root) return
+    const sc = scrollRef.current
+    if (!sc) return
     const ro = new ResizeObserver((entries) => {
-      const h = entries[0]?.contentRect.height ?? 0
-      setRootHeight(Math.floor(h))
+      setSlotHeight(Math.floor(entries[0]?.contentRect.height ?? 0))
     })
-    ro.observe(root)
-    setRootHeight(Math.floor(root.getBoundingClientRect().height))
+    ro.observe(sc)
+    setSlotHeight(Math.floor(sc.getBoundingClientRect().height))
     return () => ro.disconnect()
   }, [])
 
   useEffect(() => {
     const t = termRef.current
-    if (!t || rootHeight <= 0) return
+    if (!t || slotHeight <= 0 || !xtermShown || !isVisible) return
     const id = window.setTimeout(() => {
       try {
         t.fit.fit()
@@ -141,7 +201,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
       }
     }, 30)
     return () => window.clearTimeout(id)
-  }, [rootHeight, ready, pb.altScreen, isVisible])
+  }, [slotHeight, ready, xtermShown, pb.altScreen, isVisible])
 
   // ---- a block finished: crystallize it, rotate the tail ----
   useEffect(() => {
@@ -155,19 +215,16 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pb.blocks, ready, hostId, paneId])
 
-  // ---- visibility: re-fit + focus when we come back on screen ----
+  // ---- focus follows the input surface ----
   useEffect(() => {
     visibleRef.current = isVisible
     if (!isVisible) return
-    const t = termRef.current
-    if (!t) return
-    try {
-      t.fit.fit()
-    } catch {
-      /* not ready */
+    if (composerShown) {
+      setFocusKey((k) => k + 1)
+    } else {
+      termRef.current?.term.focus()
     }
-    t.term.focus()
-  }, [isVisible])
+  }, [isVisible, composerShown, ready])
 
   // ---- Cmd+F: find across blocks + the live tail (visible pane only) ----
   useEffect(() => {
@@ -207,22 +264,62 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     setAtBottom(pinned)
   }
 
-  const slotHeight = Math.max(0, rootHeight)
+  const focusInput = () => {
+    if (composerShown) setFocusKey((k) => k + 1)
+    else termRef.current?.term.focus()
+  }
+
+  /** Text to the pane as typed input, ending with ⏎. Multi-line goes
+   * as a bracketed paste so the shell (or agent) takes it whole. */
+  const sendText = (text: string) => {
+    dismissNotificationsFor(hostId, paneId)
+    if (text.includes('\n')) {
+      void stream.sendInput(hostId, paneId, `\x1b[200~${text}\x1b[201~`).then(
+        () => new Promise<void>((r) => window.setTimeout(r, 30)),
+      ).then(() => stream.sendInput(hostId, paneId, '\r'))
+    } else {
+      void stream.sendInput(hostId, paneId, `${text}\r`)
+    }
+    atBottomRef.current = true
+  }
+
+  const onSend = (text: string) => {
+    if (mode === 'agent' && ps.kind !== 'agent') {
+      sendText(`${AGENT_LAUNCH_COMMAND} ${shellQuote(text)}`)
+    } else {
+      sendText(text)
+    }
+  }
+
+  const onModeChange = (m: ComposerMode) => {
+    setComposerMode(hostId, paneId, ps.kind, m)
+    if (m === 'terminal' && ps.kind === 'agent') termRef.current?.term.focus()
+  }
 
   return (
-    <div ref={rootRef} className="relative h-full w-full overflow-hidden bg-[var(--terminal-bg)]">
+    <div className="relative flex h-full w-full flex-col overflow-hidden bg-[var(--terminal-bg)]">
       <div
         ref={scrollRef}
         onScroll={onScroll}
         onMouseUp={() => {
           // Clicking in the block area shouldn't strand the keyboard —
           // unless the user is selecting text to copy.
-          if (window.getSelection()?.isCollapsed) termRef.current?.term.focus()
+          if (window.getSelection()?.isCollapsed) focusInput()
         }}
-        className="helm-scroll absolute inset-0 overflow-y-auto overflow-x-hidden"
+        className="helm-scroll relative flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden"
       >
-        {ready && !pb.altScreen && <BlockList hostId={hostId} paneId={paneId} blocks={pb.blocks} />}
-        <div className="relative" style={{ height: slotHeight }}>
+        {ready && !pb.altScreen && (
+          <div className="mt-auto">
+            <BlockList hostId={hostId} paneId={paneId} blocks={pb.blocks} />
+          </div>
+        )}
+        <div
+          className="relative shrink-0"
+          style={{
+            height: xtermShown ? slotHeight : 0,
+            visibility: xtermShown ? 'visible' : 'hidden',
+          }}
+        >
           <div
             ref={xtermHostRef}
             className="absolute overflow-hidden"
@@ -235,6 +332,53 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
           />
         </div>
       </div>
+
+      {composerShown && (
+        <Composer
+          mode={mode}
+          kind={ps.kind}
+          cwd={paneCwd}
+          branch={paneBranch}
+          history={history}
+          agentName={AGENT_LAUNCH_COMMAND}
+          onModeChange={onModeChange}
+          onSend={onSend}
+          onRaw={(bytes) => void stream.sendInput(hostId, paneId, bytes)}
+          focusKey={focusKey}
+        />
+      )}
+      {blocked && (
+        <button
+          type="button"
+          onClick={() => {
+            ackBells()
+            setFocusKey((k) => k + 1)
+          }}
+          className="helm-bar text-left"
+          title="Reply in the composer"
+        >
+          <SparkIcon size={14} className="shrink-0 text-[var(--terminal-claude,#D97757)]" />
+          <span className="flex-1 text-[12px] text-text-secondary">
+            {AGENT_LAUNCH_COMMAND} is waiting for you — keys go straight to it
+          </span>
+          <span className="font-mono text-[11px] text-text-disabled">⏎ reply</span>
+        </button>
+      )}
+      {nativeBar && (
+        <div className="helm-bar">
+          <span className="flex-1 text-[12px] text-text-tertiary">
+            typing in {AGENT_LAUNCH_COMMAND} directly
+          </span>
+          <button
+            type="button"
+            onClick={() => onModeChange('agent')}
+            className="rounded-md bg-[var(--stroke-subtle)] px-2 py-0.5 text-[11px] font-medium text-text-secondary hover:text-text-primary"
+          >
+            Agent composer
+          </button>
+        </div>
+      )}
+
       {searchOpen && helmTerm && (
         <SearchOverlay
           helm={helmTerm}
@@ -247,10 +391,10 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
           type="button"
           onClick={() => scrollToBottom(scrollRef.current)}
           title="Jump to latest output"
-          className="absolute bottom-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-white/[0.08] bg-elevated py-1 pl-2.5 pr-3 text-[12px] text-text-secondary hover:text-text-primary"
-          style={{ boxShadow: 'var(--elevation-2)' }}
+          className="absolute left-1/2 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--stroke-default)] bg-elevated py-1 pl-2.5 pr-3 text-[12px] text-text-secondary hover:text-text-primary"
+          style={{ bottom: composerShown ? 120 : 16, boxShadow: 'var(--elevation-2)' }}
         >
-          <ChevronDownIcon />
+          <ChevronDownIcon size={13} />
           latest
         </button>
       )}
@@ -291,23 +435,4 @@ function isUserKeystroke(data: string): boolean {
   if (data.startsWith('\x1b[M') && data.length === 6) return false
   if (/^\x1b\[\d+;\d+R$/.test(data)) return false
   return true
-}
-
-function ChevronDownIcon() {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width="13"
-      height="13"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="m6 9 6 6 6-6" />
-    </svg>
-  )
 }

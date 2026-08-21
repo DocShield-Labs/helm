@@ -12,6 +12,7 @@ import { windowActions } from './window'
 import { inboxActions } from './inbox'
 import { themeActions } from './theme'
 import { scheduleActions } from './schedule'
+import { composerActions } from './composer'
 
 export type { Action, ActionContext, ActionKind, ActionSource } from './types'
 
@@ -23,6 +24,7 @@ export const STATIC_ACTIONS: Action[] = [
   ...inboxActions,
   ...themeActions,
   ...scheduleActions,
+  ...composerActions,
 ]
 
 export function findActionById(id: string): Action | undefined {

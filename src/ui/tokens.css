@@ -26,18 +26,19 @@
   --terminal-failed:  #E0564A;
   --terminal-success: #3DBA7E;
   --terminal-warning: #E8B04B;
+  --terminal-claude:  #D97757;
 
   /* ---------- Text (universal — opacity tiers on the theme fg) ---------- */
   --text-primary:   var(--terminal-fg);
-  --text-secondary: color-mix(in srgb, var(--terminal-fg) 70%, transparent);
-  --text-tertiary:  color-mix(in srgb, var(--terminal-fg) 50%, transparent);
-  --text-disabled:  color-mix(in srgb, var(--terminal-fg) 28%, transparent);
+  --text-secondary: color-mix(in srgb, var(--terminal-fg) 62%, transparent);
+  --text-tertiary:  color-mix(in srgb, var(--terminal-fg) 42%, transparent);
+  --text-disabled:  color-mix(in srgb, var(--terminal-fg) 26%, transparent);
   --text-inverse:   var(--terminal-bg);
 
   /* ---------- Strokes ---------- */
   --stroke-subtle:  color-mix(in srgb, var(--terminal-fg) 5%, transparent);
-  --stroke-default: color-mix(in srgb, var(--terminal-fg) 9%, transparent);
-  --stroke-strong:  color-mix(in srgb, var(--terminal-fg) 16%, transparent);
+  --stroke-default: color-mix(in srgb, var(--terminal-fg) 10%, transparent);
+  --stroke-strong:  color-mix(in srgb, var(--terminal-fg) 15%, transparent);
   --stroke-inverse: color-mix(in srgb, var(--terminal-bg) 40%, transparent);
 
   /* ---------- Accent (theme.accent — saturation untouched, depths via opacity) ----------
