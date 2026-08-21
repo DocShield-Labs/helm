@@ -270,22 +270,31 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     else termRef.current?.term.focus()
   }
 
-  /** Text to the pane as typed input, ending with ⏎. Multi-line goes
-   * as a bracketed paste so the shell (or agent) takes it whole. To an
-   * agent the ⏎ is a separate write after a short gap: Claude Code's
-   * paste detection treats a `\r` in the same chunk as the text as an
-   * inserted newline rather than a submit. */
+  /** Text to the pane as typed input, ending with ⏎.
+   *
+   * To an agent, always a bracketed paste followed by ⏎ in a separate
+   * write: unbracketed text makes Claude Code's paste heuristic wait
+   * for the chunk to settle (visible lag), and a `\r` in the same
+   * chunk is taken as an inserted newline rather than a submit.
+   * Bracketed text is inserted at once, so the ⏎ can follow on the
+   * next tick. A shell gets `text⏎` in one write, multi-line as a
+   * bracketed paste so it runs as a unit. */
   const sendText = (text: string) => {
     dismissNotificationsFor(hostId, paneId)
     const multiline = text.includes('\n')
-    const body = multiline ? `\x1b[200~${text}\x1b[201~` : text
-    if (multiline || ps.kind === 'agent') {
+    const bracketed = `\x1b[200~${text}\x1b[201~`
+    if (ps.kind === 'agent') {
       void stream
-        .sendInput(hostId, paneId, body)
-        .then(() => new Promise<void>((r) => window.setTimeout(r, 40)))
+        .sendInput(hostId, paneId, bracketed)
+        .then(() => new Promise<void>((r) => window.setTimeout(r, 8)))
+        .then(() => stream.sendInput(hostId, paneId, '\r'))
+    } else if (multiline) {
+      void stream
+        .sendInput(hostId, paneId, bracketed)
+        .then(() => new Promise<void>((r) => window.setTimeout(r, 30)))
         .then(() => stream.sendInput(hostId, paneId, '\r'))
     } else {
-      void stream.sendInput(hostId, paneId, `${body}\r`)
+      void stream.sendInput(hostId, paneId, `${text}\r`)
     }
     atBottomRef.current = true
   }
