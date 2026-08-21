@@ -31,3 +31,6 @@ yarn-error.log*
 
 # claude code harness (local state, runtime locks, conversation history)
 .claude/
+
+# staged helmd sidecar (built by scripts/build-helmd.sh)
+crates/helm-app/binaries/
