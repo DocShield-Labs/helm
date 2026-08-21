@@ -11,9 +11,6 @@ mod notifications;
 mod persistence;
 mod power;
 mod reachability;
-mod scheduler;
-mod schedules;
-mod shell;
 mod state;
 mod tool_integrations;
 
@@ -60,13 +57,6 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::tools::tool_integration_dismiss,
         commands::system::reveal_in_finder,
         commands::system::open_url,
-        commands::fs::fs_list_dir,
-        commands::schedule::schedule_list,
-        commands::schedule::schedule_save,
-        commands::schedule::schedule_delete,
-        commands::schedule::schedule_set_enabled,
-        commands::schedule::schedule_run_now,
-        commands::schedule::schedule_runs,
     ])
 }
 
@@ -128,12 +118,6 @@ pub fn run() {
         .invoke_handler(specta.invoke_handler())
         .setup(move |app| {
             specta.mount_events(app);
-            // Spawn the schedule supervisor. It's safe to start before
-            // host_subscribe wires up the frontend channel — emitted
-            // events will silently drop until the channel exists, and
-            // schedules whose first fire is more than a second away
-            // give the frontend plenty of time to subscribe in practice.
-            scheduler::spawn_supervisor(app.handle());
             Ok(())
         })
         .manage(state::AppState::default())

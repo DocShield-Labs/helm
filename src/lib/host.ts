@@ -5,7 +5,7 @@
  *   - `session` events → per-pane streams / block tables / store tree
  *   - `status` events  → host status map (+ tree fetch on connect)
  *   - `host_added` / `host_removed` → registry mutations
- *   - notifications, schedules, tool suggestions → store
+ *   - notifications, tool suggestions → store
  *
  * Selection (which workspace/window/pane is shown) is purely frontend
  * state — the daemon has no notion of it. `selectWindow` is the one
@@ -14,7 +14,7 @@
 
 import { Channel } from '@tauri-apps/api/core'
 import { commands } from '@lib/ipc'
-import { useStore, workspaceForWindow } from '@lib/store'
+import { useStore } from '@lib/store'
 import { treeToWorkspaces } from '@lib/session/tree'
 import * as stream from '@lib/session/stream'
 import * as blocks from '@lib/session/blocks'
@@ -103,41 +103,13 @@ export async function subscribeHostEvents(): Promise<void> {
           postInstallNote: evt.post_install_note,
         })
         return
-      case 'schedule_upserted':
-        useStore.getState().upsertSchedule(evt.schedule)
-        return
-      case 'schedule_removed':
-        useStore.getState().removeSchedule(evt.schedule_id)
-        return
-      case 'schedule_fired': {
-        // Manual fires jump to the new window — the user just clicked
-        // "Run now" and expects to see it. Cron fires don't yank focus.
-        if (!evt.manual) return
-        const store = useStore.getState()
-        const sched = store.schedules.get(evt.schedule_id)
-        if (!sched) return
-        const hs = store.sessions.get(sched.host_id)
-        const ws = workspaceForWindow(hs, evt.window_id)
-        if (ws) {
-          selectWindow(sched.host_id, ws.id, evt.window_id)
-        } else {
-          // Tree may not have caught up yet — retry once it does.
-          const windowId = evt.window_id
-          const hostId = sched.host_id
-          window.setTimeout(() => {
-            const later = workspaceForWindow(useStore.getState().sessions.get(hostId), windowId)
-            if (later) selectWindow(hostId, later.id, windowId)
-          }, 300)
-        }
-        return
-      }
     }
   }
   const res = await commands.hostSubscribe(channel)
   if (res.status !== 'ok') throw new Error(res.error)
   subscribed = true
 
-  // Replay current notifications / schedules so a webview reload finds
+  // Replay current notifications so a webview reload finds
   // the world the way it left it. Best-effort.
   try {
     const list = await commands.notificationsList()
@@ -145,12 +117,6 @@ export async function subscribeHostEvents(): Promise<void> {
       const upsert = useStore.getState().upsertNotification
       for (const n of list.data) upsert(n)
     }
-  } catch {
-    /* no-op */
-  }
-  try {
-    const list = await commands.scheduleList()
-    if (list.status === 'ok') useStore.getState().setSchedules(list.data)
   } catch {
     /* no-op */
   }

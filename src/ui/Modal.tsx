@@ -5,7 +5,7 @@
  * card itself caps at the viewport height with breathing room so it
  * never bleeds into the OS chrome on a small window. Esc closes the
  * modal — the listener is gated on `open` so multiple stacked modals
- * (rare, but the schedule editor opens over the palette in some flows)
+ * (rare, but a modal can open over the palette in some flows)
  * each get their own handler and only the topmost is registered when
  * the others are closed.
  */

@@ -64,9 +64,8 @@ pub fn sync_pane_index(
     }
     // Anything we track for this host that isn't in the snapshot is
     // gone (window killed, shell exited) — whether we track it via a
-    // runtime entry or only via an inbox row. Synthetic schedule panes
-    // (`schedule:<id>`) aren't daemon panes — leave them alone.
-    let is_stale = |pane: &String| !alive.contains(pane) && !pane.starts_with("schedule:");
+    // runtime entry or only via an inbox row.
+    let is_stale = |pane: &String| !alive.contains(pane);
     let mut stale: std::collections::HashSet<String> = ctx
         .pane_runtime
         .iter()
@@ -160,13 +159,12 @@ fn upsert(
 }
 
 /// Coalesce priority. Higher wins when folding two events into one row.
-///   3 — CommandDone with non-zero exit / ScheduleFailed
+///   3 — CommandDone with non-zero exit
 ///   2 — Bell / Message (latest wins on a tie)
 ///   1 — CommandDone success / unknown
 fn kind_priority(k: &NotificationKind) -> u8 {
     match k {
         NotificationKind::CommandDone { exit_code: Some(c), .. } if *c != 0 => 3,
-        NotificationKind::ScheduleFailed { .. } => 3,
         NotificationKind::Bell | NotificationKind::Message { .. } => 2,
         NotificationKind::CommandDone { .. } => 1,
     }
@@ -298,15 +296,13 @@ mod tests {
     }
 
     #[test]
-    fn sync_pane_index_dismisses_stale_and_keeps_schedules() {
+    fn sync_pane_index_dismisses_stale() {
         let ctx = test_ctx();
         let host = HostId::new();
         upsert(&ctx, &None, host, "9", NotificationKind::Bell, "", 1);
-        upsert(&ctx, &None, host, "schedule:x", NotificationKind::Bell, "", 1);
-        assert_eq!(ctx.notifications.len(), 2);
-        sync_pane_index(&ctx, &None, host, &TreeSnapshot { workspaces: vec![] });
-        // Pane 9 is gone from the tree → dismissed; schedule row survives.
         assert_eq!(ctx.notifications.len(), 1);
-        assert!(ctx.notification_by_pane.contains_key(&(host, "schedule:x".into())));
+        sync_pane_index(&ctx, &None, host, &TreeSnapshot { workspaces: vec![] });
+        // Pane 9 is gone from the tree → dismissed.
+        assert_eq!(ctx.notifications.len(), 0);
     }
 }

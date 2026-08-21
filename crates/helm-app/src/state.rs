@@ -12,8 +12,7 @@
 //!   - the single event channel that delivers everything to the frontend
 
 use helm_domain::{
-    Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification, NotificationId, Schedule,
-    ScheduleId, ScheduleRun,
+    Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification, NotificationId,
 };
 use helm_proto::client::HelmdClient;
 use helm_ssh::SshSession;
@@ -33,7 +32,7 @@ pub struct SessionHandle {
     /// own when the daemon connection drops (events channel closes).
     pub pump: AbortHandle,
     /// Latest `TreeSnapshot` from the daemon, updated by the pump on
-    /// every `TreeChanged`. Commands and the scheduler read this to
+    /// every `TreeChanged`. Commands read this to
     /// resolve names → ids without a round-trip. Arc so the pump can
     /// hold a clone without a cycle through the handle.
     pub tree: Arc<parking_lot::Mutex<helm_proto::TreeSnapshot>>,
@@ -205,21 +204,7 @@ pub struct AppState {
     /// a tool integration this app session.
     pub tool_integration_seen: Arc<DashMap<(HostId, String), ()>>,
 
-    /// User-defined scheduled runs, keyed by id. Persisted to
-    /// `schedules.json`.
-    pub schedules: Arc<DashMap<ScheduleId, Schedule>>,
-
-    /// In-memory ring of recent runs per schedule. Most recent first;
-    /// capped at `SCHEDULE_RUN_HISTORY_LIMIT`.
-    pub schedule_runs: Arc<DashMap<ScheduleId, Vec<ScheduleRun>>>,
-
-    /// Sender into the scheduler supervisor's signal channel.
-    pub scheduler_tx:
-        parking_lot::Mutex<Option<mpsc::UnboundedSender<crate::scheduler::SchedulerSignal>>>,
 }
-
-/// Cap on the in-memory run history per schedule.
-pub const SCHEDULE_RUN_HISTORY_LIMIT: usize = 50;
 
 /// Per-pane state the connection pump maintains between events.
 #[derive(Debug, Clone, Default)]
@@ -232,7 +217,7 @@ pub struct PaneRuntime {
 }
 
 /// Cheap-to-clone bundle of handles for long-running tasks (the
-/// connection pump, supervisor, scheduler) so they can call into the
+/// connection pump, supervisor) so they can call into the
 /// notifications layer without the full `AppState`.
 #[derive(Clone)]
 pub struct NotificationsCtx {
@@ -271,10 +256,6 @@ impl Default for AppState {
             }
             hosts.insert(host.id, Arc::new(Mutex::new(HostEntry::new(host))));
         }
-        let schedules = DashMap::new();
-        for s in crate::schedules::try_load_schedules() {
-            schedules.insert(s.id, s);
-        }
         Self {
             hosts,
             local_host_id: local_id,
@@ -287,9 +268,6 @@ impl Default for AppState {
             pane_runtime: Arc::new(DashMap::new()),
             focus: Arc::new(parking_lot::Mutex::new(None)),
             tool_integration_seen: Arc::new(DashMap::new()),
-            schedules: Arc::new(schedules),
-            schedule_runs: Arc::new(DashMap::new()),
-            scheduler_tx: parking_lot::Mutex::new(None),
         }
     }
 }

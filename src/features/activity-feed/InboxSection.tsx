@@ -89,17 +89,6 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
   const hasItems = list.length > 0
 
   const onJump = (n: Notification) => {
-    // Schedule failures aren't tied to a pane — clicking the row
-    // opens the schedule editor for the failing schedule so the user
-    // can fix the underlying problem (bad cwd, disconnected host, …)
-    // and dismisses the row.
-    if (n.kind.kind === 'schedule_failed') {
-      const state = useStore.getState()
-      const sched = state.schedules.get(n.kind.schedule_id)
-      if (sched) state.openScheduleEditor({ editing: sched })
-      void commands.notificationDismiss(n.id)
-      return
-    }
     // If the peek is currently showing this notification, hand off
     // to the merge animation: keep the panel visible while the new
     // pane mounts behind it, then dissolve. NotificationPeek owns
@@ -189,16 +178,8 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
             <InboxRow
               notification={n}
               host={hosts.get(n.host_id)}
-              windowName={
-                n.kind.kind === 'schedule_failed'
-                  ? n.kind.schedule_name
-                  : resolveWindowName(sessions.get(n.host_id), n)
-              }
-              cwd={
-                n.kind.kind === 'schedule_failed'
-                  ? ''
-                  : resolvePaneCwd(sessions.get(n.host_id), n)
-              }
+              windowName={resolveWindowName(sessions.get(n.host_id), n)}
+              cwd={resolvePaneCwd(sessions.get(n.host_id), n)}
               selected={isSelected(n)}
               onJump={() => onJump(n)}
               onDismiss={() => onDismiss(n)}
@@ -285,14 +266,6 @@ function InboxRow({
         </span>
       </div>
       <div className="flex items-center gap-2 pl-4">
-        {n.kind.kind === 'schedule_failed' ? (
-          <span
-            className="truncate text-left font-mono text-[11px] text-status-error"
-            title={n.kind.reason}
-          >
-            {host?.name ?? '?'} · {n.kind.reason}
-          </span>
-        ) : (
           <span
             className="truncate text-left font-mono text-[11px] text-text-tertiary"
             title={cwd || undefined}
@@ -300,7 +273,6 @@ function InboxRow({
             {host?.name ?? '?'}
             {cwd ? ` · ${prettyCwd(cwd)}` : ''}
           </span>
-        )}
       </div>
     </button>
   )
@@ -324,15 +296,6 @@ function notificationTone(kind: NotificationKind): Tone {
     return {
       color: 'var(--activity-running)',
       label: kind.text,
-    }
-  }
-  if (kind.kind === 'schedule_failed') {
-    // Schedule failures aren't tied to a pane — surface the schedule
-    // name + a short reason instead of an exit code so the user can
-    // tell why the run never reached the shell.
-    return {
-      color: 'var(--activity-failed)',
-      label: `schedule · ${kind.schedule_name}`,
     }
   }
   // command_done

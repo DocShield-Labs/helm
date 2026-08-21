@@ -331,7 +331,7 @@ pub async fn host_connect(
 }
 
 /// The body of `host_connect`, callable from places other than a Tauri
-/// command (notably the scheduler's auto-connect path). Builds the
+/// command. Builds the
 /// host-key prompter, aborts any prior supervisor, and hands off to
 /// `connection::do_connect`. The caller's `&State` borrow is dropped
 /// before the long-running connect work begins so we don't pin it

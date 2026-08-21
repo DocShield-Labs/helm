@@ -11,7 +11,6 @@ import { workspaceActions } from './workspace'
 import { windowActions } from './window'
 import { inboxActions } from './inbox'
 import { themeActions } from './theme'
-import { scheduleActions } from './schedule'
 import { composerActions } from './composer'
 
 export type { Action, ActionContext, ActionKind, ActionSource } from './types'
@@ -23,7 +22,6 @@ export const STATIC_ACTIONS: Action[] = [
   ...windowActions,
   ...inboxActions,
   ...themeActions,
-  ...scheduleActions,
   ...composerActions,
 ]
 

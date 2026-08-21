@@ -33,7 +33,6 @@ import {
 import { BlockPane } from '@features/shell/BlockPane'
 import { sendInput } from '@lib/session/stream'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
-import { ScheduleEditorModal } from '@features/schedule/ScheduleEditorModal'
 import { HostKeyPromptModal } from '@features/host-key/HostKeyPromptModal'
 import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSuggestionHost'
 import { NotificationPeek } from '@features/activity-feed/NotificationPeek'
@@ -362,7 +361,6 @@ export function App() {
       />
 
       <HostKeyPromptModal />
-      <ScheduleEditorModal />
 
       <IntegrationSuggestionHost />
       <PaletteHost />
