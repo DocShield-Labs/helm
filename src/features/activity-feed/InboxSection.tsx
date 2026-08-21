@@ -320,6 +320,12 @@ function notificationTone(kind: NotificationKind): Tone {
       label: 'bell',
     }
   }
+  if (kind.kind === 'message') {
+    return {
+      color: 'var(--activity-running)',
+      label: kind.text,
+    }
+  }
   if (kind.kind === 'schedule_failed') {
     // Schedule failures aren't tied to a pane — surface the schedule
     // name + a short reason instead of an exit code so the user can

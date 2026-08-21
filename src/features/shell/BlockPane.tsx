@@ -16,9 +16,10 @@
  *              shown in Agent mode for an agent (Claude Code)
  *   alt      → the TUI owns the grid; agent composer if it's an agent
  *   raw      → plain terminal (no integration, or the process exited)
- * An agent that rings the bell is waiting on the user (permission
- * prompt, end of turn): the composer closes and keys go straight to
- * the TUI until the user answers or presses ⏎ to reply.
+ * An agent that rings the bell is blocked on the user (a permission
+ * prompt — the Claude hook only rings for those; end of turn is an
+ * OSC 9 message): the composer closes and keys go straight to the TUI
+ * until the user answers or presses ⏎ to reply.
  *
  * Stays mounted across switches: when `isVisible` flips to false the
  * parent hides us via `display: none`; the stream keeps buffering.
@@ -286,9 +287,14 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
   const onSend = (text: string) => {
     if (mode === 'agent' && ps.kind !== 'agent') {
       sendText(`${AGENT_LAUNCH_COMMAND} ${shellQuote(text)}`)
-    } else {
-      sendText(text)
+      return
     }
+    // `clear` clears the block list too (Warp does the same); the
+    // shell still runs it so its own state agrees.
+    if (mode === 'terminal' && /^(clear|reset)$/.test(text.trim())) {
+      blocks.clearBefore(hostId, paneId, stream.head(hostId, paneId))
+    }
+    sendText(text)
   }
 
   const onModeChange = (m: ComposerMode) => {
@@ -310,7 +316,12 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
       >
         {ready && !pb.altScreen && (
           <div className="mt-auto">
-            <BlockList hostId={hostId} paneId={paneId} blocks={pb.blocks} />
+            <BlockList
+              hostId={hostId}
+              paneId={paneId}
+              blocks={pb.blocks}
+              clearedBefore={pb.clearedBefore}
+            />
           </div>
         )}
         <div
@@ -359,7 +370,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
         >
           <SparkIcon size={14} className="shrink-0 text-[var(--terminal-claude,#D97757)]" />
           <span className="flex-1 text-[12px] text-text-secondary">
-            {AGENT_LAUNCH_COMMAND} is waiting for you — keys go straight to it
+            {AGENT_LAUNCH_COMMAND} needs your approval — keys go straight to it
           </span>
           <span className="font-mono text-[11px] text-text-disabled">⏎ reply</span>
         </button>

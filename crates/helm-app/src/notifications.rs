@@ -30,6 +30,7 @@ pub fn process_daemon_notification(
     let pane_id = note.pane.to_string();
     let kind = match &note.kind {
         helm_proto::NotificationKind::Bell => NotificationKind::Bell,
+        helm_proto::NotificationKind::Message { text } => NotificationKind::Message { text: text.clone() },
         helm_proto::NotificationKind::CommandDone { exit_code, cmdline, duration_ms } => {
             NotificationKind::CommandDone {
                 exit_code: Some(*exit_code),
@@ -160,13 +161,13 @@ fn upsert(
 
 /// Coalesce priority. Higher wins when folding two events into one row.
 ///   3 — CommandDone with non-zero exit / ScheduleFailed
-///   2 — Bell
+///   2 — Bell / Message (latest wins on a tie)
 ///   1 — CommandDone success / unknown
 fn kind_priority(k: &NotificationKind) -> u8 {
     match k {
         NotificationKind::CommandDone { exit_code: Some(c), .. } if *c != 0 => 3,
         NotificationKind::ScheduleFailed { .. } => 3,
-        NotificationKind::Bell => 2,
+        NotificationKind::Bell | NotificationKind::Message { .. } => 2,
         NotificationKind::CommandDone { .. } => 1,
     }
 }

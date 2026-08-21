@@ -18,7 +18,8 @@
 //! runs hook commands with **no controlling terminal**, so `/dev/tty`
 //! doesn't exist and the write silently fails — earlier versions
 //! shipped exactly that and the bell never fired. Writing to the pane's
-//! tty by path is the reliable route. See `HOOK_CMD`. Install migrates
+//! tty by path is the reliable route. See `NOTIFICATION_HOOK_CMD` /
+//! `STOP_HOOK_CMD`. Install migrates
 //! legacy hooks (the `/dev/tty` one and the tmux-era `$TMUX_PANE` one)
 //! away via `command_is_ours`.
 //!
@@ -62,20 +63,33 @@ use super::ToolIntegration;
 
 /// Sentinel embedded as a trailing comment in our hook command so we
 /// can recognize hooks we wrote. Versioned: v1 was the tmux-era hook
-/// (`$TMUX_PANE` → `display-message`), which must be migrated now that
-/// there is no tmux.
-const HOOK_SENTINEL: &str = "helm-notify:v2";
+/// (`$TMUX_PANE` → `display-message`); v2 rang the bell for every
+/// event, which closed the agent composer at the end of every turn.
+/// Older versions are recognized as ours and migrated on install.
+const HOOK_SENTINEL: &str = "helm-notify:v3";
 /// The v1 sentinel — recognized as ours for migration, never as current.
 const LEGACY_SENTINEL: &str = "helm-claude-notify";
 
-/// The hook command we install for both `Notification` and `Stop`.
+/// The `Notification` hook. Reads the event JSON from stdin: a
+/// permission prompt (or elicitation dialog) means Claude is *blocked*
+/// on the user, so it rings the bell — helmd raises a Bell and the pane
+/// hands keys to Claude. Anything else (idle prompt, auth) is an OSC 9
+/// message: an inbox row, no blocking.
 ///
 /// `$HELM_TTY` is exported by helm's shell integration (`zsh.zshrc`,
-/// `bash.sh`, `fish.fish`) as the pane's tty path. Writing a BEL there
-/// lands on the pane's PTY, where helmd picks it up. The guard makes
-/// this a no-op outside helm; the trailing `; true` keeps the hook's
-/// exit status 0 so a miss never disrupts Claude's flow.
-const HOOK_CMD: &str = r#"[ -n "$HELM_TTY" ] && printf '\a' > "$HELM_TTY" 2>/dev/null; true # helm-notify:v2"#;
+/// `bash.sh`, `fish.fish`) as the pane's tty path. Writing there lands
+/// on the pane's PTY, where helmd picks it up. The guard makes this a
+/// no-op outside helm; the trailing `; true` keeps the hook's exit
+/// status 0 so a miss never disrupts Claude's flow.
+const NOTIFICATION_HOOK_CMD: &str = r#"[ -n "$HELM_TTY" ] && { p=$(cat); case "$p" in *permission_prompt*|*elicitation_dialog*) printf '\a';; *) printf '\033]9;Claude is waiting for input\a';; esac; } > "$HELM_TTY" 2>/dev/null; true # helm-notify:v3"#;
+
+/// The `Stop` hook: Claude finished a turn. An OSC 9 message — it shows
+/// up in the inbox but does not close the agent composer.
+const STOP_HOOK_CMD: &str = r#"[ -n "$HELM_TTY" ] && printf '\033]9;Claude finished\a' > "$HELM_TTY" 2>/dev/null; true # helm-notify:v3"#;
+
+fn hook_command(event: &str) -> &'static str {
+    if event == "Stop" { STOP_HOOK_CMD } else { NOTIFICATION_HOOK_CMD }
+}
 
 /// Hook commands we wrote in earlier versions and should clean up on
 /// install/uninstall. The `/dev/tty` line is the broken one that never
@@ -90,7 +104,10 @@ fn command_is_current(cmd: &str) -> bool {
 /// True if `cmd` is any hook we own — the current one or a legacy
 /// version we should migrate away.
 fn command_is_ours(cmd: &str) -> bool {
-    command_is_current(cmd) || cmd.contains(LEGACY_SENTINEL) || LEGACY_HOOK_CMDS.contains(&cmd)
+    command_is_current(cmd)
+        || cmd.contains(LEGACY_SENTINEL)
+        || cmd.contains("helm-notify:v2")
+        || LEGACY_HOOK_CMDS.contains(&cmd)
 }
 
 pub struct ClaudeCodeIntegration;
@@ -107,8 +124,9 @@ impl ToolIntegration for ClaudeCodeIntegration {
 
     fn description(&self) -> &'static str {
         "Add Notification + Stop hooks to ~/.claude/settings.json so \
-         Claude rings the bell when it needs input or finishes a turn. \
-         Helm's inbox picks the bell up and surfaces the workspace."
+         Helm knows when Claude needs your approval or finishes a turn. \
+         The inbox surfaces the session; the composer hands keys over \
+         while Claude waits on a prompt."
     }
 
     fn process_names(&self) -> &'static [&'static str] {
@@ -274,7 +292,7 @@ fn ensure_hook(value: &mut Value, event: &str) {
     arr.as_array_mut().unwrap().push(json!({
         "hooks": [{
             "type": "command",
-            "command": HOOK_CMD,
+            "command": hook_command(event),
         }]
     }));
 }
@@ -402,10 +420,16 @@ mod tests {
     fn current_hook_writes_helm_tty_not_dev_tty() {
         // Guard against regressing to the broken `/dev/tty` command
         // or the tmux-era one.
-        assert!(HOOK_CMD.contains("$HELM_TTY"));
-        assert!(!HOOK_CMD.contains("/dev/tty"));
-        assert!(!HOOK_CMD.contains("TMUX"));
-        assert!(command_is_current(HOOK_CMD));
+        for cmd in [NOTIFICATION_HOOK_CMD, STOP_HOOK_CMD] {
+            assert!(cmd.contains("$HELM_TTY"));
+            assert!(!cmd.contains("/dev/tty"));
+            assert!(!cmd.contains("TMUX"));
+            assert!(command_is_current(cmd));
+        }
+        // Only a permission prompt rings the bell; a finished turn is a message.
+        assert!(NOTIFICATION_HOOK_CMD.contains("permission_prompt"));
+        assert!(STOP_HOOK_CMD.contains("]9;"));
+        assert!(!STOP_HOOK_CMD.contains(r"'\a'"));
     }
 
     #[test]

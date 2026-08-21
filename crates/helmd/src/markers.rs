@@ -38,6 +38,8 @@ pub enum IngestEvent {
     Marker(Osc133),
     /// Standalone BEL (not an OSC terminator) — an application bell.
     Bell,
+    /// OSC 9 notification with a message (stripped from the output).
+    Notify(String),
     /// DECSET/DECRST 1049/1047/47 — alt screen entered/left.
     AltScreen(bool),
 }
@@ -288,6 +290,11 @@ impl StreamParser {
                 });
             }
             // Ours either way — strip malformed 133 rather than leak it.
+        } else if let Some(text) = payload.strip_prefix(b"9;") {
+            events.push(EventAt {
+                offset: out.len(),
+                event: IngestEvent::Notify(String::from_utf8_lossy(text).into_owned()),
+            });
         } else if !self.strip {
             out.extend_from_slice(&self.seq_buf);
             if bel_terminated {
@@ -446,6 +453,19 @@ mod tests {
         let (out, events) = run_whole(b"ding\x07dong");
         assert_eq!(out, b"dingdong");
         assert_eq!(events, vec![EventAt { offset: 4, event: IngestEvent::Bell }]);
+    }
+
+    #[test]
+    fn osc9_is_a_notification_with_text() {
+        let (out, events) = run_whole(b"a\x1b]9;Claude finished\x07b\x1b]9;st\x1b\\c");
+        assert_eq!(out, b"abc");
+        assert_eq!(
+            events,
+            vec![
+                EventAt { offset: 1, event: IngestEvent::Notify("Claude finished".into()) },
+                EventAt { offset: 2, event: IngestEvent::Notify("st".into()) },
+            ]
+        );
     }
 
     #[test]

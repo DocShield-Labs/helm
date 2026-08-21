@@ -325,6 +325,9 @@ pub enum NotificationKind {
     /// reliable "pay attention" signal — Claude Code, finished builds,
     /// IRC pings, etc.
     Bell,
+    /// OSC 9 notification with a message ("Claude finished"). Informational:
+    /// unlike a bell it does not mean the program is waiting on the user.
+    Message { text: String },
     /// A command finished. `exit_code` is None when the shell's
     /// integration script doesn't include one (older versions, partial
     /// sequences); the frontend treats None as "succeeded probably."

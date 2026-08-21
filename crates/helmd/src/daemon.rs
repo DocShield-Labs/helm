@@ -455,6 +455,10 @@ impl Daemon {
                 drop(core);
                 self.notify(pane_id, &pane, NotificationKind::Bell);
             }
+            IngestEvent::Notify(text) => {
+                drop(core);
+                self.notify(pane_id, &pane, NotificationKind::Message { text });
+            }
             IngestEvent::Marker(marker) => {
                 let block = {
                     let mut meta = pane.meta.lock();

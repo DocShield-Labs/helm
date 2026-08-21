@@ -15,7 +15,7 @@ pub mod client;
 /// Bump on any breaking change to the message types. The daemon refuses
 /// mismatched clients in `HelloAck` and the app responds by re-installing
 /// the daemon binary it shipped with.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Upper bound on a single frame. Output frames are batched well below
 /// this (64 KB flushes); the cap exists so a corrupt length prefix fails
@@ -282,6 +282,10 @@ pub struct Notification {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NotificationKind {
     Bell,
+    /// OSC 9 (`ESC ] 9 ; text BEL`) — a notification with a message,
+    /// the convention iTerm2 / ConEmu / Windows Terminal use. Unlike a
+    /// bell it does not mean the program is blocked on the user.
+    Message { text: String },
     /// A command finished with a non-zero exit. Carries what the daemon
     /// already knows from the block so offline notifications are as
     /// rich as live ones.
