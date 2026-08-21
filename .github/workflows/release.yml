@@ -8,6 +8,9 @@
 #     (~/.tauri/helm.key on the machine that ran `tauri signer generate`).
 #     The matching pubkey is baked into tauri.conf.json; installs refuse
 #     bundles this key didn't sign.
+# Optional (Developer ID signing + notarization, see the step below):
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
 #
 # The version comes from tauri.conf.json — bump it before tagging, and
 # keep the tag in sync (tag v0.2.0 ↔ "version": "0.2.0").
@@ -48,6 +51,40 @@ jobs:
       - uses: swatinem/rust-cache@v2
 
       - run: bun install --frozen-lockfile
+
+      # Developer ID signing + notarization. Tauri signs the .app (and
+      # the helmd sidecar) with APPLE_SIGNING_IDENTITY and notarizes it
+      # with the Apple ID credentials when these are set; without them
+      # the build is ad-hoc signed, which Gatekeeper reports as
+      # "damaged" for browser downloads (the in-app updater is fine —
+      # it never quarantines). Exported only when present, because the
+      # tauri bundler treats an empty APPLE_CERTIFICATE as a real one.
+      #
+      # Secrets:
+      #   APPLE_CERTIFICATE          base64 of the Developer ID Application .p12
+      #   APPLE_CERTIFICATE_PASSWORD password set when exporting the .p12
+      #   APPLE_SIGNING_IDENTITY     "Developer ID Application: <Name> (<TEAMID>)"
+      #   APPLE_ID                   Apple ID email
+      #   APPLE_PASSWORD             app-specific password for that Apple ID
+      #   APPLE_TEAM_ID              10-character team id
+      - name: Configure Apple signing (when secrets are present)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::warning::No APPLE_CERTIFICATE secret — bundle will be ad-hoc signed (not notarized)."
+            exit 0
+          fi
+          for k in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            v=$(printenv "$k")
+            { echo "$k<<__EOV__"; echo "$v"; echo "__EOV__"; } >> "$GITHUB_ENV"
+          done
+          echo "Developer ID signing + notarization enabled."
 
       - uses: tauri-apps/tauri-action@v0
         env:
