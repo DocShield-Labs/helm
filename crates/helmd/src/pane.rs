@@ -97,6 +97,14 @@ impl Pane {
             cmd.cwd(home);
         }
         cmd.env("TERM", "xterm-256color");
+        // helmd inherits whatever environment launched the app (an
+        // `open` from inside tmux, say); don't let a previous terminal's
+        // identity leak into every pane. Identify ourselves instead.
+        for k in ["TMUX", "TMUX_PANE", "TERM_SESSION_ID", "ITERM_SESSION_ID", "WARP_SESSION_ID"] {
+            cmd.env_remove(k);
+        }
+        cmd.env("TERM_PROGRAM", "Helm");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         // The pane's tty path, inherited by every process in the pane.
         // Tools that run hooks with no controlling terminal (Claude
         // Code) write their BEL here and helmd sees it on this PTY —
