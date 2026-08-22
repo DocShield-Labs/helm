@@ -1,9 +1,11 @@
-# Helm zsh integration — auto-sourced when ZDOTDIR points here.
+# Helm zsh integration — .zshrc forwarder + OSC 133 hooks.
 #
-# The host session manager sets ZDOTDIR=~/.helm/integration/zsh in its server
-# env, which makes zsh read THIS .zshrc instead of the user's. We restore the
-# user's real ZDOTDIR (captured into HELM_USER_ZDOTDIR before we clobbered
-# it), source their actual .zshrc, and then install the OSC 133 marker hooks.
+# helmd sets ZDOTDIR=~/.helm/integration/zsh on every shell it spawns, so
+# zsh reads THIS .zshrc instead of the user's. By the time we run, our
+# .zshenv and .zprofile forwarders have already handed off to the user's
+# real ones (see .zshenv for the contract). Here we hand off .zshrc the
+# same way, leave ZDOTDIR pointing at the user's directory for good, and
+# then install the OSC 133 marker hooks.
 #
 # This integration is PASSIVE: it only emits invisible OSC 133 markers
 # (command boundaries + cwd/branch/cmdline metadata) that helm consumes as
@@ -14,24 +16,29 @@
 # Safe to source twice — the precmd/preexec registration is idempotent
 # (we check before appending to the *_functions arrays).
 
-if [[ -z "$HELM_INTEGRATION" ]]; then
-    # Sourced outside of helm. Fall through silently — the user's normal
-    # zsh startup will handle everything.
-    return 0
+__helm_shim_dir="${${(%):-%x}:A:h}"
+
+# From here on ZDOTDIR is the user's real directory: .zlogin and .zlogout
+# come straight from it, and child shells see exactly the configuration
+# they would in any other terminal.
+ZDOTDIR="${HELM_USER_ZDOTDIR:-$HOME}"
+
+# macOS's /etc/zshrc ran before us, while ZDOTDIR still pointed here, and
+# set HISTFILE relative to it. Repoint history at the user's directory so
+# Helm panes share one history with every other terminal; the user's
+# .zshrc below can still override it.
+if [[ -n "$HISTFILE" && "$HISTFILE" == "$__helm_shim_dir"/* ]]; then
+    HISTFILE="$ZDOTDIR/${HISTFILE:t}"
+fi
+unset __helm_shim_dir
+
+if [[ -r "$ZDOTDIR/.zshrc" ]]; then
+    builtin source "$ZDOTDIR/.zshrc"
 fi
 
-
-# Restore the user's real dotfile location so any hooks they add to
-# precmd_functions / preexec_functions resolve relative to their config.
-__helm_user_zdotdir="${HELM_USER_ZDOTDIR:-$HOME}"
-ZDOTDIR="$__helm_user_zdotdir"
-
-# Source the user's real startup files in zsh's documented order. We
-# only do .zshrc here because .zshenv / .zprofile have already run
-# (zsh loads them before .zshrc regardless of ZDOTDIR being changed
-# mid-startup — well, almost; the prior ZDOTDIR was used for .zshenv).
-if [[ -f "$ZDOTDIR/.zshrc" ]]; then
-    source "$ZDOTDIR/.zshrc"
+if [[ -z "$HELM_INTEGRATION" ]]; then
+    # Sourced outside of helm: the hand-off above is all that's needed.
+    return 0
 fi
 
 # ----- OSC 133 hooks -----
