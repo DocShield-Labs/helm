@@ -10,6 +10,7 @@
 
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { correctedLineHeight, domLinePx } from './cellHeight'
 import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
@@ -105,9 +106,13 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       opts.fontFamily ??
       '"Hack", "Berkeley Mono", "JetBrains Mono", "SF Mono", ui-monospace, monospace',
     fontSize: opts.fontSize ?? 13,
-    // 20px cells: the same `--helm-line-px` rows rendered as DOM use,
-    // so the live band and the finished block it turns into line up.
-    lineHeight: opts.lineHeight ?? 20 / 13,
+    // Cells must be `--helm-line-px` (20px) tall — the rows finished
+    // blocks render as DOM — so the live band and the block it turns
+    // into line up. xterm's `lineHeight` multiplies the font's measured
+    // natural height (~1.2× the size), not `fontSize`, so this is only
+    // a first guess; `measureCellSize` corrects it from the rendered
+    // cell (see cellHeight.ts).
+    lineHeight: opts.lineHeight ?? 1.25,
     letterSpacing: 0,
     fontWeight: 400,
     fontWeightBold: 600,
@@ -239,19 +244,41 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // Cached cell dimensions in pixels. Measure from `.xterm-screen / rows`
   // (and cols) — that's xterm's internal layout, not CSS line-height,
   // so we sidestep rounding drift between the two. The pane's wheel
-  // handler reads it to turn line-mode wheel deltas into pixels.
-  // (The grid has no scrollback, so xterm never scrolls itself: the
-  // pane decides what a wheel over the grid means — see BlockPane.)
-  // 20px tall by construction (see `lineHeight`); measured to confirm.
-  let cachedCellH = 20
+  // handler reads it to turn line-mode wheel deltas into pixels, and
+  // BlockPane sizes the live band from it. (The grid has no scrollback,
+  // so xterm never scrolls itself: the pane decides what a wheel over
+  // the grid means — see BlockPane.)
+  //
+  // The measurement also closes the loop on `lineHeight`: when the
+  // rendered cell isn't the DOM row height, set the lineHeight that
+  // makes it so and refit. xterm resizes `.xterm-screen` in response,
+  // which re-measures and finds nothing left to correct.
+  const linePx = domLinePx()
+  let cachedCellH = linePx
   let cachedCellW = 8
+  let screenObserved: HTMLElement | null = null
   const measureCellSize = () => {
     const screen = host.querySelector('.xterm-screen') as HTMLElement | null
+    if (screen && screen !== screenObserved) {
+      ro.observe(screen)
+      screenObserved = screen
+    }
     if (screen && term.rows > 0 && term.cols > 0) {
       const rect = screen.getBoundingClientRect()
       if (rect.height > 0) cachedCellH = rect.height / term.rows
       if (rect.width > 0) cachedCellW = rect.width / term.cols
-      if (rect.height > 0) return
+      if (rect.height > 0) {
+        const lh = correctedLineHeight(cachedCellH, term.options.lineHeight ?? 1, window.devicePixelRatio || 1, linePx)
+        if (lh !== null) {
+          term.options.lineHeight = lh
+          try {
+            fit.fit()
+          } catch {
+            /* not laid out yet */
+          }
+        }
+        return
+      }
     }
     const row = host.querySelector('.xterm-rows > div') as HTMLElement | null
     if (row) {
@@ -260,15 +287,16 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       if (rect.width > 0 && term.cols > 0) cachedCellW = rect.width / term.cols
     }
   }
-  measureCellSize()
-
-  // Re-measure on host resize (font-size or DPR changes) and once on
-  // the first xterm render (covers the WebGL post-init race where the
-  // screen element settles to its final dimensions a tick after
-  // `term.open`). Both feed the same cache so all consumers stay in
-  // sync; no measurement happens on the wheel/hover/render hot paths.
+  // Re-measure on host resize (font-size or DPR changes), whenever
+  // xterm resizes its screen element (a font settling, our own
+  // lineHeight correction), and once on the first xterm render (covers
+  // the WebGL post-init race where the screen element settles to its
+  // final dimensions a tick after `term.open`). All feed the same cache
+  // so consumers stay in sync; nothing measures on the wheel/hover/
+  // render hot paths.
   const ro = new ResizeObserver(measureCellSize)
   ro.observe(host)
+  measureCellSize()
   let firstRender: { dispose(): void } | null = term.onRender(() => {
     measureCellSize()
     firstRender?.dispose()
