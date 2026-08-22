@@ -100,7 +100,11 @@ export function SessionRow({
                   e.stopPropagation()
                 }}
                 onClick={(e) => e.stopPropagation()}
-                className="min-w-0 flex-1 rounded-sm bg-[var(--stroke-default)] px-1 text-[12px] text-text-primary outline-none"
+                // Same box as the title it replaces (16px line, no inner
+                // padding) so the row doesn't grow while editing; the
+                // 4px side padding is pulled back with a negative margin
+                // so the text stays where the title was.
+                className="-mx-1 h-4 min-w-0 flex-1 rounded-sm bg-[var(--stroke-default)] px-1 py-0 text-[12px] leading-4 text-text-primary outline-none"
               />
             ) : (
               <span className="truncate text-[12px] leading-4 text-text-primary" title={title}>
