@@ -333,3 +333,59 @@ fn long_output_pages_through_history() {
 
     let _ = std::fs::remove_file(&socket);
 }
+
+/// A pane's environment comes from the fixed base in `helmd::env`, not
+/// from whatever the daemon inherited — here, this test process, which
+/// we dress up as a tmux-inside-iTerm launcher.
+#[test]
+fn pane_env_is_pristine_not_inherited() {
+    std::env::set_var("TMUX", "/tmp/tmux-e2e/default,1,0");
+    std::env::set_var("ITERM_SESSION_ID", "w0t0p0:e2e");
+    std::env::set_var("HELM_E2E_LEAK", "should-not-reach-the-pane");
+    let (socket, mut c, mut seen, ws_id) = start_daemon("env");
+
+    c.send(&ClientMsg::NewWindow {
+        req_id: 2,
+        workspace: ws_id,
+        name: Some("env".into()),
+        cwd: None,
+        command: Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "env | sort; printf 'helm-e2e-env-done\\n'; sleep 5".into(),
+        ]),
+    });
+    let pane_id = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Created { req_id: 2, pane, .. } => Some(pane.unwrap()),
+        _ => None,
+    });
+    let done = |m: &DaemonMsg| {
+        screen_texts(std::slice::from_ref(m), pane_id)
+            .iter()
+            .any(|t| t.contains("helm-e2e-env-done"))
+            .then_some(())
+    };
+    if !seen.iter().any(|m| done(m).is_some()) {
+        c.recv_until(10, &mut seen, done);
+    }
+    // Pull the final screen so every env line is in one snapshot.
+    c.send(&ClientMsg::Screen { req_id: 3, pane: pane_id });
+    let screen = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Screen { req_id: Some(3), pane, screen } if *pane == pane_id => Some(screen.clone()),
+        _ => None,
+    });
+    let lines: Vec<String> = screen.lines.iter().map(|r| r.text().trim_end().to_string()).collect();
+    let has = |prefix: &str| lines.iter().any(|l| l.starts_with(prefix));
+
+    assert!(!has("TMUX="), "TMUX leaked from the daemon's launcher: {lines:?}");
+    assert!(!has("ITERM_SESSION_ID="), "ITERM_SESSION_ID leaked: {lines:?}");
+    assert!(!has("HELM_E2E_LEAK="), "arbitrary launcher env leaked: {lines:?}");
+    assert!(has(&format!("PATH={}", helmd::env::SYSTEM_PATH)), "PATH is not the system base: {lines:?}");
+    assert!(has("TERM_PROGRAM=Helm"), "{lines:?}");
+    assert!(has("HELM_TTY=/dev/"), "{lines:?}");
+    assert!(has("HELM_INTEGRATION=1"), "{lines:?}");
+    assert!(has("ZDOTDIR="), "{lines:?}");
+    assert!(has("HOME="), "{lines:?}");
+
+    let _ = std::fs::remove_file(&socket);
+}

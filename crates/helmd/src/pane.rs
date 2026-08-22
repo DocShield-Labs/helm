@@ -66,7 +66,9 @@ pub struct SpawnSpec {
     pub cwd: Option<String>,
     /// argv to exec; `None` = the user's login shell.
     pub command: Option<Vec<String>>,
-    /// Extra environment (integration vars) layered on the inherited env.
+    /// Extra environment (integration vars) layered on the pane's base
+    /// env — see `crate::env` for what that base is and why it is not
+    /// the daemon's own environment.
     pub env: Vec<(String, String)>,
 }
 
@@ -97,15 +99,14 @@ impl Pane {
         } else if let Some(home) = dirs::home_dir() {
             cmd.cwd(home);
         }
-        cmd.env("TERM", "xterm-256color");
-        // helmd inherits whatever environment launched the app (an
-        // `open` from inside tmux, say); don't let a previous terminal's
-        // identity leak into every pane. Identify ourselves instead.
-        for k in ["TMUX", "TMUX_PANE", "TERM_SESSION_ID", "ITERM_SESSION_ID", "WARP_SESSION_ID"] {
-            cmd.env_remove(k);
+        // Start from a fixed base, not from whatever launched helmd —
+        // a pane must look the same whether the app came from the Dock,
+        // an `open` inside tmux, or a dev build inside a Helm pane. The
+        // user's dotfiles build the rest, as in any other terminal.
+        cmd.env_clear();
+        for (k, v) in crate::env::pane_env(std::env::vars()) {
+            cmd.env(k, v);
         }
-        cmd.env("TERM_PROGRAM", "Helm");
-        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         // The pane's tty path, inherited by every process in the pane.
         // Tools that run hooks with no controlling terminal (Claude
         // Code) write their BEL here and helmd sees it on this PTY —

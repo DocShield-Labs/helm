@@ -724,14 +724,15 @@ fn snapshot(core: &Core) -> TreeSnapshot {
 
 /// Environment layered onto every spawned shell — replaces tmux's
 /// `set-environment` fan-out.
+///
+/// The user's real zsh directory is always `$HOME` here: panes start
+/// from a fixed base (`crate::env`), so there is no inherited ZDOTDIR to
+/// honour, and a `~/.zshenv` that relocates it is picked up by the
+/// shim's own `.zshenv` forwarder.
 fn integration_env() -> Vec<(String, String)> {
     let mut env = vec![("HELM_INTEGRATION".to_string(), "1".to_string())];
     if let Some(home) = dirs::home_dir() {
-        let user_zdotdir = std::env::var("ZDOTDIR")
-            .ok()
-            .filter(|z| !z.contains(".helm/integration"))
-            .unwrap_or_else(|| home.to_string_lossy().into_owned());
-        env.push(("HELM_USER_ZDOTDIR".to_string(), user_zdotdir));
+        env.push(("HELM_USER_ZDOTDIR".to_string(), home.to_string_lossy().into_owned()));
         env.push((
             "ZDOTDIR".to_string(),
             home.join(".helm/integration/zsh").to_string_lossy().into_owned(),
