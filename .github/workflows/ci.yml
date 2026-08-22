@@ -1,0 +1,29 @@
+# Tests on every push and PR. The release workflow only runs on tags,
+# so without this nothing guards main — including the tests that run a
+# real zsh against the shell-integration shim and the ones that check a
+# pane's environment is the fixed base rather than the launcher's.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # macOS is the shipping platform: real zsh, real /etc/zshrc and
+    # path_helper, and the tauri crate builds without extra system deps.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      # Bindings are generated from the Rust types (gitignored), so
+      # produce them before type-checking the frontend against them.
+      - run: bun run bindings
+      - run: bun run typecheck
+      - run: bun test
