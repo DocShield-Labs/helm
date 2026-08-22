@@ -22,6 +22,12 @@ pub mod client;
 /// Bump on any breaking change to the message types. The daemon refuses
 /// mismatched clients in `HelloAck` and the app responds by re-installing
 /// the daemon binary it shipped with.
+///
+/// Frames are bincode, which tags enum variants by index, so after a
+/// bump the old daemon's `Error` rejection may decode on the new client
+/// as a different variant entirely. The app treats any non-`HelloAck`
+/// first message as a stale daemon for that reason — don't rely on the
+/// rejection text surviving a version gap.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Upper bound on a single frame. History pages are capped well below

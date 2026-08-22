@@ -472,8 +472,8 @@ async fn establish_local() -> Result<Established, String> {
         match connect_or_spawn_unix(&socket, &bin, &name) {
             // A daemon from another build owns the socket. Its sessions
             // are unreachable to us either way; replace it with ours.
-            Err(ClientError::HandshakeRejected(m)) if is_protocol_mismatch(&m) => {
-                tracing::warn!("local helmd is stale ({m}); restarting it");
+            Err(e) if is_stale_daemon(&e) => {
+                tracing::warn!("local helmd is stale ({e}); restarting it");
                 helm_proto::shutdown_socket(&socket)?;
                 connect_or_spawn_unix(&socket, &bin, &name)
             }
@@ -486,8 +486,21 @@ async fn establish_local() -> Result<Established, String> {
     Ok(Established { connected, ssh: None })
 }
 
-fn is_protocol_mismatch(rejection: &str) -> bool {
-    rejection.contains("protocol mismatch")
+/// Did a daemon from another build answer our hello? The clean case is
+/// an explicit `protocol mismatch` rejection. But the frame format is
+/// bincode, which tags enum variants by index — so once a protocol bump
+/// inserts variants ahead of `DaemonMsg::Error`, the old daemon's
+/// rejection decodes on our side as some other variant
+/// (`UnexpectedHello`) or as nothing at all (`Proto(Decode)`). Anything
+/// short of a `HelloAck` means its sessions are unreachable to us
+/// either way, so all three get the same treatment: replace it.
+fn is_stale_daemon(err: &ClientError) -> bool {
+    match err {
+        ClientError::HandshakeRejected(m) => m.contains("protocol mismatch"),
+        ClientError::UnexpectedHello => true,
+        ClientError::Proto(helm_proto::ProtoError::Decode(_)) => true,
+        _ => false,
+    }
 }
 
 /// The local daemon's socket: `~/.helm/helmd.sock`, or `$HELM_SOCKET`.
@@ -586,8 +599,8 @@ async fn establish_remote(
             connect_io(Box::new(opened.reader), Box::new(opened.writer), &name, None)
         };
         let connected = match bridge(&session) {
-            Err(ClientError::HandshakeRejected(m)) if is_protocol_mismatch(&m) => {
-                tracing::warn!("remote helmd is stale ({m}); restarting it");
+            Err(e) if is_stale_daemon(&e) => {
+                tracing::warn!("remote helmd is stale ({e}); restarting it");
                 shutdown_remote_helmd(&session)?;
                 bridge(&session).map_err(|e| e.to_string())?
             }
@@ -821,5 +834,23 @@ pub(crate) fn to_domain_screen(s: helm_proto::Screen) -> ScreenInfo {
         cursor: to_domain_cursor(&s.cursor),
         modes: s.modes,
         lines: s.lines.into_iter().map(to_domain_row).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_daemon_is_anything_but_a_hello_ack() {
+        let mismatch = ClientError::HandshakeRejected("protocol mismatch: client 4, daemon 3".into());
+        assert!(is_stale_daemon(&mismatch));
+        // An older daemon's `Error` frame lands on a different variant of
+        // our `DaemonMsg` — this is what a 0.2.3 daemon looks like to 0.2.4.
+        assert!(is_stale_daemon(&ClientError::UnexpectedHello));
+        // Not a version problem: leave the daemon alone.
+        assert!(!is_stale_daemon(&ClientError::HandshakeRejected("busy".into())));
+        assert!(!is_stale_daemon(&ClientError::HandshakeClosed));
+        assert!(!is_stale_daemon(&ClientError::Closed));
     }
 }
