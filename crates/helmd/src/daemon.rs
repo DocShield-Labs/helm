@@ -1,40 +1,52 @@
 //! Daemon core: the workspace → window → pane tree, client fan-out,
-//! block bookkeeping, and the offline notification queue.
+//! block bookkeeping, screen/history flushes, and the offline
+//! notification queue.
 //!
-//! One `Mutex<Core>` guards everything — contention is negligible (a
-//! handful of clients, events already batched by the reader threads),
-//! and a single lock keeps the tree/pane/client invariants trivially
-//! consistent. The event loop task (`Daemon::run`) is the only consumer
-//! of `PaneEvent`s.
+//! One `Mutex<Core>` guards the tree and the client table — contention
+//! is negligible (a handful of clients, events already batched by the
+//! reader threads), and a single lock keeps the tree/pane/client
+//! invariants trivially consistent. Lock order where two are held:
+//! `core` → pane `meta`, never the reverse; a pane's `screen` is never
+//! held together with `core` (a flush encodes the grid under `screen`
+//! alone, so a busy pane can't stall input to every other pane).
+//!
+//! The event loop task (`Daemon::run`) is the only consumer of
+//! `PaneEvent`s. Screen changes are coalesced: a `Dirty` event
+//! schedules one flush per pane ≥ 16 ms out, and the flush hands every
+//! attached client the rows that scrolled out plus the damage since
+//! the last flush.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use helm_proto::{
     BlockId, BlockMeta, DaemonMsg, Notification, NotificationId, NotificationKind, PaneId,
-    PaneInfo, ReplayFrom, SearchMatch, SearchScope, TreeSnapshot, WindowId, WindowInfo,
-    WorkspaceId, WorkspaceInfo,
+    PaneInfo, SearchMatch, SearchScope, TreeSnapshot, WindowId, WindowInfo, WorkspaceId,
+    WorkspaceInfo,
 };
 
-use crate::markers::{strip_ansi, IngestEvent, Osc133};
+use crate::markers::{IngestEvent, Osc133};
 use crate::pane::{Pane, PaneEvent, PaneMeta, SpawnSpec};
+use crate::screen::Update;
 
 /// Cap on the offline notification queue — old entries are dropped
 /// first; strictly better than tmux's single bell flag either way.
 const MAX_PENDING_NOTIFICATIONS: usize = 500;
-/// Blocks retained per pane (metadata only; bytes live in the ring).
+/// Blocks retained per pane (metadata only; rows live in the model).
 const MAX_BLOCKS_PER_PANE: usize = 1000;
+/// Screen/history flush coalescing window (~60 Hz).
+const FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 
 pub type ClientId = u64;
 
 struct ClientHandle {
     tx: UnboundedSender<DaemonMsg>,
-    /// Set by `Attach` — only attached clients receive live output.
+    /// Set by `Attach` — only attached clients receive live broadcasts.
     attached: bool,
 }
 
@@ -61,6 +73,8 @@ struct Core {
 pub struct Daemon {
     core: Mutex<Core>,
     events_tx: UnboundedSender<PaneEvent>,
+    /// Panes with a flush scheduled but not yet run.
+    flush_pending: Mutex<HashSet<PaneId>>,
     next_workspace: AtomicU64,
     next_window: AtomicU64,
     next_pane: AtomicU64,
@@ -83,6 +97,7 @@ impl Daemon {
         let daemon = Arc::new(Self {
             core: Mutex::new(Core::default()),
             events_tx,
+            flush_pending: Mutex::new(HashSet::new()),
             next_workspace: AtomicU64::new(1),
             next_window: AtomicU64::new(1),
             next_pane: AtomicU64::new(1),
@@ -119,48 +134,58 @@ impl Daemon {
         }
     }
 
-    /// Mark attached and replay each requested pane from its resume
-    /// point. Replayed bytes go only to this client; from here on it
-    /// also receives the live broadcast.
-    pub fn attach(&self, client: ClientId, resume: &[(PaneId, u64)]) {
-        let core = self.core.lock();
-        let Some(handle) = core.clients.get(&client) else { return };
-        let tx = handle.tx.clone();
-        for (pane_id, from_seq) in resume {
-            if let Some(pane) = core.panes.get(pane_id) {
-                let slice = pane.ring.lock().slice_from(*from_seq);
-                if let Some((seq, bytes)) = slice {
-                    let _ = tx.send(DaemonMsg::Output { pane: *pane_id, seq, bytes });
-                }
-                let at_seq = pane.ring.lock().head_seq();
-                let _ = tx.send(DaemonMsg::ReplayDone { pane: *pane_id, at_seq });
-            }
+    /// Subscribe the client to live broadcasts. Pane contents are
+    /// pulled with `screen` / `history` as the client shows panes.
+    pub fn attach(&self, client: ClientId) {
+        if let Some(h) = self.core.lock().clients.get_mut(&client) {
+            h.attached = true;
         }
-        drop(core);
-        self.core
-            .lock()
-            .clients
-            .get_mut(&client)
-            .map(|h| h.attached = true);
     }
 
-    pub fn replay(&self, client: ClientId, pane_id: PaneId, from: ReplayFrom) {
+    /// A client's reply channel and a pane, for request/reply handlers.
+    fn client_pane(
+        &self,
+        client: ClientId,
+        pane_id: PaneId,
+    ) -> Result<(UnboundedSender<DaemonMsg>, Arc<Pane>), String> {
         let core = self.core.lock();
-        let (Some(handle), Some(pane)) = (core.clients.get(&client), core.panes.get(&pane_id))
-        else {
-            return;
+        let tx = core.clients.get(&client).ok_or("no such client")?.tx.clone();
+        let pane = core.panes.get(&pane_id).cloned().ok_or_else(|| format!("no pane {pane_id}"))?;
+        Ok((tx, pane))
+    }
+
+    /// Reply with the pane's full grid.
+    pub fn screen(&self, client: ClientId, req_id: u64, pane_id: PaneId) -> Result<(), String> {
+        let (tx, pane) = self.client_pane(client, pane_id)?;
+        let screen = pane.screen.lock().snapshot();
+        let _ = tx.send(DaemonMsg::Screen { req_id: Some(req_id), pane: pane_id, screen });
+        Ok(())
+    }
+
+    /// Reply with a page of history rows.
+    pub fn history(
+        &self,
+        client: ClientId,
+        req_id: u64,
+        pane_id: PaneId,
+        from_line: u64,
+        to_line: u64,
+    ) -> Result<(), String> {
+        let (tx, pane) = self.client_pane(client, pane_id)?;
+        let (from, rows, history_start, top_line) = {
+            let s = pane.screen.lock();
+            let (from, rows) = s.history_page(from_line, to_line);
+            (from, rows, s.history_start(), s.top_line())
         };
-        let ring = pane.ring.lock();
-        let slice = match from {
-            ReplayFrom::Seq(seq) => ring.slice_from(seq),
-            ReplayFrom::LastBytes(n) => Some(ring.last_bytes(n)),
-        };
-        if let Some((seq, bytes)) = slice {
-            if !bytes.is_empty() {
-                let _ = handle.tx.send(DaemonMsg::Output { pane: pane_id, seq, bytes });
-            }
-        }
-        let _ = handle.tx.send(DaemonMsg::ReplayDone { pane: pane_id, at_seq: ring.head_seq() });
+        let _ = tx.send(DaemonMsg::History {
+            req_id,
+            pane: pane_id,
+            from_line: from,
+            rows,
+            history_start,
+            top_line,
+        });
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -287,26 +312,25 @@ impl Daemon {
     // Pane I/O
     // ---------------------------------------------------------------
 
-    pub fn input(&self, pane: PaneId, bytes: &[u8]) -> Result<(), String> {
-        let pane = self
-            .core
+    fn pane(&self, pane: PaneId) -> Result<Arc<Pane>, String> {
+        self.core
             .lock()
             .panes
             .get(&pane)
             .cloned()
-            .ok_or_else(|| format!("no pane {pane}"))?;
-        pane.input(bytes).map_err(|e| e.to_string())
+            .ok_or_else(|| format!("no pane {pane}"))
     }
 
+    pub fn input(&self, pane: PaneId, bytes: &[u8]) -> Result<(), String> {
+        self.pane(pane)?.input(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Resize the PTY and the model; the resulting full damage reaches
+    /// clients on the next flush.
     pub fn resize(&self, pane: PaneId, cols: u16, rows: u16) -> Result<(), String> {
-        let pane = self
-            .core
-            .lock()
-            .panes
-            .get(&pane)
-            .cloned()
-            .ok_or_else(|| format!("no pane {pane}"))?;
-        pane.resize(cols, rows).map_err(|e| e.to_string())
+        self.pane(pane)?.resize(cols, rows).map_err(|e| e.to_string())?;
+        let _ = self.events_tx.send(PaneEvent::Dirty { pane });
+        Ok(())
     }
 
     /// Retained block table for a pane, oldest first.
@@ -331,7 +355,7 @@ impl Daemon {
         max_results: u32,
     ) -> (Vec<SearchMatch>, bool) {
         // Resolve scope under the core lock, then release it: the scan
-        // itself must not stall output fan-out for every other pane.
+        // itself must not stall fan-out for every other pane.
         let in_scope: Vec<Arc<Pane>> = {
             let core = self.core.lock();
             match scope {
@@ -354,53 +378,55 @@ impl Daemon {
             lowered = query.to_lowercase();
             &lowered
         };
-        let mut matches = Vec::new();
+        let mut matches: Vec<SearchMatch> = Vec::new();
         let mut truncated = false;
+        // Reused per row so the scan allocates only for hits.
+        let mut text = String::new();
+        let mut hay = String::new();
 
-        'outer: for pane in in_scope {
-            let ring = pane.ring.lock();
-            let start_seq = ring.start_seq();
-            let (a, b) = ring.as_slices();
-            // Borrow when the ring hasn't wrapped; copy only when it has.
-            let joined: std::borrow::Cow<[u8]> = if b.is_empty() {
-                std::borrow::Cow::Borrowed(a)
-            } else {
-                std::borrow::Cow::Owned([a, b].concat())
-            };
-            let mut line_start = 0usize;
-            for line in joined.split_inclusive(|&c| c == b'\n') {
-                let line_seq = start_seq + line_start as u64;
-                line_start += line.len();
-                let text = strip_ansi(line);
-                let hay: std::borrow::Cow<str> = if case_sensitive {
-                    std::borrow::Cow::Borrowed(&text)
+        for pane in in_scope {
+            // Scan rows under the screen lock, resolve blocks after —
+            // never hold `screen` and `meta` together.
+            let first_hit = matches.len();
+            pane.screen.lock().for_each_row(|line, row| {
+                if truncated {
+                    return;
+                }
+                text.clear();
+                for sp in &row.spans {
+                    text.push_str(&sp.text);
+                }
+                let haystack: &str = if case_sensitive {
+                    &text
                 } else {
-                    std::borrow::Cow::Owned(text.to_lowercase())
+                    hay.clear();
+                    hay.extend(text.chars().flat_map(char::to_lowercase));
+                    &hay
                 };
-                let Some(pos) = hay.find(needle) else { continue };
-                // Block lookup only for hits: blocks are sorted by
-                // start_seq, so the owning block is the last one starting
-                // at or before the line.
-                let block = {
-                    let meta = pane.meta.lock();
-                    let idx = meta.blocks.partition_point(|b| b.start_seq <= line_seq);
-                    idx.checked_sub(1)
-                        .map(|i| &meta.blocks[i])
-                        .filter(|b| b.end_seq.map(|e| line_seq <= e).unwrap_or(true))
-                        .map(|b| b.id)
-                };
+                let Some(pos) = haystack.find(needle) else { return };
                 matches.push(SearchMatch {
                     pane: pane.id,
-                    block,
-                    line_seq,
+                    block: None,
+                    line,
                     line_text: text.trim_end().to_string(),
                     match_start: pos as u32,
                     match_end: (pos + needle.len()) as u32,
                 });
-                if matches.len() >= max_results as usize {
-                    truncated = true;
-                    break 'outer;
-                }
+                truncated = matches.len() >= max_results as usize;
+            });
+            let meta = pane.meta.lock();
+            for m in &mut matches[first_hit..] {
+                // Blocks are sorted by start_line, so the owning block is
+                // the last one starting at or before the line.
+                let idx = meta.blocks.partition_point(|b| b.start_line <= m.line);
+                m.block = idx
+                    .checked_sub(1)
+                    .map(|i| &meta.blocks[i])
+                    .filter(|b| b.end_line.map(|e| m.line < e).unwrap_or(true))
+                    .map(|b| b.id);
+            }
+            if truncated {
+                break;
             }
         }
         (matches, truncated)
@@ -425,14 +451,13 @@ impl Daemon {
         }
     }
 
-    fn handle_event(&self, event: PaneEvent) {
+    fn handle_event(self: &Arc<Self>, event: PaneEvent) {
         match event {
-            PaneEvent::Output { pane, seq, bytes } => {
-                let core = self.core.lock();
-                broadcast(&core, DaemonMsg::Output { pane, seq, bytes });
-            }
-            PaneEvent::Ingest { pane, seq, event } => self.handle_ingest(pane, seq, event),
+            PaneEvent::Dirty { pane } => self.schedule_flush(pane),
+            PaneEvent::Ingest { pane, line, event } => self.handle_ingest(pane, line, event),
             PaneEvent::Exited { pane: pane_id, status } => {
+                // Paint whatever the process left behind before it goes.
+                self.flush_pane(pane_id);
                 let mut core = self.core.lock();
                 broadcast(&core, DaemonMsg::PaneExited { pane: pane_id, status });
                 // A window whose only pane died disappears from the tree;
@@ -443,7 +468,59 @@ impl Daemon {
         }
     }
 
-    fn handle_ingest(&self, pane_id: PaneId, seq: u64, event: IngestEvent) {
+    /// One flush per pane per interval: the first `Dirty` after a flush
+    /// arms a timer; later ones are absorbed until it fires.
+    fn schedule_flush(self: &Arc<Self>, pane: PaneId) {
+        if !self.flush_pending.lock().insert(pane) {
+            return;
+        }
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(FLUSH_INTERVAL).await;
+            daemon.flush_pane(pane);
+        });
+    }
+
+    /// Hand attached clients the rows that scrolled out and the damage
+    /// since the last flush. The core lock is held only to find the
+    /// pane and its audience; encoding and sending happen under the
+    /// pane's own lock, which also keeps two flushes of one pane from
+    /// interleaving their history appends.
+    pub fn flush_pane(&self, pane_id: PaneId) {
+        self.flush_pending.lock().remove(&pane_id);
+        let (pane, audience) = {
+            let core = self.core.lock();
+            let Some(pane) = core.panes.get(&pane_id).cloned() else { return };
+            let audience: Vec<UnboundedSender<DaemonMsg>> =
+                core.clients.values().filter(|c| c.attached).map(|c| c.tx.clone()).collect();
+            (pane, audience)
+        };
+        let mut s = pane.screen.lock();
+        if audience.is_empty() {
+            // Nobody listening: forget pending history (clients re-page on
+            // attach) and let damage accumulate into one full paint.
+            s.discard_pending();
+            return;
+        }
+        let send = |msg: DaemonMsg| {
+            for tx in &audience {
+                let _ = tx.send(msg.clone());
+            }
+        };
+        let (first_line, rows) = s.take_pending_history();
+        if !rows.is_empty() {
+            send(DaemonMsg::HistoryAppend { pane: pane_id, first_line, rows });
+        }
+        match s.take_update() {
+            Update::None => {}
+            Update::Full(screen) => send(DaemonMsg::Screen { req_id: None, pane: pane_id, screen }),
+            Update::Partial { top_line, scroll, rows, cursor, modes } => {
+                send(DaemonMsg::ScreenDiff { pane: pane_id, top_line, scroll, rows, cursor, modes })
+            }
+        }
+    }
+
+    fn handle_ingest(&self, pane_id: PaneId, line: u64, event: IngestEvent) {
         let core = self.core.lock();
         let Some(pane) = core.panes.get(&pane_id).cloned() else { return };
         match event {
@@ -462,13 +539,13 @@ impl Daemon {
             IngestEvent::Marker(marker) => {
                 let block = {
                     let mut meta = pane.meta.lock();
-                    update_blocks(&mut meta, seq, marker)
+                    update_blocks(&mut meta, line, marker)
                 };
                 if let Some(block) = block.clone() {
                     broadcast(&core, DaemonMsg::Block { pane: pane_id, block });
                 }
                 drop(core);
-                if let Some(b @ BlockMeta { exit_code: Some(code), end_seq: Some(_), .. }) = block {
+                if let Some(b @ BlockMeta { exit_code: Some(code), end_line: Some(_), .. }) = block {
                     if code != 0 {
                         let duration_ms = match (b.started_at_ms, b.finished_at_ms) {
                             (Some(s), Some(f)) => Some(f.saturating_sub(s)),
@@ -490,11 +567,7 @@ impl Daemon {
     }
 
     fn notify(&self, pane_id: PaneId, pane: &Arc<Pane>, kind: NotificationKind) {
-        let preview = {
-            let ring = pane.ring.lock();
-            let (_, tail) = ring.last_bytes(512);
-            preview_from_tail(&tail)
-        };
+        let preview = pane.screen.lock().last_nonempty_text();
         let note = Notification {
             id: NotificationId(self.next_notification.fetch_add(1, Ordering::Relaxed)),
             pane: pane_id,
@@ -522,13 +595,13 @@ impl Daemon {
 
 /// OSC 133 marker → block table transition. Returns the block to
 /// broadcast, if any changed.
-fn update_blocks(meta: &mut PaneMeta, seq: u64, marker: Osc133) -> Option<BlockMeta> {
+fn update_blocks(meta: &mut PaneMeta, line: u64, marker: Osc133) -> Option<BlockMeta> {
     match marker {
         Osc133::PromptStart { cwd, branch } => {
             // Close a dangling block (its D never arrived).
             if let Some(idx) = meta.open_block.take() {
-                if meta.blocks[idx].end_seq.is_none() {
-                    meta.blocks[idx].end_seq = Some(seq);
+                if meta.blocks[idx].end_line.is_none() {
+                    meta.blocks[idx].end_line = Some(line);
                 }
             }
             if cwd.is_some() {
@@ -537,10 +610,10 @@ fn update_blocks(meta: &mut PaneMeta, seq: u64, marker: Osc133) -> Option<BlockM
             meta.branch = branch.clone();
             let block = BlockMeta {
                 id: BlockId(meta.next_block_id),
-                start_seq: seq,
-                cmd_seq: None,
-                output_seq: None,
-                end_seq: None,
+                start_line: line,
+                cmd_line: None,
+                output_line: None,
+                end_line: None,
                 cmdline: None,
                 cwd,
                 branch,
@@ -560,7 +633,7 @@ fn update_blocks(meta: &mut PaneMeta, seq: u64, marker: Osc133) -> Option<BlockM
         Osc133::CommandStart { cmdline } => {
             let idx = meta.open_block?;
             let b = &mut meta.blocks[idx];
-            b.cmd_seq = Some(seq);
+            b.cmd_line = Some(line);
             b.cmdline = cmdline;
             b.started_at_ms = Some(now_ms());
             Some(b.clone())
@@ -568,13 +641,13 @@ fn update_blocks(meta: &mut PaneMeta, seq: u64, marker: Osc133) -> Option<BlockM
         Osc133::OutputStart => {
             let idx = meta.open_block?;
             let b = &mut meta.blocks[idx];
-            b.output_seq = Some(seq);
+            b.output_line = Some(line);
             Some(b.clone())
         }
         Osc133::CommandDone { exit_code } => {
             let idx = meta.open_block.take()?;
             let b = &mut meta.blocks[idx];
-            b.end_seq = Some(seq);
+            b.end_line = Some(line);
             b.exit_code = exit_code;
             b.finished_at_ms = Some(now_ms());
             Some(b.clone())
@@ -631,7 +704,6 @@ fn snapshot(core: &Core) -> TreeSnapshot {
                             .filter_map(|id| core.panes.get(id))
                             .map(|p| {
                                 let meta = p.meta.lock();
-                                let ring = p.ring.lock();
                                 PaneInfo {
                                     id: p.id,
                                     cols: meta.cols,
@@ -640,8 +712,6 @@ fn snapshot(core: &Core) -> TreeSnapshot {
                                     cwd: meta.cwd.clone(),
                                     branch: meta.branch.clone(),
                                     command: meta.command.clone(),
-                                    head_seq: ring.head_seq(),
-                                    buffer_start_seq: ring.start_seq(),
                                 }
                             })
                             .collect(),
@@ -670,26 +740,9 @@ fn integration_env() -> Vec<(String, String)> {
     env
 }
 
-/// Last non-empty stripped line of the tail, clamped to 120 chars.
-fn preview_from_tail(tail: &[u8]) -> String {
-    let text = strip_ansi(tail);
-    let line = text
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    line.chars().take(120).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn preview_takes_last_nonempty_line() {
-        assert_eq!(preview_from_tail(b"first\n\x1b[32msecond\x1b[0m\n\n"), "second");
-    }
 
     #[test]
     fn block_lifecycle() {
@@ -700,19 +753,20 @@ mod tests {
             Osc133::PromptStart { cwd: Some("/x".into()), branch: Some("main".into()) },
         )
         .unwrap();
-        assert_eq!(b.start_seq, 10);
+        assert_eq!(b.start_line, 10);
         assert_eq!(meta.cwd.as_deref(), Some("/x"));
 
-        update_blocks(&mut meta, 20, Osc133::CommandStart { cmdline: Some("ls".into()) }).unwrap();
-        update_blocks(&mut meta, 25, Osc133::OutputStart).unwrap();
-        let done = update_blocks(&mut meta, 90, Osc133::CommandDone { exit_code: Some(2) }).unwrap();
+        update_blocks(&mut meta, 11, Osc133::CommandStart { cmdline: Some("ls".into()) }).unwrap();
+        update_blocks(&mut meta, 12, Osc133::OutputStart).unwrap();
+        let done = update_blocks(&mut meta, 40, Osc133::CommandDone { exit_code: Some(2) }).unwrap();
         assert_eq!(done.cmdline.as_deref(), Some("ls"));
         assert_eq!(done.exit_code, Some(2));
-        assert_eq!(done.end_seq, Some(90));
+        assert_eq!(done.output_line, Some(12));
+        assert_eq!(done.end_line, Some(40));
         assert!(meta.open_block.is_none());
 
         // Next prompt opens a fresh block.
-        let b2 = update_blocks(&mut meta, 95, Osc133::PromptStart { cwd: None, branch: None }).unwrap();
+        let b2 = update_blocks(&mut meta, 40, Osc133::PromptStart { cwd: None, branch: None }).unwrap();
         assert_eq!(b2.id, BlockId(1));
         assert_eq!(meta.blocks.len(), 2);
     }
@@ -721,10 +775,10 @@ mod tests {
     fn dangling_block_closed_by_next_prompt() {
         let mut meta = PaneMeta::default();
         update_blocks(&mut meta, 0, Osc133::PromptStart { cwd: None, branch: None });
-        update_blocks(&mut meta, 5, Osc133::CommandStart { cmdline: Some("vim".into()) });
+        update_blocks(&mut meta, 1, Osc133::CommandStart { cmdline: Some("vim".into()) });
         // No D (shell died mid-command); next A closes it.
         update_blocks(&mut meta, 50, Osc133::PromptStart { cwd: None, branch: None });
-        assert_eq!(meta.blocks[0].end_seq, Some(50));
+        assert_eq!(meta.blocks[0].end_line, Some(50));
         assert_eq!(meta.blocks[0].exit_code, None);
     }
 }

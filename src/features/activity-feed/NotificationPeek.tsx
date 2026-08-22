@@ -1,33 +1,28 @@
 /**
- * NotificationPeek — hover-revealed snapshot of an inbox notification's
- * source window.
+ * NotificationPeek — hover an inbox row and the pane's recent output
+ * slides down from the top of the pane area, so "still spinning" vs
+ * "really done" is answerable without switching windows.
  *
- * Slides down from the top of the main pane area when the user hovers
- * an inbox row, showing the last visible text from that window's pane.
- * Dismisses on mouse-leave with a short grace period so quickly moving
- * between rows doesn't make it flicker.
+ * Source data is the pane's model mirror (`lib/session/screen`): the
+ * grid plus the last few history rows, paged in on demand. The peek
+ * re-renders on every screen change while open, so a live pane's
+ * output keeps moving under the cursor.
  *
- * Source data is the pane's byte stream (`lib/session/stream`) — the
- * same buffer the pane renders from, so the peek is essentially free
- * and always current.
- *
- * Click-to-merge: when the user clicks the inbox row, the active pane
- * synchronously switches to the notification's source window. The new
- * pane is already mounted (BlockPane keep-alive) sitting underneath
- * the peek. Instead of dismissing the peek instantly, we hold it
- * visible and animate scale 1→1.02 + opacity 1→0 over 380ms so the
- * peek visually dissolves to reveal the live pane. The user perceives
- * one continuous transition rather than peek snap → blank → pane.
+ * Two behaviours layered on the hover:
+ *   - a short grace period on mouse-leave so the pointer can cross
+ *     from the row into the panel;
+ *   - a "merge" animation when the row is clicked: the panel lifts and
+ *     blurs into the pane that's taking over, then the peek closes.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import { useStore } from '@lib/store'
-import * as stream from '@lib/session/stream'
-import { lastLines, linesToText, renderAnsi } from '@lib/session/ansi'
+import * as screen from '@lib/session/screen'
 
 const PEEK_CLOSE_GRACE_MS = 120
 const PEEK_MERGE_MS = 460
+const PEEK_ROWS = 60
 
 export function NotificationPeek() {
   const peekedId = useStore((s) => s.peekedInboxId)
@@ -56,50 +51,42 @@ export function NotificationPeek() {
 
   const notif = peekedId ? notifications.get(peekedId) : undefined
   const host = notif ? hosts.get(notif.host_id) : undefined
-  // Re-render as the pane's stream grows while the peek is open, and
-  // pull the pane's history if this is the first time we look at it.
-  const [tick, setTick] = useState(0)
-  const peekHost = notif?.host_id
-  const peekPane = notif?.pane_id
+
+  // Make sure the pane's grid and a few rows above it are known, then
+  // follow every change while the peek is open.
+  const peekHost = notif?.host_id ?? ''
+  const peekPane = notif?.pane_id ?? ''
   useEffect(() => {
     if (!peekHost || !peekPane) return
-    let cancelled = false
-    const unsub = stream.subscribeTail(peekHost, peekPane, () => setTick((t) => t + 1))
-    void stream.ensureHistory(peekHost, peekPane).then(() => {
-      if (!cancelled) setTick((t) => t + 1)
+    void screen.ensureScreen(peekHost, peekPane).then(() => {
+      const s = screen.getPaneScreen(peekHost, peekPane)
+      void screen.ensureHistory(peekHost, peekPane, s.topLine - PEEK_ROWS)
     })
-    return () => {
-      cancelled = true
-      unsub()
-    }
   }, [peekHost, peekPane])
+  const version = screen.useScreenVersion(peekHost, peekPane)
 
   const text = useMemo(() => {
     if (!peekHost || !peekPane) return ''
-    const end = stream.head(peekHost, peekPane)
-    const from = Math.max(stream.start(peekHost, peekPane), end - 8192)
-    const bytes = stream.slice(peekHost, peekPane, from, end)
-    if (!bytes || bytes.length === 0) return ''
-    return linesToText(lastLines(renderAnsi(new TextDecoder().decode(bytes)), 60))
+    return screen.tailText(screen.getPaneScreen(peekHost, peekPane), PEEK_ROWS)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [peekHost, peekPane, tick])
+  }, [peekHost, peekPane, version])
 
-  // Resolve a friendly "workspace · window" label from the live tree.
+  // Breadcrumb: "workspace · window" for the notification's window.
   let windowLabel = ''
   if (notif) {
     const hs = sessions.get(notif.host_id)
     if (hs && notif.window_id) {
       for (const ws of hs.workspaces.values()) {
         const win = ws.windows.get(notif.window_id)
-        if (win) { windowLabel = `${ws.name} · ${win.name}`; break }
+        if (win) {
+          windowLabel = `${ws.name} · ${win.name}`
+          break
+        }
       }
     }
   }
 
-  // True when the peeked notification's window is the user's currently
-  // active pane. Suppresses the peek render in the "you're already
-  // looking at it" case — the user gets no value from a snapshot of
-  // the same content.
+  // Don't peek at the window the user is already looking at.
   const activeMatchesPeek = useMemo(() => {
     if (!notif) return false
     if (activeHostId !== notif.host_id) return false
@@ -113,12 +100,6 @@ export function NotificationPeek() {
     return false
   }, [notif, activeHostId, sessions])
 
-  // Merge fires when InboxSection's onJump explicitly tags this
-  // notification as "the click that just happened was on a row
-  // whose peek was visible." We don't infer it from active-pane
-  // changes — that ambiguates "user clicked" from "user navigated
-  // away while still hovering" — so the click handler in InboxSection
-  // is the single source of truth for the merge intent.
   const merging = !!mergingInboxId && mergingInboxId === peekedId
 
   useEffect(() => {
@@ -130,30 +111,17 @@ export function NotificationPeek() {
     return () => window.clearTimeout(t)
   }, [merging, setMergingInboxId, setPeekedInboxId])
 
-  // Show the peek when there's a hovered notification, with two carve-
-  // outs: hide it when the user is already on that pane (nothing new
-  // to show), and force-show during the merge so the dissolve has
-  // something to dissolve.
   const visible = !!notif && (!activeMatchesPeek || merging)
 
   return (
     <AnimatePresence>
       {visible && notif && (
         <motion.div
-          // Keying on the notif id makes the peek crossfade between
-          // sources rather than re-mounting (no animation jank when the
-          // user moves from one row to the next).
           key={notif.id}
           initial={{ y: '-100%', opacity: 0, scale: 1, filter: 'blur(0px)' }}
           animate={
             merging
               ? {
-                  // The dissolve. A larger scale-up + a real upward
-                  // float + an 8px Gaussian blur give the panel a
-                  // sense of dissipating into the air, not just fading.
-                  // Combined with the opacity ramp, the eye reads it as
-                  // "this thing got absorbed into the world" rather
-                  // than "the layer turned off."
                   y: -12,
                   opacity: 0,
                   scale: 1.06,
@@ -165,11 +133,6 @@ export function NotificationPeek() {
           transition={
             merging
               ? {
-                  // Slightly longer than a "feedback" animation so the
-                  // dissolve has weight — the eye registers the
-                  // multi-property change over ~half a second. EaseOut
-                  // on the back end so the panel decelerates into
-                  // nothing, mirroring how a vapor trail fades.
                   duration: PEEK_MERGE_MS / 1000,
                   ease: [0.32, 0, 0.4, 1],
                 }
@@ -190,14 +153,9 @@ export function NotificationPeek() {
             <span className="opacity-50">·</span>
             <span>{windowLabel || notif.pane_id}</span>
           </div>
-          {/* The body uses flex-col-reverse so the pre is positioned
-              at the visual bottom of the available space. min-h-0
-              + flex-shrink lets the body shrink below the pre's
-              intrinsic height when the panel hits maxHeight, and
-              overflow-hidden then clips the pre from the top — so
-              the latest output (at the pre's bottom) stays visible.
-              When content fits, the body sizes to the pre and the
-              panel auto-sizes to content (no empty space). */}
+          {/* flex-col-reverse pins the pre to the visual bottom; when
+              the panel hits maxHeight the body clips from the top so
+              the latest output stays visible. */}
           <div className="flex min-h-0 flex-col-reverse overflow-hidden">
             <pre className="m-0 whitespace-pre px-4 py-3 font-mono text-[11px] leading-[1.55] text-text-secondary">
               {text || 'No output yet.'}

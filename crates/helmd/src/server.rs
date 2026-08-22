@@ -130,7 +130,7 @@ fn dispatch(
             tracing::info!("client {client_id} connected: {client_name}");
             let _ = tx.send(daemon.hello_ack(DAEMON_VERSION));
         }
-        ClientMsg::Attach { resume } => daemon.attach(client_id, &resume),
+        ClientMsg::Attach => daemon.attach(client_id),
         ClientMsg::Input { pane, bytes } => {
             if let Err(e) = daemon.input(pane, &bytes) {
                 err(None, "input", e);
@@ -141,7 +141,16 @@ fn dispatch(
                 err(None, "resize", e);
             }
         }
-        ClientMsg::Replay { pane, from } => daemon.replay(client_id, pane, from),
+        ClientMsg::Screen { req_id, pane } => {
+            if let Err(e) = daemon.screen(client_id, req_id, pane) {
+                err(Some(req_id), "screen", e);
+            }
+        }
+        ClientMsg::History { req_id, pane, from_line, to_line } => {
+            if let Err(e) = daemon.history(client_id, req_id, pane, from_line, to_line) {
+                err(Some(req_id), "history", e);
+            }
+        }
         ClientMsg::NewWorkspace { req_id, name } => match daemon.new_workspace(name) {
             Ok((workspace, window, pane)) => {
                 let _ = tx.send(DaemonMsg::Created {

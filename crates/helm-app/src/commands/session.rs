@@ -5,14 +5,16 @@
 //! event channel; these commands are the control plane.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use helm_domain::{BlockInfo, HostId, SearchHit, SessionTree};
-use helm_proto::{DaemonMsg, PaneId, ReplayFrom, SearchScope, WindowId, WorkspaceId};
+use helm_domain::{BlockInfo, HistoryPage, HostId, ScreenInfo, SearchHit, SessionTree};
+use helm_proto::{DaemonMsg, PaneId, SearchScope, WindowId, WorkspaceId};
 use serde::Serialize;
 use specta::Type;
 use tauri::State;
 
 use crate::commands::session_for;
-use crate::connection::{to_domain_block, to_domain_hits, to_domain_tree};
+use crate::connection::{
+    to_domain_block, to_domain_hits, to_domain_row, to_domain_screen, to_domain_tree,
+};
 use crate::state::AppState;
 
 /// Current tree for a host, from the cached snapshot. The frontend
@@ -61,29 +63,52 @@ pub async fn session_resize(
         .map_err(|e| e.to_string())
 }
 
-/// Ask for scrollback. Exactly one of `from_seq` / `last_bytes`; the
-/// bytes arrive as `SessionEvent::Output` frames followed by
-/// `SessionEvent::ReplayDone`.
+/// The pane's current grid, for the first paint of a pane the frontend
+/// shows (later changes stream as `SessionEvent::Screen` /
+/// `SessionEvent::ScreenDiff`).
 #[tauri::command]
 #[specta::specta]
-pub async fn session_replay(
+pub async fn session_screen(
     state: State<'_, AppState>,
     host_id: HostId,
     pane_id: String,
-    from_seq: Option<u64>,
-    last_bytes: Option<u64>,
-) -> Result<(), String> {
+) -> Result<ScreenInfo, String> {
     let session = session_for(&state, host_id).await?;
-    tracing::debug!(%pane_id, ?from_seq, ?last_bytes, "session_replay");
-    let from = match (from_seq, last_bytes) {
-        (Some(seq), _) => ReplayFrom::Seq(seq),
-        (None, Some(n)) => ReplayFrom::LastBytes(n),
-        (None, None) => ReplayFrom::LastBytes(256 * 1024),
-    };
-    session
-        .client
-        .replay(pane_id.parse::<PaneId>()?, from)
-        .map_err(|e| e.to_string())
+    tracing::debug!(%pane_id, "session_screen");
+    let pane = pane_id.parse::<PaneId>()?;
+    match session.request(|id| session.client.screen(id, pane)).await? {
+        DaemonMsg::Screen { screen, .. } => Ok(to_domain_screen(screen)),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+/// History rows in `[from_line, to_line)`, clamped to what the daemon
+/// retains and to one page counted back from `to_line` — the frontend
+/// pages upward from the grid's top as the user scrolls.
+#[tauri::command]
+#[specta::specta]
+pub async fn session_history(
+    state: State<'_, AppState>,
+    host_id: HostId,
+    pane_id: String,
+    from_line: u64,
+    to_line: u64,
+) -> Result<HistoryPage, String> {
+    let session = session_for(&state, host_id).await?;
+    tracing::debug!(%pane_id, from_line, to_line, "session_history");
+    let pane = pane_id.parse::<PaneId>()?;
+    match session
+        .request(|id| session.client.history(id, pane, from_line, to_line))
+        .await?
+    {
+        DaemonMsg::History { from_line, rows, history_start, top_line, .. } => Ok(HistoryPage {
+            from_line,
+            rows: rows.into_iter().map(to_domain_row).collect(),
+            history_start,
+            top_line,
+        }),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
 }
 
 /// Ids returned by the creating commands.

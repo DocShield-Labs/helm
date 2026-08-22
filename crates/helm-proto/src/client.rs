@@ -19,7 +19,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     encode_frame, ClientMsg, DaemonMsg, FrameDecoder, Notification, NotificationId, PaneId,
-    ProtoError, ReplayFrom, SearchScope, TreeSnapshot, WindowId, WorkspaceId, PROTOCOL_VERSION,
+    ProtoError, SearchScope, TreeSnapshot, WindowId, WorkspaceId, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -203,8 +203,8 @@ impl HelmdClient {
         self.tx.send(msg).map_err(|_| ClientError::Closed)
     }
 
-    pub fn attach(&self, resume: Vec<(PaneId, u64)>) -> Result<(), ClientError> {
-        self.send(ClientMsg::Attach { resume })
+    pub fn attach(&self) -> Result<(), ClientError> {
+        self.send(ClientMsg::Attach)
     }
     pub fn input(&self, pane: PaneId, bytes: Vec<u8>) -> Result<(), ClientError> {
         self.send(ClientMsg::Input { pane, bytes })
@@ -212,8 +212,17 @@ impl HelmdClient {
     pub fn resize(&self, pane: PaneId, cols: u16, rows: u16) -> Result<(), ClientError> {
         self.send(ClientMsg::Resize { pane, cols, rows })
     }
-    pub fn replay(&self, pane: PaneId, from: ReplayFrom) -> Result<(), ClientError> {
-        self.send(ClientMsg::Replay { pane, from })
+    pub fn screen(&self, req_id: u64, pane: PaneId) -> Result<(), ClientError> {
+        self.send(ClientMsg::Screen { req_id, pane })
+    }
+    pub fn history(
+        &self,
+        req_id: u64,
+        pane: PaneId,
+        from_line: u64,
+        to_line: u64,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::History { req_id, pane, from_line, to_line })
     }
     pub fn new_workspace(&self, req_id: u64, name: Option<String>) -> Result<(), ClientError> {
         self.send(ClientMsg::NewWorkspace { req_id, name })

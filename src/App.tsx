@@ -31,7 +31,7 @@ import {
   setThemeForAllTerminals,
 } from '@lib/terminal'
 import { BlockPane } from '@features/shell/BlockPane'
-import { sendInput } from '@lib/session/stream'
+import { sendInput } from '@lib/session/screen'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
 import { HostKeyPromptModal } from '@features/host-key/HostKeyPromptModal'
 import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSuggestionHost'

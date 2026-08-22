@@ -1,8 +1,8 @@
 /**
  * The composer — Helm's input. Warp's universal input, in our palette:
- * a bordered box above the bottom edge with context chips, a growing
- * mono editor, and a Terminal | Agent control that says where ⏎ sends
- * the text.
+ * a bordered box above the bottom edge with one row of context — the
+ * Terminal | Agent control that says where ⏎ sends the text, then the
+ * cwd and branch chips — over a growing mono editor.
  *
  *   Terminal  → the shell (`cmd⏎`; multi-line as a bracketed paste)
  *   Agent     → the agent running in this pane, or — from a shell —
@@ -79,15 +79,22 @@ export function Composer({
     taRef.current?.focus()
   }, [focusKey])
 
-  // Grow with content up to MAX_ROWS, then scroll.
+  // Grow with content up to MAX_ROWS, then scroll. Measuring means
+  // collapsing the textarea to read its scrollHeight; the box is held
+  // at its current height meanwhile, or the pane above would grow for
+  // a layout pass and WebKit would clamp a bottom-pinned scroll
+  // position off the bottom.
   useLayoutEffect(() => {
     const ta = taRef.current
-    if (!ta) return
+    const box = ta?.parentElement
+    if (!ta || !box) return
+    box.style.height = `${box.offsetHeight}px`
     ta.style.height = '0px'
     const line = 20
     const max = line * MAX_ROWS
     ta.style.height = `${Math.min(max, Math.max(line, ta.scrollHeight))}px`
     ta.style.overflowY = ta.scrollHeight > max ? 'auto' : 'hidden'
+    box.style.height = ''
   }, [text])
 
   const send = () => {
@@ -159,13 +166,6 @@ export function Composer({
         : `Start ${agentName} with a prompt…`
       : 'Type a command…'
 
-  const hints =
-    mode === 'agent'
-      ? kind === 'agent'
-        ? '⏎ send · ⇧⏎ newline · ↑↓⇥ reach the TUI when empty'
-        : '⏎ send · ⇧⏎ newline'
-      : '⏎ run · ⇧⏎ newline · ↑ history'
-
   return (
     <div
       className={`helm-composer ${focused ? 'helm-composer-focused' : ''}`}
@@ -177,22 +177,21 @@ export function Composer({
         }
       }}
     >
-      {(cwd || branch) && (
-        <div className="flex items-center gap-1.5 px-3 pt-2.5">
-          {cwd && (
-            <Chip title={cwd}>
-              <FolderIcon size={12} />
-              {homeRelative(cwd)}
-            </Chip>
-          )}
-          {branch && (
-            <Chip>
-              <BranchIcon size={12} />
-              {branch}
-            </Chip>
-          )}
-        </div>
-      )}
+      <div className="flex items-center gap-1.5 px-2 pt-2">
+        <Segmented value={mode} onChange={onModeChange} />
+        {cwd && (
+          <Chip title={cwd}>
+            <FolderIcon size={12} />
+            {homeRelative(cwd)}
+          </Chip>
+        )}
+        {branch && (
+          <Chip>
+            <BranchIcon size={12} />
+            {branch}
+          </Chip>
+        )}
+      </div>
       <textarea
         ref={taRef}
         value={text}
@@ -210,11 +209,6 @@ export function Composer({
         onBlur={() => setFocused(false)}
         className="helm-composer-editor"
       />
-      <div className="flex items-center gap-3 px-2 pb-2 pt-1">
-        <Segmented value={mode} onChange={onModeChange} />
-        <span className="flex-1" />
-        <span className="select-none font-mono text-[11px] text-text-disabled">{hints}</span>
-      </div>
     </div>
   )
 }

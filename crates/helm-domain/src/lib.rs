@@ -92,11 +92,74 @@ pub struct PaneInfo {
     pub branch: Option<String>,
     /// argv[0] basename of what was spawned, when not the default shell.
     pub command: Option<String>,
-    /// Next byte offset the pane will produce. The frontend records the
-    /// last seq it has applied per pane and resumes from there.
-    pub head_seq: u64,
-    /// Oldest byte still in the daemon's ring buffer.
-    pub buffer_start_seq: u64,
+}
+
+// ---------- terminal rows (the daemon's model, mirrored) ----------
+//
+// Colors are packed into one number to keep history pages small on the
+// JSON boundary: -1 = default, 0..=255 = indexed, >= 1<<24 = truecolor
+// with `(1<<24) | (r<<16) | (g<<8) | b`.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct SpanInfo {
+    pub text: String,
+    pub fg: i32,
+    pub bg: i32,
+    /// `helm_proto::attrs` bits.
+    pub attrs: u16,
+    pub link: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct RowInfo {
+    pub spans: Vec<SpanInfo>,
+    /// Soft-wrapped: the next row continues this logical line.
+    pub wrapped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Beam,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct CursorInfo {
+    pub row: u16,
+    pub col: u16,
+    pub visible: bool,
+    pub shape: CursorShape,
+    pub blink: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct ScreenInfo {
+    pub cols: u16,
+    pub rows: u16,
+    pub top_line: u64,
+    /// Oldest history line the daemon still holds.
+    pub history_start: u64,
+    pub lines: Vec<RowInfo>,
+    pub cursor: CursorInfo,
+    /// `helm_proto::modes` bits.
+    pub modes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct RowAt {
+    pub index: u16,
+    pub row: RowInfo,
+}
+
+/// Reply to `session_history`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct HistoryPage {
+    pub from_line: u64,
+    pub rows: Vec<RowInfo>,
+    pub history_start: u64,
+    pub top_line: u64,
 }
 
 /// One command block, segmented daemon-side from OSC 133 markers. The
@@ -104,12 +167,12 @@ pub struct PaneInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct BlockInfo {
     pub id: String,
-    /// Byte offsets into the pane stream (prompt start / command
+    /// Absolute lines in the pane's line space (prompt start / command
     /// accepted / output begins / finished).
-    pub start_seq: u64,
-    pub cmd_seq: Option<u64>,
-    pub output_seq: Option<u64>,
-    pub end_seq: Option<u64>,
+    pub start_line: u64,
+    pub cmd_line: Option<u64>,
+    pub output_line: Option<u64>,
+    pub end_line: Option<u64>,
     pub cmdline: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
@@ -123,9 +186,9 @@ pub struct BlockInfo {
 pub struct SearchHit {
     pub pane_id: String,
     pub block_id: Option<String>,
-    /// Seq of the first byte of the matched line.
-    pub line_seq: u64,
-    /// The matched line, ANSI-stripped.
+    /// Absolute line of the matched row.
+    pub line: u64,
+    /// The matched row's text.
     pub line_text: String,
     pub match_start: u32,
     pub match_end: u32,
@@ -135,16 +198,27 @@ pub struct SearchHit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
-    /// Pane bytes (live tail or replay). `seq` is the absolute offset
-    /// of the first byte; `data` is base64 — one string field instead
-    /// of a JSON `number[]`, which was a 3-4× wire bloat.
-    Output {
+    /// The pane's whole grid — on request, resize, alt-screen swap, or
+    /// any change the model reports as full damage. Paint it all.
+    Screen { pane_id: String, screen: ScreenInfo },
+    /// Rows that changed since the last screen message, plus cursor
+    /// and modes as of now. The grid first scrolled up by `scroll` rows
+    /// (delivered as `HistoryAppend`); row indices are post-scroll.
+    ScreenDiff {
         pane_id: String,
-        seq: u64,
-        data: String,
+        top_line: u64,
+        scroll: u16,
+        rows: Vec<RowAt>,
+        cursor: CursorInfo,
+        modes: u32,
     },
-    /// End of a replay burst; the pane is live from `at_seq`.
-    ReplayDone { pane_id: String, at_seq: u64 },
+    /// Rows that scrolled out of the grid: `first_line` is the absolute
+    /// line of `rows[0]`; the grid's top is now `first_line + rows.len()`.
+    HistoryAppend {
+        pane_id: String,
+        first_line: u64,
+        rows: Vec<RowInfo>,
+    },
     /// A block started / gained its command / finished.
     Block { pane_id: String, block: BlockInfo },
     /// The pane entered or left the alternate screen (TUI mode). The

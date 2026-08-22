@@ -24,3 +24,4 @@ tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 dirs = { workspace = true }
 libc = { workspace = true }
+alacritty_terminal = { version = "0.26", default-features = false }

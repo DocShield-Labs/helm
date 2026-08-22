@@ -1,95 +1,43 @@
 /**
- * One finished command block, rendered as plain DOM from the pane's
- * byte stream. Warp's block: a quiet prompt row (`cwd on branch`, the
- * duration right-aligned), the command line, the output; failed
- * commands washed red; a hover belt (copy command / copy output) at
- * the top-right. No edge borders — hairlines live in the list.
+ * One finished command block at Warp's geometry: a prompt row (cwd on
+ * branch, duration right-aligned), the command line, then the output —
+ * the rows in `[lo, hi)`, decided by `BlockList` (rows the grid is
+ * showing are left to it; rows above the loaded history wait for their
+ * page). Failed commands washed red; a hover belt (copy command / copy
+ * output) at the top right.
  */
 
-import { memo, useMemo, type CSSProperties } from 'react'
+import { memo, type CSSProperties } from 'react'
 import type { BlockInfo, HostId } from '@bindings'
-import { commands } from '@lib/ipc'
-import * as stream from '@lib/session/stream'
-import { bodyStartSeq } from '@lib/session/blocks'
-import { linesToText, renderAnsi, type Line, type Style } from '@lib/session/ansi'
+import { formatDuration } from '@lib/format'
 import { homeRelative } from '@lib/path'
+import { getPaneScreen, rowsBetween } from '@lib/session/screen'
 import { CopyIcon, TerminalIcon } from '@features/sessions/icons'
-
-const decoder = new TextDecoder()
+import { RowsView, rowsToText } from './Rows'
 
 interface BlockProps {
   hostId: HostId
   paneId: string
   block: BlockInfo
+  /** Rows to render, `[lo, hi)`. */
+  lo: number
+  hi: number
 }
 
-export const Block = memo(function Block({ hostId, paneId, block }: BlockProps) {
-  const bodyStart = bodyStartSeq(block)
-  const end = block.end_seq ?? bodyStart
-  const lines = useMemo<Line[] | null>(() => {
-    const bytes = stream.slice(hostId, paneId, bodyStart, end)
-    if (!bytes) return null
-    if (bytes.length === 0) return []
-    return renderAnsi(decoder.decode(bytes))
-    // Finished blocks are immutable: key on identity + span.
-  }, [hostId, paneId, block.id, bodyStart, end])
-
+export const Block = memo(function Block({ hostId, paneId, block, lo, hi }: BlockProps) {
   const failed = block.exit_code !== null && block.exit_code !== 0
-  const duration = formatDuration(block)
-  const cwd = homeRelative(block.cwd)
+  const copyOutput = () =>
+    void navigator.clipboard.writeText(rowsToText(rowsBetween(getPaneScreen(hostId, paneId), lo, hi)))
 
   return (
     <div
       data-block-id={block.id}
       className={`helm-block group relative ${failed ? 'helm-block-failed' : ''}`}
     >
-      <div className="helm-block-header sticky top-0 z-10">
-        <div className="helm-prompt-row">
-          <span className="min-w-0 truncate">
-            {cwd && <span>{cwd}</span>}
-            {block.branch && (
-              <>
-                <span className="text-text-disabled"> on </span>
-                <span>{block.branch}</span>
-              </>
-            )}
-          </span>
-          <span className="flex-1" />
-          <span
-            className={`shrink-0 select-none group-hover:invisible ${
-              failed ? 'text-[var(--terminal-failed)]' : ''
-            }`}
-          >
-            {failed ? `exit ${block.exit_code}${duration ? ` · ${duration}` : ''}` : duration}
-          </span>
-        </div>
-        <div className="helm-cmd-row">{block.cmdline ?? ''}</div>
-        <div className="helm-belt opacity-0 transition-opacity group-hover:opacity-100">
-          <BeltButton
-            title="Copy command"
-            onClick={() => void navigator.clipboard.writeText(block.cmdline ?? '')}
-          >
-            <TerminalIcon size={14} />
-          </BeltButton>
-          <BeltButton
-            title="Copy output"
-            onClick={() => void navigator.clipboard.writeText(lines ? linesToText(lines) : '')}
-          >
-            <CopyIcon size={14} />
-          </BeltButton>
-        </div>
-      </div>
-      {lines === null ? (
-        <div className="px-4 pb-4 font-mono text-[11px] text-text-disabled">
-          output no longer in buffer
-        </div>
-      ) : lines.length > 0 ? (
+      <BlockHeader block={block} copyOutput={copyOutput} />
+      {hi > lo ? (
         <pre className="helm-block-output">
-          {lines.map((line, i) => (
-            <div key={i} className="helm-line">
-              {line.length === 0 ? ' ' : line.map((span, j) => <SpanView key={j} text={span.text} style={span.style} />)}
-            </div>
-          ))}
+          <RowsView hostId={hostId} paneId={paneId} from={lo} to={hi} />
         </pre>
       ) : (
         <div className="h-4" />
@@ -98,46 +46,51 @@ export const Block = memo(function Block({ hostId, paneId, block }: BlockProps) 
   )
 })
 
-function SpanView({ text, style }: { text: string; style: Style }) {
-  const css = spanStyle(style)
-  if (style.href) {
-    const href = style.href
-    return (
-      <a
-        href={href}
-        style={{ ...css, textDecoration: 'underline' }}
-        onClick={(e) => {
-          e.preventDefault()
-          void commands.openUrl(href)
-        }}
-      >
-        {text}
-      </a>
-    )
-  }
-  return <span style={css}>{text}</span>
-}
-
-function spanStyle(s: Style): CSSProperties | undefined {
-  let fg = s.fg
-  let bg = s.bg
-  if (s.inverse) {
-    const t = fg
-    fg = bg ?? 'var(--terminal-bg)'
-    bg = t ?? 'var(--terminal-fg)'
-  }
-  const css: CSSProperties = {}
-  if (fg) css.color = fg
-  if (bg) css.backgroundColor = bg
-  if (s.bold) css.fontWeight = 600
-  if (s.dim) css.opacity = 0.6
-  if (s.italic) css.fontStyle = 'italic'
-  if (s.underline || s.strike) {
-    css.textDecoration = [s.underline ? 'underline' : '', s.strike ? 'line-through' : '']
-      .filter(Boolean)
-      .join(' ')
-  }
-  return Object.keys(css).length ? css : undefined
+/** The prompt row, the command line and the hover belt — shared by
+ * finished blocks and the running one (which has no exit or duration
+ * yet). Sticky so the command stays in view while its output scrolls. */
+export function BlockHeader({ block, copyOutput }: { block: BlockInfo; copyOutput: () => void }) {
+  const failed = block.exit_code !== null && block.exit_code !== 0
+  const duration =
+    block.started_at_ms !== null && block.finished_at_ms !== null
+      ? formatDuration(block.finished_at_ms - block.started_at_ms)
+      : ''
+  const cwd = homeRelative(block.cwd)
+  return (
+    <div className="helm-block-header sticky top-0 z-10">
+      <div className="helm-prompt-row">
+        <span className="min-w-0 truncate">
+          {cwd && <span>{cwd}</span>}
+          {block.branch && (
+            <>
+              <span className="text-text-disabled"> on </span>
+              <span>{block.branch}</span>
+            </>
+          )}
+        </span>
+        <span className="flex-1" />
+        <span
+          className={`shrink-0 select-none group-hover:invisible ${
+            failed ? 'text-[var(--terminal-failed)]' : ''
+          }`}
+        >
+          {failed ? `exit ${block.exit_code}${duration ? ` · ${duration}` : ''}` : duration}
+        </span>
+      </div>
+      <div className="helm-cmd-row">{block.cmdline ?? ''}</div>
+      <div className="helm-belt opacity-0 transition-opacity group-hover:opacity-100">
+        <BeltButton
+          title="Copy command"
+          onClick={() => void navigator.clipboard.writeText(block.cmdline ?? '')}
+        >
+          <TerminalIcon size={14} />
+        </BeltButton>
+        <BeltButton title="Copy output" onClick={copyOutput}>
+          <CopyIcon size={14} />
+        </BeltButton>
+      </div>
+    </div>
+  )
 }
 
 function BeltButton({
@@ -154,19 +107,10 @@ function BeltButton({
       type="button"
       title={title}
       onClick={onClick}
-      className="flex h-6 w-6 items-center justify-center rounded text-text-tertiary hover:bg-[var(--stroke-default)] hover:text-text-primary"
+      className="flex h-6 w-6 items-center justify-center rounded-[4px] text-text-tertiary hover:bg-white/[0.06] hover:text-text-primary"
+      style={{ cursor: 'pointer' } satisfies CSSProperties}
     >
       {children}
     </button>
   )
-}
-
-export function formatDuration(b: BlockInfo): string {
-  if (b.started_at_ms === null || b.finished_at_ms === null) return ''
-  const ms = Math.max(0, b.finished_at_ms - b.started_at_ms)
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-  const m = Math.floor(ms / 60_000)
-  const s = Math.round((ms % 60_000) / 1000)
-  return `${m}m ${s.toString().padStart(2, '0')}s`
 }

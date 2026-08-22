@@ -16,7 +16,7 @@ import { Channel } from '@tauri-apps/api/core'
 import { commands } from '@lib/ipc'
 import { useStore } from '@lib/store'
 import { treeToWorkspaces } from '@lib/session/tree'
-import * as stream from '@lib/session/stream'
+import * as screen from '@lib/session/screen'
 import * as blocks from '@lib/session/blocks'
 import type { HostEvent, HostId, SessionEvent } from '@bindings'
 
@@ -61,20 +61,20 @@ export async function subscribeHostEvents(): Promise<void> {
         if (evt.status === 'disconnected' && prev === 'connected') {
           store.setWorkspaces(evt.host_id, [])
           store.clearRunningForHost(evt.host_id)
-          stream.dropHost(evt.host_id)
+          screen.dropHost(evt.host_id)
           blocks.dropHost(evt.host_id)
         }
         // Reconnecting: keep the tree. helmd persists across transport
         // drops (and auto-respawns on localhost); the next Tree event
-        // reconciles whatever changed, and panes resume from their
-        // last seq — the whole point of seq-addressed output.
+        // reconciles whatever changed, and each pane repaints from the
+        // daemon's model when it's next shown.
         return
       }
       case 'host_added':
         useStore.getState().addHost(evt.host)
         return
       case 'host_removed':
-        stream.dropHost(evt.host_id)
+        screen.dropHost(evt.host_id)
         blocks.dropHost(evt.host_id)
         useStore.getState().removeHost(evt.host_id)
         return
@@ -125,18 +125,21 @@ export async function subscribeHostEvents(): Promise<void> {
 function handleSessionEvent(hostId: HostId, ev: SessionEvent): void {
   const store = useStore.getState()
   switch (ev.kind) {
-    case 'output':
-      stream.applyOutput(hostId, ev.pane_id, ev.seq, ev.data)
+    case 'screen':
+      screen.applyScreen(hostId, ev.pane_id, ev.screen)
       return
-    case 'replay_done':
-      stream.onReplayDone(hostId, ev.pane_id)
+    case 'screen_diff':
+      screen.applyDiff(hostId, ev.pane_id, ev.top_line, ev.scroll, ev.rows, ev.cursor, ev.modes)
+      return
+    case 'history_append':
+      screen.applyHistoryAppend(hostId, ev.pane_id, ev.first_line, ev.rows)
       return
     case 'block': {
       const b = ev.block
       blocks.upsertBlock(hostId, ev.pane_id, b)
       if (blocks.isRunning(b)) {
         store.markPaneRunning(hostId, ev.pane_id, b.cmdline)
-      } else if (b.end_seq !== null) {
+      } else if (b.end_line !== null) {
         store.markPaneIdle(hostId, ev.pane_id)
       }
       if (b.cwd !== null) {

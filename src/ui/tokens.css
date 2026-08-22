@@ -27,6 +27,9 @@
   --terminal-success: #3DBA7E;
   --terminal-warning: #E8B04B;
   --terminal-claude:  #D97757;
+  /* One row of terminal output rendered as DOM (Rows.tsx sizes chunks
+     from it, so a change here is a change everywhere). */
+  --helm-line-px: 20px;
 
   /* ---------- Text (universal — opacity tiers on the theme fg) ---------- */
   --text-primary:   var(--terminal-fg);

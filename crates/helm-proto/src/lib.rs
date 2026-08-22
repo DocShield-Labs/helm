@@ -6,6 +6,13 @@
 //! tmux control-mode protocol this replaces, the stream is binary-safe
 //! end to end: no line orientation, no octal escaping, and decoding is
 //! stateful across arbitrarily-split reads (see `FrameDecoder`).
+//!
+//! Since v4 the daemon owns the terminal model: clients never see raw
+//! PTY bytes. A pane is a grid (`Screen`, updated by `ScreenDiff`) plus
+//! a line history of rows that scrolled off the top (`HistoryAppend`,
+//! paged with `History`). Positions are absolute line numbers that are
+//! monotonic for the pane's lifetime — blocks, search hits and history
+//! pages all address the same line space.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -15,12 +22,15 @@ pub mod client;
 /// Bump on any breaking change to the message types. The daemon refuses
 /// mismatched clients in `HelloAck` and the app responds by re-installing
 /// the daemon binary it shipped with.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
-/// Upper bound on a single frame. Output frames are batched well below
-/// this (64 KB flushes); the cap exists so a corrupt length prefix fails
-/// fast instead of allocating gigabytes.
+/// Upper bound on a single frame. History pages are capped well below
+/// this; the cap exists so a corrupt length prefix fails fast instead
+/// of allocating gigabytes.
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+
+/// Most rows one `History` reply carries. Clients page.
+pub const MAX_HISTORY_PAGE: u64 = 4000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
@@ -67,6 +77,121 @@ id_newtype!(BlockId);
 id_newtype!(NotificationId);
 
 // ---------------------------------------------------------------------------
+// Terminal model
+// ---------------------------------------------------------------------------
+
+/// A cell color. Indexed covers the 16 ANSI + 256-color cube; the
+/// client maps `Default` and indices through its theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum Color {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// SGR attribute bits carried by `Style::attrs`.
+pub mod attrs {
+    pub const BOLD: u16 = 1 << 0;
+    pub const DIM: u16 = 1 << 1;
+    pub const ITALIC: u16 = 1 << 2;
+    pub const UNDERLINE: u16 = 1 << 3;
+    pub const INVERSE: u16 = 1 << 4;
+    pub const STRIKE: u16 = 1 << 5;
+    pub const HIDDEN: u16 = 1 << 6;
+    pub const DOUBLE_UNDERLINE: u16 = 1 << 7;
+    pub const UNDERCURL: u16 = 1 << 8;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct Style {
+    pub fg: Color,
+    pub bg: Color,
+    pub attrs: u16,
+    /// OSC 8 hyperlink target, when the run is a link.
+    pub link: Option<String>,
+}
+
+/// A run of cells sharing one style. Wide characters appear once (their
+/// spacer cell is dropped); zero-width combining characters follow the
+/// cell they attach to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+}
+
+/// One terminal row. Trailing default-style blanks are trimmed, so an
+/// empty row has no spans.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct Row {
+    pub spans: Vec<Span>,
+    /// The row was soft-wrapped: the next row continues the same
+    /// logical line. Lets a client reflow history at its own width.
+    pub wrapped: bool,
+}
+
+impl Row {
+    /// Plain text of the row (search, previews).
+    pub fn text(&self) -> String {
+        let mut s = String::with_capacity(self.spans.iter().map(|sp| sp.text.len()).sum());
+        for sp in &self.spans {
+            s.push_str(&sp.text);
+        }
+        s
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Beam,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub row: u16,
+    pub col: u16,
+    pub visible: bool,
+    pub shape: CursorShape,
+    pub blink: bool,
+}
+
+/// DEC private modes a painting client must mirror so its input
+/// encoding (arrow keys, mouse reports, paste wrapping, focus events)
+/// matches what the application asked for.
+pub mod modes {
+    pub const APP_CURSOR: u32 = 1 << 0;
+    pub const APP_KEYPAD: u32 = 1 << 1;
+    pub const BRACKETED_PASTE: u32 = 1 << 2;
+    pub const FOCUS_IN_OUT: u32 = 1 << 3;
+    pub const MOUSE_CLICK: u32 = 1 << 4;
+    pub const MOUSE_DRAG: u32 = 1 << 5;
+    pub const MOUSE_MOTION: u32 = 1 << 6;
+    pub const SGR_MOUSE: u32 = 1 << 7;
+    pub const UTF8_MOUSE: u32 = 1 << 8;
+    pub const ALT_SCREEN: u32 = 1 << 9;
+    pub const ALTERNATE_SCROLL: u32 = 1 << 10;
+}
+
+/// Full grid snapshot — what a client paints on attach, resize, or any
+/// change alacritty reports as full damage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Screen {
+    pub cols: u16,
+    pub rows: u16,
+    /// Absolute line number of grid row 0.
+    pub top_line: u64,
+    /// Oldest history line the daemon still holds.
+    pub history_start: u64,
+    /// Exactly `rows` entries.
+    pub lines: Vec<Row>,
+    pub cursor: Cursor,
+    pub modes: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Client → daemon
 // ---------------------------------------------------------------------------
 
@@ -79,19 +204,22 @@ pub enum ClientMsg {
         /// Human-readable client identity for daemon logs ("helm-app 0.1.1").
         client_name: String,
     },
-    /// Subscribe to live output. `resume` carries the last seq the client
-    /// has per pane; the daemon replays everything after each point before
-    /// switching that pane to live tail — the reattach path, exact by
-    /// construction.
-    Attach { resume: Vec<(PaneId, u64)> },
+    /// Subscribe to live broadcasts (screen diffs, history, blocks,
+    /// tree changes, notifications). Pane contents are pulled with
+    /// `Screen` / `History` as panes are shown.
+    Attach,
     /// Keystrokes / pasted bytes for a pane's PTY. Raw bytes — no
     /// encoding, no hex, no send-keys quoting hazards.
     Input { pane: PaneId, bytes: Vec<u8> },
     /// The focused client owns the size. Last writer wins; no unions.
     Resize { pane: PaneId, cols: u16, rows: u16 },
-    /// Request scrollback. Answered with `Output` frames (historical
-    /// bytes, correctly seq-stamped) followed by `ReplayDone`.
-    Replay { pane: PaneId, from: ReplayFrom },
+    /// The pane's current grid. Answered with `Screen` carrying `req_id`.
+    Screen { req_id: u64, pane: PaneId },
+    /// History rows in `[from_line, to_line)`, clamped to what the
+    /// daemon retains and to `MAX_HISTORY_PAGE` (from the end, so a
+    /// client paging backwards gets the newest rows first). Answered
+    /// with `History` carrying `req_id`.
+    History { req_id: u64, pane: PaneId, from_line: u64, to_line: u64 },
     /// Create a workspace. Also spawns an initial window (default
     /// shell) so a fresh workspace is immediately usable — the tmux
     /// "session always has a window" semantic. Answered with `Created`
@@ -110,8 +238,8 @@ pub enum ClientMsg {
     KillWorkspace { workspace: WorkspaceId },
     RenameWorkspace { workspace: WorkspaceId, name: String },
     RenameWindow { window: WindowId, name: String },
-    /// Server-side scrollback search over the ANSI-stripped line index.
-    /// Answered with `SearchResults` carrying `req_id`.
+    /// Server-side search over history + grid rows (plain text of each
+    /// row). Answered with `SearchResults` carrying `req_id`.
     Search {
         req_id: u64,
         query: String,
@@ -130,14 +258,6 @@ pub enum ClientMsg {
     AckNotifications { up_to: NotificationId },
     /// Orderly daemon shutdown (dev tooling; the app never sends this).
     Shutdown,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum ReplayFrom {
-    /// Everything at and after this absolute byte offset.
-    Seq(u64),
-    /// The most recent N bytes (first paint of a pane we've never seen).
-    LastBytes(u64),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -162,13 +282,38 @@ pub enum DaemonMsg {
         /// strictly more information than tmux's one-bit bell flag.
         pending: Vec<Notification>,
     },
-    /// Live or replayed pane bytes. `seq` is the absolute offset of
-    /// `bytes[0]` since pane creation; contiguity is checkable by the
-    /// client (`seq + bytes.len()` == next frame's `seq`). Batched by
-    /// the daemon (5 ms / 64 KB flush) — never per-line.
-    Output { pane: PaneId, seq: u64, bytes: Vec<u8> },
-    /// End of a `Replay` response; the pane is live-tailing from `at_seq`.
-    ReplayDone { pane: PaneId, at_seq: u64 },
+    /// Full grid. `req_id` is set when answering `ClientMsg::Screen`;
+    /// `None` for broadcasts (resize, alt-screen swap, clear — anything
+    /// the model reports as full damage).
+    Screen { req_id: Option<u64>, pane: PaneId, screen: Screen },
+    /// Rows that changed since the last `Screen` / `ScreenDiff`, with
+    /// the cursor and modes as of now. Coalesced per pane at ≤ 60 Hz.
+    /// `scroll` rows left the top of the grid first (they arrived as
+    /// `HistoryAppend`): shift the grid up by that much, then apply
+    /// `rows`, whose indices are post-shift.
+    ScreenDiff {
+        pane: PaneId,
+        top_line: u64,
+        scroll: u16,
+        rows: Vec<(u16, Row)>,
+        cursor: Cursor,
+        modes: u32,
+    },
+    /// Rows that scrolled out of the primary grid since the last flush;
+    /// `first_line` is the absolute line of `rows[0]` and the new
+    /// `top_line` is `first_line + rows.len()`.
+    HistoryAppend { pane: PaneId, first_line: u64, rows: Vec<Row> },
+    /// Reply to `History`. `from_line` is the absolute line of `rows[0]`
+    /// (may be later than asked when clamped); `history_start` is the
+    /// oldest line the daemon still holds; `top_line` is the grid top.
+    History {
+        req_id: u64,
+        pane: PaneId,
+        from_line: u64,
+        rows: Vec<Row>,
+        history_start: u64,
+        top_line: u64,
+    },
     /// OSC 133 segmentation, parsed statefully at ingest. Sent on block
     /// start (prompt), on command capture, and on finish (exit code).
     Block { pane: PaneId, block: BlockMeta },
@@ -208,8 +353,9 @@ impl DaemonMsg {
             DaemonMsg::Created { req_id, .. }
             | DaemonMsg::SearchResults { req_id, .. }
             | DaemonMsg::Blocks { req_id, .. }
+            | DaemonMsg::History { req_id, .. }
             | DaemonMsg::Pong { req_id } => Some(*req_id),
-            DaemonMsg::Error { req_id, .. } => *req_id,
+            DaemonMsg::Screen { req_id, .. } | DaemonMsg::Error { req_id, .. } => *req_id,
             _ => None,
         }
     }
@@ -244,23 +390,19 @@ pub struct PaneInfo {
     pub branch: Option<String>,
     /// Foreground command name if known ("claude", "cargo", …).
     pub command: Option<String>,
-    /// Next byte offset the pane will produce (== total bytes ever).
-    pub head_seq: u64,
-    /// Oldest byte still in the ring buffer. Replay below this is gone.
-    pub buffer_start_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockMeta {
     pub id: BlockId,
-    /// OSC 133 A — prompt start.
-    pub start_seq: u64,
+    /// OSC 133 A — prompt start (absolute line of the cursor).
+    pub start_line: u64,
     /// OSC 133 B — command accepted. None while still at the prompt.
-    pub cmd_seq: Option<u64>,
+    pub cmd_line: Option<u64>,
     /// OSC 133 C — output begins.
-    pub output_seq: Option<u64>,
+    pub output_line: Option<u64>,
     /// OSC 133 D — command finished. None while running.
-    pub end_seq: Option<u64>,
+    pub end_line: Option<u64>,
     pub cmdline: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
@@ -274,7 +416,7 @@ pub struct Notification {
     pub id: NotificationId,
     pub pane: PaneId,
     pub kind: NotificationKind,
-    /// ANSI-stripped tail of the pane at event time, ≤ ~120 chars.
+    /// Last non-empty grid row at event time, ≤ ~120 chars.
     pub preview: String,
     pub at_ms: u64,
 }
@@ -301,9 +443,9 @@ pub struct SearchMatch {
     pub pane: PaneId,
     /// Which block the line belongs to, when block-indexed.
     pub block: Option<BlockId>,
-    /// Seq of the first byte of the matched line — the jump anchor.
-    pub line_seq: u64,
-    /// The matched line, ANSI-stripped, possibly truncated around the match.
+    /// Absolute line of the matched row — the jump anchor.
+    pub line: u64,
+    /// The matched row's text.
     pub line_text: String,
     /// Byte range of the match within `line_text`.
     pub match_start: u32,
@@ -470,9 +612,11 @@ mod tests {
                 pane: PaneId(7),
                 bytes: b"cargo test\r".to_vec(),
             },
-            ClientMsg::Replay {
+            ClientMsg::History {
                 pane: PaneId(7),
-                from: ReplayFrom::Seq(4096),
+                req_id: 4,
+                from_line: 4096,
+                to_line: 8192,
             },
             ClientMsg::Search {
                 req_id: 9,
@@ -485,23 +629,43 @@ mod tests {
         ]
     }
 
+    fn sample_row() -> Row {
+        Row {
+            spans: vec![
+                Span { text: "error".into(), style: Style { fg: Color::Indexed(1), ..Default::default() } },
+                Span {
+                    text: ": \u{1f600} wide".into(),
+                    style: Style {
+                        fg: Color::Rgb(1, 2, 3),
+                        bg: Color::Default,
+                        attrs: attrs::BOLD | attrs::UNDERLINE,
+                        link: Some("https://x.dev".into()),
+                    },
+                },
+            ],
+            wrapped: true,
+        }
+    }
+
     fn sample_daemon_msgs() -> Vec<DaemonMsg> {
         vec![
-            DaemonMsg::Output {
+            DaemonMsg::ScreenDiff {
                 pane: PaneId(7),
-                seq: 123_456,
-                // Deliberately includes the byte patterns that broke the
-                // tmux path: bare ESC, BEL, OSC 8 fragments, newlines.
-                bytes: b"\x1b]8;;file:///a\x07label\x1b]8;;\x07\ntail\x1b".to_vec(),
+                top_line: 123_456,
+                scroll: 1,
+                rows: vec![(3, sample_row()), (4, Row::default())],
+                cursor: Cursor { row: 4, col: 0, visible: true, shape: CursorShape::Beam, blink: true },
+                modes: modes::BRACKETED_PASTE | modes::FOCUS_IN_OUT,
             },
+            DaemonMsg::HistoryAppend { pane: PaneId(7), first_line: 123_455, rows: vec![sample_row()] },
             DaemonMsg::Block {
                 pane: PaneId(7),
                 block: BlockMeta {
                     id: BlockId(3),
-                    start_seq: 100,
-                    cmd_seq: Some(120),
-                    output_seq: Some(140),
-                    end_seq: Some(9000),
+                    start_line: 100,
+                    cmd_line: Some(101),
+                    output_line: Some(102),
+                    end_line: Some(9000),
                     cmdline: Some("cargo build --release".into()),
                     cwd: Some("/Users/x/code".into()),
                     branch: Some("main".into()),
@@ -549,6 +713,42 @@ mod tests {
         for (a, b) in msgs.iter().zip(out.iter()) {
             assert_eq!(format!("{a:?}"), format!("{b:?}"));
         }
+    }
+
+    #[test]
+    fn row_text_joins_spans() {
+        assert_eq!(sample_row().text(), "error: \u{1f600} wide");
+        assert_eq!(Row::default().text(), "");
+    }
+
+    #[test]
+    fn reply_correlation() {
+        let screen = Screen {
+            cols: 1,
+            rows: 1,
+            top_line: 0,
+            history_start: 0,
+            lines: vec![Row::default()],
+            cursor: Cursor { row: 0, col: 0, visible: true, shape: CursorShape::Block, blink: false },
+            modes: 0,
+        };
+        assert_eq!(
+            DaemonMsg::Screen { req_id: Some(5), pane: PaneId(1), screen: screen.clone() }.req_id(),
+            Some(5)
+        );
+        assert_eq!(DaemonMsg::Screen { req_id: None, pane: PaneId(1), screen }.req_id(), None);
+        assert_eq!(
+            DaemonMsg::History {
+                req_id: 8,
+                pane: PaneId(1),
+                from_line: 0,
+                rows: vec![],
+                history_start: 0,
+                top_line: 0
+            }
+            .req_id(),
+            Some(8)
+        );
     }
 
     #[test]

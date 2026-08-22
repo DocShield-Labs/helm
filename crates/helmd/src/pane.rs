@@ -1,10 +1,11 @@
-//! A pane: one PTY, one child process, one ring buffer.
+//! A pane: one PTY, one child process, one terminal model.
 //!
-//! The reader thread is the single producer for a pane's byte stream:
-//! raw PTY bytes → `StreamParser` (strips OSC 133 / bells, detects
-//! alt-screen) → ring append → `PaneEvent`s to the daemon core. Sequence
-//! numbers are assigned here, under the ring lock, so `Output` frames
-//! and marker events can never disagree about stream positions.
+//! The reader thread is the single producer for a pane's state: raw
+//! PTY bytes → `StreamParser` (strips OSC 133 / bells / OSC 9, detects
+//! alt-screen) → `PaneScreen` (the VT model; rows scroll into history)
+//! → `PaneEvent`s to the daemon core. Markers are positioned by feeding
+//! the model up to each one and reading the cursor's absolute line, so
+//! block boundaries and rows can never disagree.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -16,19 +17,19 @@ use tokio::sync::mpsc::UnboundedSender;
 use helm_proto::{BlockMeta, PaneId};
 
 use crate::markers::{IngestEvent, StreamParser};
-use crate::ring::RingBuffer;
+use crate::screen::{PaneScreen, SharedWriter};
 
-/// 8 MB of raw scrollback per pane. At ~120 bytes/line of dense colored
-/// output that's ~70k lines — far past tmux's 2000-line default.
-pub const RING_CAPACITY: usize = 8 * 1024 * 1024;
+/// Bytes per PTY read — also the most lines one feed can scroll out,
+/// which bounds the model's own scrollback (see `screen.rs`).
+pub const READ_BUF_LEN: usize = 8192;
 
 /// Events flowing from reader/wait threads into the daemon core.
 #[derive(Debug)]
 pub enum PaneEvent {
-    /// Cleaned bytes appended to the ring at `seq`.
-    Output { pane: PaneId, seq: u64, bytes: Vec<u8> },
-    /// Semantic event at an absolute stream position.
-    Ingest { pane: PaneId, seq: u64, event: IngestEvent },
+    /// Semantic event at an absolute line.
+    Ingest { pane: PaneId, line: u64, event: IngestEvent },
+    /// The model changed; the daemon schedules a flush.
+    Dirty { pane: PaneId },
     /// Child exited (or the PTY hit EOF).
     Exited { pane: PaneId, status: Option<i32> },
 }
@@ -52,9 +53,9 @@ pub struct PaneMeta {
 
 pub struct Pane {
     pub id: PaneId,
-    pub ring: Mutex<RingBuffer>,
+    pub screen: Mutex<PaneScreen>,
     pub meta: Mutex<PaneMeta>,
-    writer: Mutex<Box<dyn std::io::Write + Send>>,
+    writer: SharedWriter,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
@@ -123,7 +124,7 @@ impl Pane {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
         let killer = child.clone_killer();
 
         let command_name = spec.command.as_ref().and_then(|argv| {
@@ -137,7 +138,7 @@ impl Pane {
 
         let pane = Arc::new(Pane {
             id,
-            ring: Mutex::new(RingBuffer::new(RING_CAPACITY)),
+            screen: Mutex::new(PaneScreen::new(spec.cols, spec.rows, writer.clone())),
             meta: Mutex::new(PaneMeta {
                 cols: spec.cols,
                 rows: spec.rows,
@@ -145,12 +146,12 @@ impl Pane {
                 cwd: spec.cwd.clone(),
                 ..Default::default()
             }),
-            writer: Mutex::new(writer),
+            writer,
             master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
         });
 
-        // Reader thread: PTY → parser → ring → events.
+        // Reader thread: PTY → parser → model → events.
         {
             let pane = pane.clone();
             let events = events.clone();
@@ -182,6 +183,8 @@ impl Pane {
     }
 
     /// Last-writer-wins resize (no tmux-style union across clients).
+    /// The model resizes with the PTY so its reflow matches what the
+    /// application will redraw into.
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
         self.master.lock().resize(PtySize {
             rows: rows.max(2),
@@ -189,6 +192,7 @@ impl Pane {
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        self.screen.lock().resize(cols, rows);
         let mut meta = self.meta.lock();
         meta.cols = cols;
         meta.rows = rows;
@@ -223,7 +227,7 @@ fn reader_loop(
     events: UnboundedSender<PaneEvent>,
 ) {
     let mut parser = StreamParser::new();
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; READ_BUF_LEN];
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) | Err(_) => break, // EOF: the wait thread reports the exit
@@ -233,26 +237,31 @@ fn reader_loop(
         let mut ingest = Vec::new();
         parser.feed(&buf[..n], &mut out, &mut ingest);
 
-        // Assign seq under the ring lock so append order == seq order.
-        let base = {
-            let mut ring = pane.ring.lock();
-            let base = ring.head_seq();
-            ring.append(&out);
-            base
-        };
-        if !out.is_empty()
-            && events
-                .send(PaneEvent::Output { pane: pane.id, seq: base, bytes: out })
-                .is_err()
+        // Feed the model up to each marker and read where the cursor is:
+        // that line is the marker's position in the pane's line space.
+        let mut positioned = Vec::with_capacity(ingest.len());
         {
-            break; // daemon gone
+            let mut screen = pane.screen.lock();
+            let mut fed = 0usize;
+            for e in ingest {
+                let at = e.offset.min(out.len());
+                screen.advance(&out[fed..at]);
+                fed = at;
+                positioned.push((screen.cursor_abs_line(), e.event));
+            }
+            screen.advance(&out[fed..]);
         }
-        for e in ingest {
-            let _ = events.send(PaneEvent::Ingest {
-                pane: pane.id,
-                seq: base + e.offset as u64,
-                event: e.event,
-            });
+
+        for (line, event) in positioned {
+            if events
+                .send(PaneEvent::Ingest { pane: pane.id, line, event })
+                .is_err()
+            {
+                return; // daemon gone
+            }
+        }
+        if !out.is_empty() && events.send(PaneEvent::Dirty { pane: pane.id }).is_err() {
+            return;
         }
     }
 }

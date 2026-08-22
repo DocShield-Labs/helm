@@ -83,7 +83,7 @@ async function run(t: string) {
         const { workspace, pane, window: win } = located
         const snippet = hit.line_text.trim().slice(0, 120)
         out.push({
-          id: `search.${hostId}.${hit.pane_id}.${hit.line_seq}`,
+          id: `search.${hostId}.${hit.pane_id}.${hit.line}`,
           kind: 'window',
           label: snippet || '(blank match)',
           sublabel: `${host.name} · ${workspace.name} · ${win?.name ?? ''}`,
@@ -91,7 +91,7 @@ async function run(t: string) {
           run: () => {
             selectWindow(hostId, workspace.id, pane.windowId)
             // The pane consumes this once it's mounted and hydrated.
-            requestJump({ hostId, paneId: hit.pane_id, blockId: hit.block_id, lineSeq: hit.line_seq })
+            requestJump({ hostId, paneId: hit.pane_id, blockId: hit.block_id, line: hit.line })
           },
         })
       }

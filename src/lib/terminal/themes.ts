@@ -41,8 +41,8 @@ export interface Theme {
 export const THEMES: readonly Theme[] = [
   {
     // Helm 2.0 default — near-black with warm white, helm blue accent,
-    // Warp-style luminous ANSI pastels. Mirrors `ANSI16` in
-    // lib/session/ansi.ts so DOM blocks and the xterm tail agree.
+    // Warp-style luminous ANSI pastels (also helmd's default palette
+    // for OSC colour queries, see helmd/src/screen.rs).
     name: 'Helm',
     bg: '#0C0C0E',
     fg: '#F5F4F0',
@@ -215,5 +215,13 @@ export function applyThemeCssVars(theme: Theme): void {
   root.style.setProperty('--terminal-failed', theme.ansi.red)
   root.style.setProperty('--terminal-success', theme.ansi.green)
   root.style.setProperty('--terminal-warning', theme.ansi.yellow)
+  // The 16 ANSI slots, for rows rendered as DOM (lib/session/palette.ts)
+  // — same palette the xterm grid paints with.
+  const slots: Array<keyof ThemeAnsi> = [
+    'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+    'brightBlack', 'brightRed', 'brightGreen', 'brightYellow',
+    'brightBlue', 'brightMagenta', 'brightCyan', 'brightWhite',
+  ]
+  slots.forEach((slot, i) => root.style.setProperty(`--ansi-${i}`, theme.ansi[slot]))
   root.dataset.themeMode = isLightTheme(theme) ? 'light' : 'dark'
 }

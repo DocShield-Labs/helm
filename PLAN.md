@@ -192,6 +192,122 @@ setting.
   integration scripts eventually.
 - **Windows hosts**: out of scope (same as today).
 
+## M8 — helmd owns the terminal model (2026-08-21)
+
+### Why
+
+Three bugs traced on 2026-08-21 share one root: the pane's *byte stream*
+is the source of truth and three consumers re-interpret it — xterm for
+the live tail, `ansi.ts` for finished blocks, helmd's marker scanner for
+blocks. Every bound and every artifact came from that:
+
+- A running agent's history lived only in xterm's `scrollback: 10_000`
+  line buffer, seeded on (re)mount from a 512 KB byte window. A long
+  Claude session walked off the end of both; helmd had the bytes (8 MB
+  ring) with no way to page them into view. (Probed Claude Code
+  2.1.239 in a pty: its renderer is diff-based and clean — a 250-line
+  answer in 20 rows is 19 KB, every line emitted once, no `ESC[2J/3J`,
+  resize repaints the viewport only. The loss was purely ours.)
+- A finished agent block was "crystallized" by replaying the whole TUI
+  byte stream through a homegrown ANSI→grid renderer, which produced
+  the TUI's last frame — a static Claude screen that read as a
+  respawned instance.
+- Re-feeding bytes into xterm re-executed terminal queries (Claude's
+  DA1 at boot), typing stray `?1;2c` answers into the agent.
+
+A multiplexer whose agents run for hours needs what tmux, mosh and Warp
+converged on: **the daemon keeps terminal state; clients paint it.**
+
+### Design
+
+**helmd** embeds a real VT emulator per pane (`alacritty_terminal`,
+Apache-2.0, what Zed uses) and owns:
+
+- the live grid (rows × cols; alt screen included),
+- a **line history** of rows that scrolled off the top, capped by rows
+  (100k; ~100 B/row RLE-encoded) — not by bytes, not by xterm,
+- the block index keyed by **absolute line numbers**
+  (`start_line / cmd_line / output_line / end_line`), computed at
+  ingest because the marker parser now knows where the cursor is,
+- terminal query answering (DA1/DA2, DSR/CPR, DECRQM, OSC 10/11/12,
+  XTVERSION, kitty `?u`) — answered exactly once, by the model; the
+  frontend never sees raw bytes again.
+
+Absolute line `L` = rows ever scrolled out of the primary grid + grid
+row. Lines are monotonic for the pane's lifetime; the grid's top row is
+`top_line`, history covers `[history_start, top_line)`.
+
+**Protocol (v4).** `Output`/`Replay`/`ReplayDone`/seq go away. New:
+
+```
+Row        { spans: [Span], wrapped }          Span { text, style }
+Style      { fg: Color, bg: Color, attrs: u16, link: Option<String> }
+Color      Default | Indexed(u8) | Rgb(r,g,b)
+Cursor     { row, col, visible, shape: Block|Underline|Beam, blink }
+Modes      bitflags: APP_CURSOR APP_KEYPAD BRACKETED_PASTE FOCUS_IN_OUT
+           MOUSE_CLICK MOUSE_DRAG MOUSE_MOTION SGR_MOUSE UTF8_MOUSE
+           ALT_SCREEN ALTERNATE_SCROLL
+Screen     { cols, rows, top_line, lines: [Row], cursor, modes }
+
+Client → daemon   Screen{req_id, pane}   History{req_id, pane, from_line, to_line}
+Daemon → client   Screen{req_id?, pane, screen}            full repaint
+                  ScreenDiff{pane, top_line, rows:[(row, Row)], cursor, modes}
+                  HistoryAppend{pane, first_line, rows}   rows leaving the grid
+                  History{req_id, pane, from_line, rows, history_start, top_line}
+BlockMeta  *_seq → *_line        PaneInfo  head_seq/buffer_start_seq → top_line/history_start
+SearchMatch line_seq → line
+```
+
+Diffs are damage-driven (alacritty's per-line damage), coalesced per
+pane at ≤ 60 Hz, and strictly smaller on the wire than raw bytes.
+Reattach is `Screen` + lazily-paged `History` — exact, no replay, no
+`term.reset()` seam, no re-executed escape sequences.
+
+**Frontend.** The scroll container is DOM rows for all of history —
+finished blocks *and* the running command's scrolled-off output,
+fetched by line range as the user scrolls up — with the xterm pinned at
+the bottom as the **live screen only** (`scrollback: 0`). Painting =
+synthesizing `CUP` + SGR spans per damaged row from `ScreenDiff`, plus
+the DEC modes xterm needs for input encoding (DECCKM, mouse, bracketed
+paste, focus). Blocks are line ranges; a block whose rows are still in
+the grid shows them in the grid (or, when the grid is hidden at a
+prompt, from the frontend's mirror of it). `ansi.ts`, `seqbuffer.ts`
+and byte replay retire.
+
+### What it fixes in one move
+
+Unbounded agent scrollback · exact reattach from the running block's
+start · the "respawned Claude" artifact (a finished block is a line
+range, not a re-rendering of TUI bytes) · the DA1 re-answer bug ·
+copy/select/find are DOM-native over all history · search runs over
+styled rows with no ANSI stripping · helmd's raw ring is unnecessary.
+
+### Phases
+
+- **Phase 1 — model, protocol, painter, rows as DOM** (this commit).
+  helmd: `screen.rs` (Term + history + row encoding + query answering),
+  line-indexed blocks, ≤60 Hz diff flush, search over rows; proto v4;
+  app bridge (`session_screen`, `session_history`, new events);
+  frontend: `lib/session/screen.ts` (model mirror + painter +
+  paged history), BlockPane on rows, blocks as ranges, xterm as a
+  scrollback-less painter.
+- **Phase 2 — depth.** Disk-backed history (append-only row log per
+  pane, lazy page-in) so a day-long session survives a daemon restart
+  and is not memory-bound; windowed rendering past ~20k DOM rows;
+  align DOM and grid line metrics so the DOM/grid boundary doesn't
+  shift on phase change; OSC 52 clipboard → app; window title from
+  OSC 0/2.
+- **Phase 3 — many clients.** Per-pane subscribe (only panes a client
+  shows get diffs), per-client size, row delta compression for SSH.
+
+### Risks
+
+Emulation fidelity now rests on alacritty_terminal (complete VT, but
+e.g. sixel is out). Mouse-heavy TUIs depend on the mode flags being
+forwarded faithfully. Protocol bump = daemon restart on upgrade (the
+version handshake already handles it; sessions die, as with any helmd
+upgrade).
+
 ## Status
 
 - [x] M0: zsh.zshrc de-blocked (passive markers only)
@@ -300,3 +416,32 @@ setting.
       surface (agent command per host), regex search daemon-side (M6),
       foreground-process tracking in helmd, cross-platform helmd bundles
       for heterogeneous fleets.
+- [x] M8 phase 1: helmd owns the terminal model (2026-08-21).
+      · `helmd/src/screen.rs` — `alacritty_terminal` per pane; rows
+        drained into our own line history (100k rows) after every feed
+        so numbering is absolute and history rows are immutable;
+        damage-driven `Screen`/`ScreenDiff` diffed against what was last
+        sent; terminal queries (DA1/DA2, DSR/CPR, OSC 10/11/12, text
+        area size, DECRQM) answered by the model on the PTY; 14 tests.
+      · `pane.rs` positions OSC 133 markers by feeding the model up to
+        each one and reading the cursor's absolute line; `ring.rs` and
+        the parser's strip mode are gone. `daemon.rs` coalesces flushes
+        per pane (16 ms), pages history, searches rows.
+      · `helm-proto` v4: `Output`/`Replay`/seq replaced by `Screen`,
+        `ScreenDiff`, `HistoryAppend`, `History`; blocks and search hits
+        carry lines. e2e: a 3000-line command in a 24-row pane pages
+        back from line 1 with search anchors in the block's line space.
+      · App bridge: `session_screen`, `session_history`; packed colours
+        in `SpanInfo` keep history pages small over JSON.
+      · Frontend: `lib/session/screen.ts` (mirror, paged history,
+        per-range row caching), `painter.ts` (grid → xterm sequences,
+        DEC mode mirroring), `Rows.tsx` (wrapped rows join into logical
+        lines; chunked with `content-visibility`), BlockPane rebuilt on
+        rows: sentinel-driven paging with scroll anchoring, blocks as
+        line ranges (grid-resident rows shown from the mirror while the
+        grid is hidden at a prompt), xterm `scrollback: 0`. `ansi.ts`,
+        `seqbuffer.ts`, `stream.ts` deleted. Also fixes Cmd+C on grid
+        selections (the mouseup no longer steals focus from xterm).
+      Deferred to phase 2: disk-backed history, windowing past ~60k
+      client rows, DOM/grid line-metric alignment, OSC 52 → clipboard,
+      OSC 0/2 titles, per-pane subscribe + row delta compression for SSH.

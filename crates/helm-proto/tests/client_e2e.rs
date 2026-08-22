@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use helm_proto::{DaemonMsg, ReplayFrom, SearchScope};
+use helm_proto::{DaemonMsg, SearchScope};
 
 async fn recv_until<T>(
     events: &mut tokio::sync::mpsc::UnboundedReceiver<DaemonMsg>,
@@ -59,7 +59,7 @@ async fn typed_client_lifecycle() {
     assert!(conn.pending.is_empty());
 
     let client = &conn.client;
-    client.attach(vec![]).unwrap();
+    client.attach().unwrap();
     client.new_workspace(1, Some("typed".into())).unwrap();
     let ws = recv_until(&mut conn.events, 5, |m| match m {
         DaemonMsg::Created { req_id: 1, workspace, .. } => Some(*workspace),
@@ -86,10 +86,17 @@ async fn typed_client_lifecycle() {
     })
     .await;
 
+    // The live grid arrives as screen diffs (or a full screen).
     recv_until(&mut conn.events, 10, |m| match m {
-        DaemonMsg::Output { pane: p, bytes, .. } if *p == pane => {
-            String::from_utf8_lossy(bytes).contains("typed-client-out").then_some(())
-        }
+        DaemonMsg::ScreenDiff { pane: p, rows, .. } if *p == pane => rows
+            .iter()
+            .any(|(_, row)| row.text().contains("typed-client-out"))
+            .then_some(()),
+        DaemonMsg::Screen { pane: p, screen, .. } if *p == pane => screen
+            .lines
+            .iter()
+            .any(|row| row.text().contains("typed-client-out"))
+            .then_some(()),
         _ => None,
     })
     .await;
@@ -106,18 +113,23 @@ async fn typed_client_lifecycle() {
     })
     .await;
 
-    client.replay(pane, ReplayFrom::Seq(0)).unwrap();
-    let mut replay = Vec::new();
-    recv_until(&mut conn.events, 5, |m| match m {
-        DaemonMsg::Output { pane: p, bytes, .. } if *p == pane => {
-            replay.extend_from_slice(bytes);
-            None
-        }
-        DaemonMsg::ReplayDone { pane: p, .. } if *p == pane => Some(()),
+    // A fresh client paints from the model: the full screen still holds
+    // the output (exact reattach, no byte replay).
+    client.screen(4, pane).unwrap();
+    let screen = recv_until(&mut conn.events, 5, |m| match m {
+        DaemonMsg::Screen { req_id: Some(4), pane: p, screen } if *p == pane => Some(screen.clone()),
         _ => None,
     })
     .await;
-    assert!(String::from_utf8_lossy(&replay).contains("typed-client-out"));
+    assert!(screen.lines.iter().any(|row| row.text().contains("typed-client-out")));
+    assert_eq!(screen.lines.len(), screen.rows as usize);
+
+    client.history(5, pane, 0, u64::MAX).unwrap();
+    recv_until(&mut conn.events, 5, |m| match m {
+        DaemonMsg::History { req_id: 5, pane: p, .. } if *p == pane => Some(()),
+        _ => None,
+    })
+    .await;
 
     let _ = std::fs::remove_file(&socket);
 }

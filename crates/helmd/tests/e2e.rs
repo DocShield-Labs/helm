@@ -1,15 +1,13 @@
 //! End-to-end: daemon on a real unix socket, a real `/bin/sh` child in a
-//! real PTY, OSC 133 markers through the full ingest path, then replay
-//! and search over the ring.
+//! real PTY, OSC 133 markers through the full ingest path, then screen,
+//! history and search over the model.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use helm_proto::{
-    encode_frame, ClientMsg, DaemonMsg, FrameDecoder, ReplayFrom, SearchScope, WorkspaceId,
-};
+use helm_proto::{encode_frame, ClientMsg, DaemonMsg, FrameDecoder, SearchScope, WorkspaceId};
 
 struct TestClient {
     stream: UnixStream,
@@ -74,19 +72,10 @@ impl TestClient {
     }
 }
 
-fn output_bytes(msgs: &[DaemonMsg]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for m in msgs {
-        if let DaemonMsg::Output { bytes, .. } = m {
-            out.extend_from_slice(bytes);
-        }
-    }
-    out
-}
-
-#[test]
-fn full_session_lifecycle() {
-    let socket = std::env::temp_dir().join(format!("helmd-e2e-{}.sock", std::process::id()));
+/// A daemon on a fresh temp socket plus a connected, attached client
+/// with one workspace — the prelude every scenario shares.
+fn start_daemon(tag: &str) -> (PathBuf, TestClient, Vec<DaemonMsg>, WorkspaceId) {
+    let socket = std::env::temp_dir().join(format!("helmd-e2e-{tag}-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     {
         let socket = socket.clone();
@@ -99,14 +88,12 @@ fn full_session_lifecycle() {
                 .unwrap();
         });
     }
-
     let mut c = TestClient::connect(&socket);
     let mut seen = Vec::new();
-
     // Hello → HelloAck with a matching protocol version.
     c.send(&ClientMsg::Hello {
         protocol_version: helm_proto::PROTOCOL_VERSION,
-        client_name: "e2e-test".into(),
+        client_name: format!("e2e-{tag}"),
     });
     c.recv_until(5, &mut seen, |m| match m {
         DaemonMsg::HelloAck { protocol_version, .. } => {
@@ -115,19 +102,40 @@ fn full_session_lifecycle() {
         }
         _ => None,
     });
-
     // Attach before creating anything so we get all broadcasts.
-    c.send(&ClientMsg::Attach { resume: vec![] });
-
+    c.send(&ClientMsg::Attach);
     // New workspace → Created reply (and an initial shell window).
-    c.send(&ClientMsg::NewWorkspace { req_id: 1, name: Some("e2e".into()) });
-    let ws_id: WorkspaceId = c.recv_until(5, &mut seen, |m| match m {
+    c.send(&ClientMsg::NewWorkspace { req_id: 1, name: Some(tag.into()) });
+    let ws_id = c.recv_until(5, &mut seen, |m| match m {
         DaemonMsg::Created { req_id: 1, workspace, window, pane } => {
             assert!(window.is_some() && pane.is_some(), "workspace should come with a window");
             Some(*workspace)
         }
         _ => None,
     });
+    (socket, c, seen, ws_id)
+}
+
+/// Every row text a pane's screen messages carried, in arrival order.
+fn screen_texts(msgs: &[DaemonMsg], pane_id: helm_proto::PaneId) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in msgs {
+        match m {
+            DaemonMsg::Screen { pane, screen, .. } if *pane == pane_id => {
+                out.extend(screen.lines.iter().map(|r| r.text()))
+            }
+            DaemonMsg::ScreenDiff { pane, rows, .. } if *pane == pane_id => {
+                out.extend(rows.iter().map(|(_, r)| r.text()))
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn full_session_lifecycle() {
+    let (socket, mut c, mut seen, ws_id) = start_daemon("lifecycle");
 
     // A window running a script that walks the full OSC 133 block
     // lifecycle (A → B → C → output → D;3), then lingers so the pane
@@ -152,26 +160,35 @@ fn full_session_lifecycle() {
         _ => None,
     });
 
-    // Live output arrives, with the markers stripped.
-    c.recv_until(10, &mut seen, |m| match m {
-        DaemonMsg::Output { pane, bytes, .. } if *pane == pane_id => {
-            String::from_utf8_lossy(bytes).contains("helm-e2e-out").then_some(())
-        }
-        _ => None,
-    });
-    let live = output_bytes(&seen);
-    assert!(!live.windows(4).any(|w| w == b"133;"), "markers leaked into output");
-
-    // The block closed with exit 3 and the decoded cmdline.
-    c.recv_until(10, &mut seen, |m| match m {
+    // The block closes with exit 3, the decoded cmdline, and line
+    // positions inside the pane's line space. Blocks are broadcast at
+    // ingest; the screen flush that paints the output trails by a tick.
+    let block = c.recv_until(10, &mut seen, |m| match m {
         DaemonMsg::Block { pane, block } if *pane == pane_id => (block.exit_code == Some(3)
             && block.cmdline.as_deref() == Some("e2e")
-            && block.end_seq.is_some())
-        .then_some(()),
+            && block.end_line.is_some())
+        .then_some(block.clone()),
         _ => None,
     });
+    assert!(block.output_line.unwrap() <= block.end_line.unwrap());
+    assert!(block.start_line <= block.cmd_line.unwrap());
 
-    // Search finds the line with a seq anchor inside the block.
+    // Live output arrives as screen rows, with the markers stripped.
+    let has_output = |m: &DaemonMsg| {
+        screen_texts(std::slice::from_ref(m), pane_id)
+            .iter()
+            .any(|t| t.contains("helm-e2e-out"))
+            .then_some(())
+    };
+    if !seen.iter().any(|m| has_output(m).is_some()) {
+        c.recv_until(10, &mut seen, has_output);
+    }
+    assert!(
+        !screen_texts(&seen, pane_id).iter().any(|t| t.contains("133;")),
+        "markers leaked into rows"
+    );
+
+    // Search finds the line with a line anchor inside the block.
     c.send(&ClientMsg::Search {
         req_id: 3,
         query: "e2e-out".into(),
@@ -180,26 +197,40 @@ fn full_session_lifecycle() {
         scope: SearchScope::All,
         max_results: 10,
     });
-    c.recv_until(5, &mut seen, |m| match m {
+    let hit_line = c.recv_until(5, &mut seen, |m| match m {
         DaemonMsg::SearchResults { matches, .. } => matches
             .iter()
-            .any(|hit| hit.pane == pane_id && hit.line_text.contains("helm-e2e-out"))
-            .then_some(()),
+            .find(|hit| hit.pane == pane_id && hit.line_text.contains("helm-e2e-out"))
+            .map(|hit| hit.line),
         _ => None,
     });
+    assert!(hit_line >= block.output_line.unwrap() && hit_line < block.end_line.unwrap());
 
-    // Replay returns the same bytes again (exact reattach semantics).
-    c.send(&ClientMsg::Replay { pane: pane_id, from: ReplayFrom::LastBytes(100_000) });
-    let mut replayed = Vec::new();
-    c.recv_until(5, &mut replayed, |m| match m {
-        DaemonMsg::ReplayDone { pane, .. } if *pane == pane_id => Some(()),
+    // A fresh paint from the model carries the output (exact reattach,
+    // no byte replay), sized to the pane.
+    c.send(&ClientMsg::Screen { req_id: 4, pane: pane_id });
+    let screen = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Screen { req_id: Some(4), pane, screen } if *pane == pane_id => {
+            Some(screen.clone())
+        }
         _ => None,
     });
-    let replay_bytes = output_bytes(&replayed);
-    assert!(
-        String::from_utf8_lossy(&replay_bytes).contains("helm-e2e-out"),
-        "replay missing output: {replay_bytes:?}"
-    );
+    assert_eq!(screen.lines.len(), screen.rows as usize);
+    assert!(screen.lines.iter().any(|r| r.text().contains("helm-e2e-out")));
+    assert_eq!(screen.top_line, 0, "one line of output can't have scrolled a 24-row pane");
+
+    // History paging answers even when nothing has scrolled out yet.
+    c.send(&ClientMsg::History { req_id: 5, pane: pane_id, from_line: 0, to_line: u64::MAX });
+    c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::History { req_id: 5, pane, rows, history_start, top_line, .. }
+            if *pane == pane_id =>
+        {
+            assert_eq!((*history_start, *top_line), (0, 0));
+            assert!(rows.is_empty());
+            Some(())
+        }
+        _ => None,
+    });
 
     // Kill the window; it disappears from the tree (the workspace's
     // auto-spawned initial window remains).
@@ -213,6 +244,92 @@ fn full_session_lifecycle() {
             .then_some(()),
         _ => None,
     });
+
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// The M8 guarantee: output that scrolls out of the grid is retained as
+/// history, addressed by the same absolute lines the block index and
+/// search use, and pages back in full — a 24-row pane holds a 3000-line
+/// command without losing its start.
+#[test]
+fn long_output_pages_through_history() {
+    let (socket, mut c, mut seen, ws_id) = start_daemon("history");
+
+    // One block whose command prints 3000 numbered lines ("c2Vx" = "seq").
+    let script = concat!(
+        "printf '\\033]133;A\\007'; ",
+        "printf '\\033]133;B;cmdline_b64=c2Vx\\007'; ",
+        "printf '\\033]133;C\\007'; ",
+        "seq 1 3000; ",
+        "printf '\\033]133;D;0\\007'; ",
+        "sleep 5",
+    );
+    c.send(&ClientMsg::NewWindow {
+        req_id: 2,
+        workspace: ws_id,
+        name: None,
+        cwd: None,
+        command: Some(vec!["/bin/sh".into(), "-c".into(), script.into()]),
+    });
+    let pane_id = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Created { req_id: 2, pane, .. } => Some(pane.unwrap()),
+        _ => None,
+    });
+    let block = c.recv_until(30, &mut seen, |m| match m {
+        DaemonMsg::Block { pane, block } if *pane == pane_id => {
+            (block.cmdline.as_deref() == Some("seq") && block.end_line.is_some()).then_some(block.clone())
+        }
+        _ => None,
+    });
+    let out = block.output_line.unwrap();
+    let end = block.end_line.unwrap();
+    assert!(end - out >= 3000, "block spans {out}..{end}");
+
+    // The first rows of the command, long gone from the 24-row grid.
+    c.send(&ClientMsg::History { req_id: 3, pane: pane_id, from_line: out, to_line: out + 100 });
+    let rows = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::History { req_id: 3, rows, .. } => Some(rows.clone()),
+        _ => None,
+    });
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows[0].text(), "1");
+    assert_eq!(rows[99].text(), "100");
+
+    // An open-ended request pages from the end, clamped to one page.
+    c.send(&ClientMsg::History { req_id: 4, pane: pane_id, from_line: 0, to_line: u64::MAX });
+    let (from, rows, history_start, top_line) = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::History { req_id: 4, from_line, rows, history_start, top_line, .. } => {
+            Some((*from_line, rows.clone(), *history_start, *top_line))
+        }
+        _ => None,
+    });
+    assert!(rows.len() as u64 <= helm_proto::MAX_HISTORY_PAGE);
+    assert_eq!(from + rows.len() as u64, top_line);
+    assert_eq!(history_start, 0);
+    assert!(top_line >= 2976, "top_line {top_line}");
+    // The grid still holds the last 24 lines; history ends just above.
+    assert!(rows.iter().any(|r| r.text() == "2900"));
+    let last: u64 = rows.last().unwrap().text().trim().parse().unwrap_or(0);
+    assert!(last >= 2960 && last < 3000, "history ends at {last}");
+
+    // Search anchors deep in history agree with the block's line space.
+    c.send(&ClientMsg::Search {
+        req_id: 5,
+        query: "1500".into(),
+        regex: false,
+        case_sensitive: false,
+        scope: SearchScope::Pane(pane_id),
+        max_results: 10,
+    });
+    let hit_line = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::SearchResults { req_id: 5, matches, .. } => {
+            matches.iter().find(|h| h.line_text == "1500").map(|h| h.line)
+        }
+        _ => None,
+    });
+    assert!(hit_line >= out && hit_line < end);
+    assert_eq!(hit_line, out + 1499, "line N of seq lands at output_line + N - 1");
 
     let _ = std::fs::remove_file(&socket);
 }

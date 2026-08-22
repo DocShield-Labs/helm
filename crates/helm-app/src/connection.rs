@@ -22,11 +22,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use dashmap::DashMap;
 use helm_domain::{
-    AuthMethod, BlockInfo, Host, HostEvent, HostId, HostStatus, PaneInfo, SearchHit, SessionEvent,
-    SessionTree, WindowInfo, WorkspaceInfo,
+    AuthMethod, BlockInfo, CursorInfo, CursorShape, Host, HostEvent, HostId, HostStatus,
+    PaneInfo, RowAt, RowInfo, ScreenInfo, SearchHit, SessionEvent, SessionTree, SpanInfo,
+    WindowInfo, WorkspaceInfo,
 };
 use helm_proto::client::{connect_io, connect_or_spawn_unix, ClientError, Connected};
 use helm_proto::{DaemonMsg, TreeSnapshot};
@@ -182,7 +182,7 @@ async fn install_session(
     if let Some(max) = last_note_id {
         let _ = session.client.ack_notifications(helm_proto::NotificationId(max));
     }
-    let _ = session.client.attach(vec![]);
+    let _ = session.client.attach();
 
     // A daemon with no workspaces gets one, named after the host's
     // default. Await the reply so the first tree the frontend renders
@@ -230,15 +230,33 @@ async fn pump(
     };
     while let Some(msg) = events.recv().await {
         match msg {
-            DaemonMsg::Output { pane, seq, bytes } => {
-                emit(SessionEvent::Output {
+            // A full screen with a req_id answers a `session_screen`
+            // call; without one it's a broadcast repaint.
+            DaemonMsg::Screen { req_id: None, pane, screen } => {
+                emit(SessionEvent::Screen {
                     pane_id: pane.to_string(),
-                    seq,
-                    data: B64.encode(&bytes),
+                    screen: to_domain_screen(screen),
                 });
             }
-            DaemonMsg::ReplayDone { pane, at_seq } => {
-                emit(SessionEvent::ReplayDone { pane_id: pane.to_string(), at_seq });
+            DaemonMsg::ScreenDiff { pane, top_line, scroll, rows, cursor, modes } => {
+                emit(SessionEvent::ScreenDiff {
+                    pane_id: pane.to_string(),
+                    top_line,
+                    scroll,
+                    rows: rows
+                        .into_iter()
+                        .map(|(index, row)| RowAt { index, row: to_domain_row(row) })
+                        .collect(),
+                    cursor: to_domain_cursor(&cursor),
+                    modes,
+                });
+            }
+            DaemonMsg::HistoryAppend { pane, first_line, rows } => {
+                emit(SessionEvent::HistoryAppend {
+                    pane_id: pane.to_string(),
+                    first_line,
+                    rows: rows.into_iter().map(to_domain_row).collect(),
+                });
             }
             DaemonMsg::Block { pane, block } => {
                 let pane_id = pane.to_string();
@@ -472,7 +490,16 @@ fn is_protocol_mismatch(rejection: &str) -> bool {
     rejection.contains("protocol mismatch")
 }
 
+/// The local daemon's socket: `~/.helm/helmd.sock`, or `$HELM_SOCKET`.
+/// The override lets a dev build run against its own daemon while the
+/// installed app keeps its sessions on the default socket — a protocol
+/// bump would otherwise restart the shared daemon on first connect.
 fn helmd_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("HELM_SOCKET") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".helm")
@@ -699,8 +726,6 @@ pub(crate) fn to_domain_tree(t: &TreeSnapshot) -> SessionTree {
                                 cwd: p.cwd.clone(),
                                 branch: p.branch.clone(),
                                 command: p.command.clone(),
-                                head_seq: p.head_seq,
-                                buffer_start_seq: p.buffer_start_seq,
                             })
                             .collect(),
                     })
@@ -713,10 +738,10 @@ pub(crate) fn to_domain_tree(t: &TreeSnapshot) -> SessionTree {
 pub(crate) fn to_domain_block(b: &helm_proto::BlockMeta) -> BlockInfo {
     BlockInfo {
         id: b.id.to_string(),
-        start_seq: b.start_seq,
-        cmd_seq: b.cmd_seq,
-        output_seq: b.output_seq,
-        end_seq: b.end_seq,
+        start_line: b.start_line,
+        cmd_line: b.cmd_line,
+        output_line: b.output_line,
+        end_line: b.end_line,
         cmdline: b.cmdline.clone(),
         cwd: b.cwd.clone(),
         branch: b.branch.clone(),
@@ -732,10 +757,69 @@ pub(crate) fn to_domain_hits(matches: &[helm_proto::SearchMatch]) -> Vec<SearchH
         .map(|m| SearchHit {
             pane_id: m.pane.to_string(),
             block_id: m.block.map(|b| b.to_string()),
-            line_seq: m.line_seq,
+            line: m.line,
             line_text: m.line_text.clone(),
             match_start: m.match_start,
             match_end: m.match_end,
         })
         .collect()
+}
+
+/// Packed-colour flag for truecolor (see `helm_domain::SpanInfo`).
+/// Exported to the frontend as a binding constant.
+pub const TRUECOLOR_FLAG: i32 = 1 << 24;
+
+fn pack_color(c: helm_proto::Color) -> i32 {
+    match c {
+        helm_proto::Color::Default => -1,
+        helm_proto::Color::Indexed(i) => i as i32,
+        helm_proto::Color::Rgb(r, g, b) => {
+            TRUECOLOR_FLAG | ((r as i32) << 16) | ((g as i32) << 8) | b as i32
+        }
+    }
+}
+
+/// Rows arrive owned from the daemon; moving their strings into the
+/// domain type is the only copy on the way to the webview.
+pub(crate) fn to_domain_row(r: helm_proto::Row) -> RowInfo {
+    RowInfo {
+        spans: r
+            .spans
+            .into_iter()
+            .map(|s| SpanInfo {
+                text: s.text,
+                fg: pack_color(s.style.fg),
+                bg: pack_color(s.style.bg),
+                attrs: s.style.attrs,
+                link: s.style.link,
+            })
+            .collect(),
+        wrapped: r.wrapped,
+    }
+}
+
+pub(crate) fn to_domain_cursor(c: &helm_proto::Cursor) -> CursorInfo {
+    CursorInfo {
+        row: c.row,
+        col: c.col,
+        visible: c.visible,
+        shape: match c.shape {
+            helm_proto::CursorShape::Block => CursorShape::Block,
+            helm_proto::CursorShape::Underline => CursorShape::Underline,
+            helm_proto::CursorShape::Beam => CursorShape::Beam,
+        },
+        blink: c.blink,
+    }
+}
+
+pub(crate) fn to_domain_screen(s: helm_proto::Screen) -> ScreenInfo {
+    ScreenInfo {
+        cols: s.cols,
+        rows: s.rows,
+        top_line: s.top_line,
+        history_start: s.history_start,
+        cursor: to_domain_cursor(&s.cursor),
+        modes: s.modes,
+        lines: s.lines.into_iter().map(to_domain_row).collect(),
+    }
 }

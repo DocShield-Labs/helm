@@ -1,8 +1,11 @@
 /**
  * xterm.js + WebGL renderer wrapper. Thin and unopinionated:
  * the consumer creates a div, hands it to `attachTerminal`, and we wire up
- * the renderer + addons. Backpressure (`xon`/`xoff` via Terminal.write())
- * happens implicitly — helmd batches on the producer side.
+ * the renderer + addons.
+ *
+ * Since M8 xterm is a painter for the daemon's grid and an input
+ * encoder — it has no scrollback (history is DOM above it, see
+ * lib/session/screen.ts) and never sees application bytes.
  */
 
 import { Terminal } from '@xterm/xterm'
@@ -102,7 +105,9 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       opts.fontFamily ??
       '"Hack", "Berkeley Mono", "JetBrains Mono", "SF Mono", ui-monospace, monospace',
     fontSize: opts.fontSize ?? 13,
-    lineHeight: opts.lineHeight ?? 1.2,
+    // 20px cells: the same `--helm-line-px` rows rendered as DOM use,
+    // so the live band and the finished block it turns into line up.
+    lineHeight: opts.lineHeight ?? 20 / 13,
     letterSpacing: 0,
     fontWeight: 400,
     fontWeightBold: 600,
@@ -127,7 +132,8 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     // so no LF→CRLF translation: doing it would double-space output
     // from programs that already emit CRLF.
     convertEol: false,
-    scrollback: 10_000,
+    // The grid only: history lives in the daemon and renders as DOM.
+    scrollback: 0,
     // When a TUI like Claude Code or vim turns on mouse capture
     // (DECSET 1000/1006), xterm forwards every click to the app and
     // link clicks no longer fire. Enabling this lets the user hold
@@ -230,32 +236,14 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     /* terminal not visible yet */
   }
 
-  // Native-feeling scroll for trackpads. xterm's built-in viewport
-  // scrolls integer rows per wheel notch, which on a high-DPI macOS
-  // trackpad shows up as one row per ~13px gesture — distinctly
-  // step-y. We replace that with our own handler:
-  //
-  //   - Listen on the host in capture phase + stopPropagation so
-  //     xterm's own wheel listener (registered on `.xterm-viewport`
-  //     during `term.open`) never fires.
-  //   - Translate `deltaY` to row-fraction units based on `deltaMode`:
-  //       0 (PIXEL) → divide by measured cell height
-  //       1 (LINE)  → pass through directly
-  //       2 (PAGE)  → multiply by viewport rows
-  //     macOS trackpads emit pixel mode; classic mouse wheels emit
-  //     line mode; our behaviour matches each modality's intent.
-  //   - Accumulate fractional rows; only call `term.scrollLines(int)`
-  //     when the integer part crosses a boundary. Fractions persist
-  //     between events so a slow trackpad gesture eventually scrolls
-  //     a full row instead of being rounded away.
-  //   - Cmd / Ctrl + wheel are left to the browser (zoom).
-  let scrollAccum = 0
   // Cached cell dimensions in pixels. Measure from `.xterm-screen / rows`
   // (and cols) — that's xterm's internal layout, not CSS line-height,
-  // so we sidestep rounding drift between the two. The wheel handler,
-  // the block overlay, and the hover hit-test all read from this cache
-  // so they can't disagree about row positions.
-  let cachedCellH = 17
+  // so we sidestep rounding drift between the two. The pane's wheel
+  // handler reads it to turn line-mode wheel deltas into pixels.
+  // (The grid has no scrollback, so xterm never scrolls itself: the
+  // pane decides what a wheel over the grid means — see BlockPane.)
+  // 20px tall by construction (see `lineHeight`); measured to confirm.
+  let cachedCellH = 20
   let cachedCellW = 8
   const measureCellSize = () => {
     const screen = host.querySelector('.xterm-screen') as HTMLElement | null
@@ -273,50 +261,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     }
   }
   measureCellSize()
-  const onWheel = (e: WheelEvent) => {
-    if (e.ctrlKey || e.metaKey) return
-    // Alt-screen TUIs own the wheel (xterm converts it to arrow keys or
-    // mouse reports for them) — don't intercept.
-    if (term.buffer.active.type === 'alternate') return
-
-    let rowDelta: number
-    switch (e.deltaMode) {
-      case 1: // LINE
-        rowDelta = e.deltaY
-        break
-      case 2: // PAGE
-        rowDelta = e.deltaY * Math.max(1, term.rows - 1)
-        break
-      case 0: // PIXEL
-      default:
-        rowDelta = e.deltaY / cachedCellH
-        break
-    }
-
-    // At the edges of xterm's own scrollback, let the event bubble so
-    // the enclosing block list scrolls instead (the tail sits at the
-    // bottom of a larger document).
-    const buf = term.buffer.active
-    const atTop = buf.viewportY <= 0
-    const atBottom = buf.viewportY >= buf.baseY
-    if ((rowDelta < 0 && atTop) || (rowDelta > 0 && atBottom)) {
-      scrollAccum = 0
-      return
-    }
-    e.preventDefault()
-    e.stopPropagation()
-
-    scrollAccum += rowDelta
-    const intRows = Math.trunc(scrollAccum)
-    if (intRows !== 0) {
-      scrollAccum -= intRows
-      term.scrollLines(intRows)
-    }
-  }
-  // capture phase + passive:false so we can preventDefault. Without
-  // capture, xterm's own listener (which is bubble-phase on a child
-  // element) fires first and we'd double-scroll.
-  host.addEventListener('wheel', onWheel, { capture: true, passive: false })
 
   // Re-measure on host resize (font-size or DPR changes) and once on
   // the first xterm render (covers the WebGL post-init race where the
@@ -341,7 +285,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     },
     dispose: () => {
       attached.delete(helm)
-      host.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions)
       ro.disconnect()
       firstRender?.dispose()
       webgl?.dispose()

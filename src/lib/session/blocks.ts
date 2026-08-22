@@ -10,9 +10,10 @@
 import { useSyncExternalStore } from 'react'
 import { commands } from '@lib/ipc'
 import type { BlockInfo, HostId } from '@bindings'
+import { addListener, notifyListeners } from './listeners'
 
 export interface PaneBlocks {
-  /** Sorted by start_seq. */
+  /** Sorted by start_line. */
   blocks: readonly BlockInfo[]
   altScreen: boolean
   exited: boolean
@@ -21,7 +22,7 @@ export interface PaneBlocks {
   /** Count of bells the pane has rung since the frontend started.
    * Consumers compare against the count they last acknowledged. */
   bells: number
-  /** Blocks starting before this seq are hidden (`clear`). */
+  /** Blocks starting before this line are hidden (`clear`). */
   clearedBefore: number
 }
 
@@ -44,13 +45,12 @@ function update(k: string, f: (cur: PaneBlocks) => PaneBlocks): void {
   const next = f(cur)
   if (next === cur) return
   panes.set(k, next)
-  const set = subs.get(k)
-  if (set) for (const cb of set) cb()
+  notifyListeners(subs, k)
 }
 
 function insertSorted(list: readonly BlockInfo[], block: BlockInfo): BlockInfo[] {
   const out = list.filter((b) => b.id !== block.id)
-  let i = out.findIndex((b) => b.start_seq > block.start_seq)
+  let i = out.findIndex((b) => b.start_line > block.start_line)
   if (i < 0) i = out.length
   out.splice(i, 0, block)
   return out
@@ -68,10 +68,10 @@ export function ringBell(hostId: HostId, paneId: string): void {
   update(key(hostId, paneId), (cur) => ({ ...cur, bells: cur.bells + 1 }))
 }
 
-/** `clear`: hide every block that started before `seq`. The bytes stay
- * in the stream (search, replay); only the list forgets them. */
-export function clearBefore(hostId: HostId, paneId: string, seq: number): void {
-  update(key(hostId, paneId), (cur) => ({ ...cur, clearedBefore: Math.max(cur.clearedBefore, seq) }))
+/** `clear`: hide every block that started before `line`. The rows stay
+ * in the daemon (search, history); only the list forgets them. */
+export function clearBefore(hostId: HostId, paneId: string, line: number): void {
+  update(key(hostId, paneId), (cur) => ({ ...cur, clearedBefore: Math.max(cur.clearedBefore, line) }))
 }
 
 export function setExited(hostId: HostId, paneId: string): void {
@@ -83,17 +83,7 @@ export function getPaneBlocks(hostId: HostId, paneId: string): PaneBlocks {
 }
 
 export function subscribe(hostId: HostId, paneId: string, cb: () => void): () => void {
-  const k = key(hostId, paneId)
-  let set = subs.get(k)
-  if (!set) {
-    set = new Set()
-    subs.set(k, set)
-  }
-  set.add(cb)
-  return () => {
-    set?.delete(cb)
-    if (set?.size === 0) subs.delete(k)
-  }
+  return addListener(subs, key(hostId, paneId), cb)
 }
 
 /** React hook: the pane's block table, re-rendering on change. */
@@ -119,7 +109,7 @@ export function ensureLoaded(hostId: HostId, paneId: string): Promise<void> {
     .then((res) => {
       update(k, (cur) => {
         if (res.status !== 'ok') return { ...cur, loaded: true }
-        let blocks: BlockInfo[] = [...res.data].sort((a, b) => a.start_seq - b.start_seq)
+        let blocks: BlockInfo[] = [...res.data].sort((a, b) => a.start_line - b.start_line)
         for (const live of cur.blocks) blocks = insertSorted(blocks, live)
         return { ...cur, blocks, loaded: true }
       })
@@ -134,33 +124,38 @@ export function dropHost(hostId: HostId): void {
   for (const k of [...panes.keys()]) {
     if (k.startsWith(prefix)) {
       panes.delete(k)
-      const set = subs.get(k)
-      if (set) for (const cb of set) cb()
+      notifyListeners(subs, k)
     }
   }
 }
 
 /** A block whose command has been accepted but not finished. */
 export function isRunning(b: BlockInfo): boolean {
-  return b.cmd_seq !== null && b.end_seq === null
+  return b.cmd_line !== null && b.end_line === null
 }
 
-/** Where a block's *output* starts in the stream: after the prompt and
- * the echoed command when the markers were seen, else the block start. */
-export function bodyStartSeq(b: BlockInfo): number {
-  return b.output_seq ?? b.cmd_seq ?? b.start_seq
+/** Where a block's *output* starts: the line after the prompt and the
+ * echoed command when the markers were seen, else the block start. */
+export function bodyStartLine(b: BlockInfo): number {
+  return b.output_line ?? b.cmd_line ?? b.start_line
+}
+
+/** A block's output rows, `[bodyStart, end)`; empty while running. */
+export function blockRange(b: BlockInfo): [number, number] {
+  const start = bodyStartLine(b)
+  return [start, b.end_line ?? start]
 }
 
 /** Finished blocks with something to show (a command line or output). */
 export function isRenderable(b: BlockInfo): boolean {
-  if (b.end_seq === null) return false
-  return (b.cmdline !== null && b.cmdline !== '') || b.end_seq > bodyStartSeq(b)
+  if (b.end_line === null) return false
+  return (b.cmdline !== null && b.cmdline !== '') || b.end_line > bodyStartLine(b)
 }
 
 /** The most recently finished block, without copying the list. */
 export function lastFinished(blocks: readonly BlockInfo[]): BlockInfo | undefined {
   for (let i = blocks.length - 1; i >= 0; i--) {
-    if (blocks[i].end_seq !== null) return blocks[i]
+    if (blocks[i].end_line !== null) return blocks[i]
   }
   return undefined
 }
@@ -175,7 +170,8 @@ export interface PendingJump {
   hostId: HostId
   paneId: string
   blockId: string | null
-  lineSeq: number
+  /** Absolute line to scroll to. */
+  line: number
 }
 
 let pendingJump: PendingJump | null = null

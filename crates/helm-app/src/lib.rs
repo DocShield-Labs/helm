@@ -22,7 +22,44 @@ use tauri_specta::{collect_commands, Builder};
 /// Both `run()` and `export_bindings()` start from this so the bindings can't
 /// drift out of sync with what the runtime actually exposes.
 fn specta_builder() -> Builder<tauri::Wry> {
-    Builder::<tauri::Wry>::new().commands(collect_commands![
+    use std::collections::BTreeMap;
+    use helm_proto::{attrs, modes};
+    Builder::<tauri::Wry>::new()
+        // Wire bit layouts the frontend must agree on, generated into
+        // bindings.ts so they can't drift from helm-proto.
+        .constant(
+            "ATTRS",
+            BTreeMap::from([
+                ("BOLD", attrs::BOLD),
+                ("DIM", attrs::DIM),
+                ("ITALIC", attrs::ITALIC),
+                ("UNDERLINE", attrs::UNDERLINE),
+                ("INVERSE", attrs::INVERSE),
+                ("STRIKE", attrs::STRIKE),
+                ("HIDDEN", attrs::HIDDEN),
+                ("DOUBLE_UNDERLINE", attrs::DOUBLE_UNDERLINE),
+                ("UNDERCURL", attrs::UNDERCURL),
+            ]),
+        )
+        .constant(
+            "MODES",
+            BTreeMap::from([
+                ("APP_CURSOR", modes::APP_CURSOR),
+                ("APP_KEYPAD", modes::APP_KEYPAD),
+                ("BRACKETED_PASTE", modes::BRACKETED_PASTE),
+                ("FOCUS_IN_OUT", modes::FOCUS_IN_OUT),
+                ("MOUSE_CLICK", modes::MOUSE_CLICK),
+                ("MOUSE_DRAG", modes::MOUSE_DRAG),
+                ("MOUSE_MOTION", modes::MOUSE_MOTION),
+                ("SGR_MOUSE", modes::SGR_MOUSE),
+                ("UTF8_MOUSE", modes::UTF8_MOUSE),
+                ("ALT_SCREEN", modes::ALT_SCREEN),
+                ("ALTERNATE_SCROLL", modes::ALTERNATE_SCROLL),
+            ]),
+        )
+        .constant("TRUECOLOR_FLAG", connection::TRUECOLOR_FLAG)
+        .constant("MAX_HISTORY_PAGE", helm_proto::MAX_HISTORY_PAGE)
+        .commands(collect_commands![
         commands::host::ping,
         commands::host::host_list,
         commands::host::host_local_id,
@@ -37,7 +74,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::session::session_tree,
         commands::session::session_input,
         commands::session::session_resize,
-        commands::session::session_replay,
+        commands::session::session_screen,
+        commands::session::session_history,
         commands::session::workspace_new,
         commands::session::workspace_kill,
         commands::session::workspace_rename,

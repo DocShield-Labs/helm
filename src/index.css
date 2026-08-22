@@ -105,7 +105,7 @@ button:not(:disabled),
   padding: 0 16px;
   font-family: var(--font-mono);
   font-size: 13px;
-  line-height: 20px;
+  line-height: var(--helm-line-px);
   color: var(--text-primary);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -115,10 +115,24 @@ button:not(:disabled),
   padding: 10px 16px 0;
   font-family: var(--font-mono);
   font-size: 13px;
-  line-height: 20px;
+  line-height: var(--helm-line-px);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: var(--text-primary);
+}
+/* Rows the running command has scrolled out, above the live grid. */
+.helm-tail {
+  padding-bottom: 4px;
+}
+/* Rows are grouped so the browser skips laying out what's off-screen. */
+.helm-rows-chunk {
+  content-visibility: auto;
+}
+.helm-line {
+  min-height: var(--helm-line-px);
+}
+.helm-sentinel {
+  height: 1px;
 }
 .helm-block-failed {
   background: var(--terminal-failed-10);
@@ -173,7 +187,7 @@ button:not(:disabled),
   border: 0;
   outline: 0;
   background: transparent;
-  padding: 8px 12px 2px;
+  padding: 6px 12px var(--helm-line-px);
   font-family: var(--font-mono);
   font-size: 13px;
   line-height: 20px;

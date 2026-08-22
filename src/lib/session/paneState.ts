@@ -70,12 +70,12 @@ export function agentPromptOf(cmdline: string | null | undefined): string | null
 
 export function derivePaneState(pb: PaneBlocks, spawnedCommand: string | null): PaneState {
   const last = pb.blocks.length > 0 ? pb.blocks[pb.blocks.length - 1] : undefined
-  const running = last && last.cmd_seq !== null && last.end_seq === null ? last : null
+  const running = last && last.cmd_line !== null && last.end_line === null ? last : null
   const program = running ? commandName(running.cmdline) : spawnedCommand
   const kind: PaneKind = isAgentCommand(program) ? 'agent' : 'shell'
   if (pb.altScreen) return { phase: 'alt', kind, current: running }
   if (!pb.loaded || pb.exited || !last) return { phase: 'raw', kind, current: null }
-  if (last.end_seq === null && last.cmd_seq === null) {
+  if (last.end_line === null && last.cmd_line === null) {
     return { phase: 'prompt', kind: 'shell', current: null }
   }
   return { phase: 'running', kind, current: running }

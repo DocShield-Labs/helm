@@ -86,10 +86,6 @@ pub struct StreamParser {
     /// Bytes of the in-flight sequence, *including* its ESC introducer,
     /// so a flush-through reproduces the input exactly.
     seq_buf: Vec<u8>,
-    /// Stripper mode: drop every escape sequence (and `\r`) instead of
-    /// passing non-133 ones through. Backs `strip_ansi`, so "what is an
-    /// escape sequence" is decided by exactly one state machine.
-    strip: bool,
 }
 
 impl Default for StreamParser {
@@ -103,24 +99,12 @@ impl StreamParser {
         Self {
             state: State::Ground,
             seq_buf: Vec::new(),
-            strip: false,
         }
     }
 
-    /// A parser that drops all escape sequences (see `strip_ansi`).
-    pub fn stripper() -> Self {
-        Self {
-            state: State::Ground,
-            seq_buf: Vec::new(),
-            strip: true,
-        }
-    }
-
-    /// Emit a completed pass-through sequence (or drop it in strip mode).
+    /// Emit a completed pass-through sequence.
     fn flush_seq(&mut self, out: &mut Vec<u8>) {
-        if !self.strip {
-            out.extend_from_slice(&self.seq_buf);
-        }
+        out.extend_from_slice(&self.seq_buf);
         self.seq_buf.clear();
     }
 
@@ -150,7 +134,6 @@ impl StreamParser {
                     offset: out.len(),
                     event: IngestEvent::Bell,
                 }),
-                b'\r' if self.strip => {}
                 _ => out.push(b),
             },
 
@@ -173,9 +156,7 @@ impl StreamParser {
                 }
                 0x1b => {
                     // ESC ESC: emit the first, stay in Esc for the second.
-                    if !self.strip {
-                        out.push(0x1b);
-                    }
+                    out.push(0x1b);
                     // seq_buf holds one ESC already; keep it for the new one.
                 }
                 _ => {
@@ -295,7 +276,7 @@ impl StreamParser {
                 offset: out.len(),
                 event: IngestEvent::Notify(String::from_utf8_lossy(text).into_owned()),
             });
-        } else if !self.strip {
+        } else {
             out.extend_from_slice(&self.seq_buf);
             if bel_terminated {
                 out.push(0x07);
@@ -304,18 +285,6 @@ impl StreamParser {
         self.seq_buf.clear();
         self.state = State::Ground;
     }
-}
-
-/// Printable text of `bytes` with every escape sequence, bell, and `\r`
-/// removed — for search indexing and notification previews. Same state
-/// machine as the ingest parser, so the two never disagree about where
-/// a sequence ends. UTF-8 is preserved (lossy only on invalid bytes).
-pub fn strip_ansi(bytes: &[u8]) -> String {
-    let mut p = StreamParser::stripper();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut events = Vec::new();
-    p.feed(bytes, &mut out, &mut events);
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `CSI ? 1049 h/l` (and legacy 47 / 1047) → Some(entering).
@@ -541,14 +510,6 @@ mod tests {
         }
         assert_eq!(out, whole_out);
         assert_eq!(events, whole_events);
-    }
-
-    #[test]
-    fn strip_ansi_drops_sequences_keeps_utf8() {
-        assert_eq!(strip_ansi(b"\x1b[31mr\xc3\xa9d\x1b[0m ok\r\n"), "r\u{e9}d ok\n");
-        assert_eq!(strip_ansi(b"\x1b]8;;http://x\x07link\x1b]8;;\x07"), "link");
-        assert_eq!(strip_ansi(b"a\x1bkTITLE\x1b\\b\x1b7c\x07d"), "abcd");
-        assert_eq!(strip_ansi(b"\x1bPq#0\x1b\\tail"), "tail");
     }
 
     #[test]
