@@ -235,11 +235,10 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   } catch {
     /* no WebGL2 — xterm falls back to its DOM renderer automatically */
   }
-  try {
-    fit.fit()
-  } catch {
-    /* terminal not visible yet */
-  }
+  // The first fit waits for the first render (below): fit() → term.resize
+  // → syncScrollArea reads `renderer.dimensions`, which is undefined until
+  // the renderer has painted — and loading the WebGL addon above swaps the
+  // renderer, so a fit here throws an (async, uncatchable) TypeError.
 
   // Cached cell dimensions in pixels. Measure from `.xterm-screen / rows`
   // (and cols) — that's xterm's internal layout, not CSS line-height,
@@ -256,28 +255,17 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   const linePx = domLinePx()
   let cachedCellH = linePx
   let cachedCellW = 8
-  let screenObserved: HTMLElement | null = null
-  const measureCellSize = () => {
+  // Pure measurement: read the rendered cell into the cache. NEVER
+  // mutates layout — an observer that resized what it observes would
+  // loop. Returns the measured cell height, or 0 if nothing's laid out.
+  const measureCellSize = (): number => {
     const screen = host.querySelector('.xterm-screen') as HTMLElement | null
-    if (screen && screen !== screenObserved) {
-      ro.observe(screen)
-      screenObserved = screen
-    }
     if (screen && term.rows > 0 && term.cols > 0) {
       const rect = screen.getBoundingClientRect()
-      if (rect.height > 0) cachedCellH = rect.height / term.rows
-      if (rect.width > 0) cachedCellW = rect.width / term.cols
       if (rect.height > 0) {
-        const lh = correctedLineHeight(cachedCellH, term.options.lineHeight ?? 1, window.devicePixelRatio || 1, linePx)
-        if (lh !== null) {
-          term.options.lineHeight = lh
-          try {
-            fit.fit()
-          } catch {
-            /* not laid out yet */
-          }
-        }
-        return
+        cachedCellH = rect.height / term.rows
+        if (rect.width > 0) cachedCellW = rect.width / term.cols
+        return cachedCellH
       }
     }
     const row = host.querySelector('.xterm-rows > div') as HTMLElement | null
@@ -285,20 +273,55 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       const rect = row.getBoundingClientRect()
       if (rect.height > 0) cachedCellH = rect.height
       if (rect.width > 0 && term.cols > 0) cachedCellW = rect.width / term.cols
+      return cachedCellH
     }
+    return 0
   }
-  // Re-measure on host resize (font-size or DPR changes), whenever
-  // xterm resizes its screen element (a font settling, our own
-  // lineHeight correction), and once on the first xterm render (covers
-  // the WebGL post-init race where the screen element settles to its
-  // final dimensions a tick after `term.open`). All feed the same cache
-  // so consumers stay in sync; nothing measures on the wheel/hover/
-  // render hot paths.
-  const ro = new ResizeObserver(measureCellSize)
+
+  // Make xterm's cell exactly `--helm-line-px` tall (see cellHeight.ts).
+  // A bounded one-shot, decoupled from the ResizeObserver: each pass
+  // measures, and if the cell is off, sets the lineHeight that fixes it
+  // and refits — which resizes the screen, so we re-check on the next
+  // frame. Capped so a font that never lands on an exact device pixel
+  // can't loop; whatever cell we have after that is what the band uses.
+  let corrections = 0
+  const correctLineHeight = () => {
+    const measured = measureCellSize()
+    if (measured <= 0) {
+      if (corrections < 8) {
+        corrections++
+        requestAnimationFrame(correctLineHeight)
+      }
+      return
+    }
+    const lh = correctedLineHeight(measured, term.options.lineHeight ?? 1, window.devicePixelRatio || 1, linePx)
+    if (lh === null || corrections >= 4) return
+    corrections++
+    term.options.lineHeight = lh
+    try {
+      fit.fit()
+    } catch {
+      /* not laid out yet */
+    }
+    requestAnimationFrame(correctLineHeight)
+  }
+
+  // Re-measure (cache only) on host resize — font-size or DPR changes.
+  const ro = new ResizeObserver(() => measureCellSize())
   ro.observe(host)
-  measureCellSize()
+  // Start the lineHeight correction only once xterm has actually
+  // rendered: fit()/syncScrollArea read `renderer.dimensions`, which is
+  // undefined until the first paint (throws otherwise), and the screen
+  // element only settles a tick after `term.open` anyway.
   let firstRender: { dispose(): void } | null = term.onRender(() => {
-    measureCellSize()
+    // Renderer has painted now — `dimensions` is populated, so fit() is
+    // safe. Size to the viewport, then correct the cell height.
+    try {
+      fit.fit()
+    } catch {
+      /* not laid out yet */
+    }
+    correctLineHeight()
     firstRender?.dispose()
     firstRender = null
   })
