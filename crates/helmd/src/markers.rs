@@ -24,6 +24,9 @@ pub enum Osc133 {
     PromptStart {
         cwd: Option<String>,
         branch: Option<String>,
+        /// Git toplevel of `cwd` (a worktree's own root); `None`
+        /// outside a repo or from an older shim that doesn't send it.
+        root: Option<String>,
     },
     /// `B` — command line accepted.
     CommandStart { cmdline: Option<String> },
@@ -331,6 +334,7 @@ fn parse_osc133(body: &[u8]) -> Option<Osc133> {
         b'A' => Some(Osc133::PromptStart {
             cwd: b64_field(rest, "cwd_b64"),
             branch: b64_field(rest, "branch_b64"),
+            root: b64_field(rest, "root_b64"),
         }),
         b'B' => Some(Osc133::CommandStart {
             cmdline: b64_field(rest, "cmdline_b64"),
@@ -372,9 +376,10 @@ mod tests {
     #[test]
     fn osc133_markers_stripped_and_parsed() {
         let input = format!(
-            "\x1b]133;A;cwd_b64={};branch_b64={}\x07before\x1b]133;B;cmdline_b64={}\x07\x1b]133;C\x07out\x1b]133;D;1\x07",
-            b64("/Users/x/code"),
+            "\x1b]133;A;cwd_b64={};branch_b64={};root_b64={}\x07before\x1b]133;B;cmdline_b64={}\x07\x1b]133;C\x07out\x1b]133;D;1\x07",
+            b64("/Users/x/code/src"),
             b64("main"),
+            b64("/Users/x/code"),
             b64("cargo test"),
         );
         let (out, events) = run_whole(input.as_bytes());
@@ -383,8 +388,9 @@ mod tests {
         assert_eq!(
             events[0].event,
             IngestEvent::Marker(Osc133::PromptStart {
-                cwd: Some("/Users/x/code".into()),
+                cwd: Some("/Users/x/code/src".into()),
                 branch: Some("main".into()),
+                root: Some("/Users/x/code".into()),
             })
         );
         assert_eq!(events[0].offset, 0);

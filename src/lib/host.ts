@@ -143,7 +143,7 @@ function handleSessionEvent(hostId: HostId, ev: SessionEvent): void {
         store.markPaneIdle(hostId, ev.pane_id)
       }
       if (b.cwd !== null) {
-        store.updatePaneCwd(hostId, ev.pane_id, b.cwd, b.branch ?? '')
+        store.updatePaneCwd(hostId, ev.pane_id, b.cwd, b.branch ?? '', b.root ?? '')
       }
       return
     }

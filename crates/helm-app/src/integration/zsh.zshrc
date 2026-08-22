@@ -70,12 +70,16 @@ __helm_precmd() {
     fi
 
     local cwd="$PWD"
-    local branch
+    local branch root
     branch=$(command git symbolic-ref --short HEAD 2>/dev/null)
-    local cwd_b64 branch_b64
+    # The repo root (a worktree's own root): the sidebar groups
+    # sessions by it. Empty outside a repo.
+    root=$(command git rev-parse --show-toplevel 2>/dev/null)
+    local cwd_b64 branch_b64 root_b64
     cwd_b64=$(__helm_b64 "$cwd")
     branch_b64=$(__helm_b64 "$branch")
-    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
+    root_b64=$(__helm_b64 "$root")
+    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64};root_b64=${root_b64}"
 }
 
 __helm_preexec() {

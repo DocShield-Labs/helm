@@ -28,7 +28,7 @@ pub mod client;
 /// as a different variant entirely. The app treats any non-`HelloAck`
 /// first message as a stale daemon for that reason — don't rely on the
 /// rejection text surviving a version gap.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Upper bound on a single frame. History pages are capped well below
 /// this; the cap exists so a corrupt length prefix fails fast instead
@@ -394,6 +394,9 @@ pub struct PaneInfo {
     pub alt_screen: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd` (a worktree's own root); `None` outside a
+    /// repo. The sidebar groups sessions by it.
+    pub root: Option<String>,
     /// Foreground command name if known ("claude", "cargo", …).
     pub command: Option<String>,
 }
@@ -412,6 +415,8 @@ pub struct BlockMeta {
     pub cmdline: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd` at the prompt; `None` outside a repo.
+    pub root: Option<String>,
     pub exit_code: Option<i32>,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
@@ -675,6 +680,7 @@ mod tests {
                     cmdline: Some("cargo build --release".into()),
                     cwd: Some("/Users/x/code".into()),
                     branch: Some("main".into()),
+                    root: None,
                     exit_code: Some(0),
                     started_at_ms: Some(1_700_000_000_000),
                     finished_at_ms: Some(1_700_000_042_100),

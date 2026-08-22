@@ -46,6 +46,9 @@ export interface TmuxPane {
    * directory isn't a git repo or git is unavailable). Refreshes on the
    * same cadence as cwd. */
   branch: string
+  /** Git toplevel of `cwd` (a worktree's own root) at the last refetch;
+   * empty outside a repo. The sidebar groups sessions by it. */
+  root: string
 }
 
 export interface TmuxWorkspace {
@@ -252,7 +255,7 @@ interface HelmState {
    * block events (each prompt reports cwd/branch) so the sidebar's
    * folder grouping reflects user `cd`s live. No-op when the pane
    * isn't in the tree yet. */
-  updatePaneCwd: (host: HostId, paneId: string, cwd: string, branch: string) => void
+  updatePaneCwd: (host: HostId, paneId: string, cwd: string, branch: string, root: string) => void
   /** Toggle whether a workspace's window list is visible. */
   toggleWorkspaceCollapsed: (host: HostId, workspaceId: string) => void
 
@@ -820,7 +823,7 @@ export const useStore = create<HelmState>((set, get) => ({
       ),
     })),
 
-  updatePaneCwd: (host, paneId, cwd, branch) =>
+  updatePaneCwd: (host, paneId, cwd, branch, root) =>
     set((s) => {
       const hs = s.sessions.get(host)
       if (!hs) return {}
@@ -836,14 +839,14 @@ export const useStore = create<HelmState>((set, get) => ({
       // Skip the re-render if nothing actually changed — `prompt_start`
       // fires on every prompt redraw, so the same cwd+branch arrives
       // many times in a row inside one folder.
-      if (prev.cwd === cwd && prev.branch === branch) return {}
+      if (prev.cwd === cwd && prev.branch === branch && prev.root === root) return {}
       return {
         sessions: withHostSessions(s.sessions, host, (cur) =>
           withWorkspace(cur, targetWsId!, (w) => {
             const next = new Map(w.panes)
             const p = next.get(paneId)
             if (!p) return w
-            next.set(paneId, { ...p, cwd, branch })
+            next.set(paneId, { ...p, cwd, branch, root })
             return { ...w, panes: next }
           }),
         ),

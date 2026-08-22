@@ -597,7 +597,7 @@ impl Daemon {
 /// broadcast, if any changed.
 fn update_blocks(meta: &mut PaneMeta, line: u64, marker: Osc133) -> Option<BlockMeta> {
     match marker {
-        Osc133::PromptStart { cwd, branch } => {
+        Osc133::PromptStart { cwd, branch, root } => {
             // Close a dangling block (its D never arrived).
             if let Some(idx) = meta.open_block.take() {
                 if meta.blocks[idx].end_line.is_none() {
@@ -608,6 +608,7 @@ fn update_blocks(meta: &mut PaneMeta, line: u64, marker: Osc133) -> Option<Block
                 meta.cwd = cwd.clone();
             }
             meta.branch = branch.clone();
+            meta.root = root.clone();
             let block = BlockMeta {
                 id: BlockId(meta.next_block_id),
                 start_line: line,
@@ -617,6 +618,7 @@ fn update_blocks(meta: &mut PaneMeta, line: u64, marker: Osc133) -> Option<Block
                 cmdline: None,
                 cwd,
                 branch,
+                root,
                 exit_code: None,
                 started_at_ms: None,
                 finished_at_ms: None,
@@ -711,6 +713,7 @@ fn snapshot(core: &Core) -> TreeSnapshot {
                                     alt_screen: meta.alt_screen,
                                     cwd: meta.cwd.clone(),
                                     branch: meta.branch.clone(),
+                                    root: meta.root.clone(),
                                     command: meta.command.clone(),
                                 }
                             })
@@ -751,7 +754,7 @@ mod tests {
         let b = update_blocks(
             &mut meta,
             10,
-            Osc133::PromptStart { cwd: Some("/x".into()), branch: Some("main".into()) },
+            Osc133::PromptStart { cwd: Some("/x".into()), branch: Some("main".into()), root: Some("/x".into()) },
         )
         .unwrap();
         assert_eq!(b.start_line, 10);
@@ -767,7 +770,7 @@ mod tests {
         assert!(meta.open_block.is_none());
 
         // Next prompt opens a fresh block.
-        let b2 = update_blocks(&mut meta, 40, Osc133::PromptStart { cwd: None, branch: None }).unwrap();
+        let b2 = update_blocks(&mut meta, 40, Osc133::PromptStart { cwd: None, branch: None, root: None }).unwrap();
         assert_eq!(b2.id, BlockId(1));
         assert_eq!(meta.blocks.len(), 2);
     }
@@ -775,10 +778,10 @@ mod tests {
     #[test]
     fn dangling_block_closed_by_next_prompt() {
         let mut meta = PaneMeta::default();
-        update_blocks(&mut meta, 0, Osc133::PromptStart { cwd: None, branch: None });
+        update_blocks(&mut meta, 0, Osc133::PromptStart { cwd: None, branch: None, root: None });
         update_blocks(&mut meta, 1, Osc133::CommandStart { cmdline: Some("vim".into()) });
         // No D (shell died mid-command); next A closes it.
-        update_blocks(&mut meta, 50, Osc133::PromptStart { cwd: None, branch: None });
+        update_blocks(&mut meta, 50, Osc133::PromptStart { cwd: None, branch: None, root: None });
         assert_eq!(meta.blocks[0].end_line, Some(50));
         assert_eq!(meta.blocks[0].exit_code, None);
     }

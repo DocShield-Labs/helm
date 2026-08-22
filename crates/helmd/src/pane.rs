@@ -42,6 +42,8 @@ pub struct PaneMeta {
     pub alt_screen: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd`, from the last prompt; `None` outside a repo.
+    pub root: Option<String>,
     /// argv[0] basename of what was spawned ("zsh", "claude", …).
     pub command: Option<String>,
     pub blocks: Vec<BlockMeta>,

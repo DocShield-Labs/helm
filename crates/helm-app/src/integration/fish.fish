@@ -38,9 +38,12 @@ function __helm_precmd --on-event fish_prompt
 
     set -l cwd $PWD
     set -l branch (command git symbolic-ref --short HEAD 2>/dev/null)
+    # The repo root: the sidebar groups sessions by it. Empty outside a repo.
+    set -l root (command git rev-parse --show-toplevel 2>/dev/null)
     set -l cwd_b64 (__helm_b64 $cwd)
     set -l branch_b64 (__helm_b64 "$branch")
-    __helm_emit "A;cwd_b64=$cwd_b64;branch_b64=$branch_b64"
+    set -l root_b64 (__helm_b64 "$root")
+    __helm_emit "A;cwd_b64=$cwd_b64;branch_b64=$branch_b64;root_b64=$root_b64"
 
     # Top pad: leave A's row blank, push header onto the next row.
     echo

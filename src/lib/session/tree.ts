@@ -21,6 +21,7 @@ export function treeToWorkspaces(tree: SessionTree): TmuxWorkspace[] {
           command: p.command ?? '',
           cwd: p.cwd ?? '',
           branch: p.branch ?? '',
+          root: p.root ?? '',
         })
       }
     }

@@ -47,11 +47,14 @@ __helm_precmd() {
     __helm_pending_cmdline=""
 
     local cwd="$PWD"
-    local branch
+    local branch root
     branch=$(command git symbolic-ref --short HEAD 2>/dev/null)
-    local cwd_b64 branch_b64
+    # The repo root: the sidebar groups sessions by it. Empty outside a repo.
+    root=$(command git rev-parse --show-toplevel 2>/dev/null)
+    local cwd_b64 branch_b64 root_b64
     cwd_b64=$(__helm_b64 "$cwd")
     branch_b64=$(__helm_b64 "$branch")
+    root_b64=$(__helm_b64 "$root")
     # Two blank rows of breathing room ABOVE A so they sit in the gap
     # between blocks (no block owns them). Putting them BEFORE A means
     # A captures the row where the cwd · branch header is about to
@@ -60,7 +63,7 @@ __helm_precmd() {
     # math single-row anchored.
     echo
     echo
-    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
+    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64};root_b64=${root_b64}"
     if [ -z "$HELM_KEEP_PROMPT" ]; then
         local cwd_pretty="${PWD/#$HOME/~}"
         if [ -n "$branch" ]; then

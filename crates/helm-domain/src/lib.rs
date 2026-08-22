@@ -90,6 +90,9 @@ pub struct PaneInfo {
     pub alt_screen: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd` (a worktree's own root); `None` outside a
+    /// repo. The sidebar groups sessions by it.
+    pub root: Option<String>,
     /// argv[0] basename of what was spawned, when not the default shell.
     pub command: Option<String>,
 }
@@ -176,6 +179,8 @@ pub struct BlockInfo {
     pub cmdline: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd` at the prompt; `None` outside a repo.
+    pub root: Option<String>,
     pub exit_code: Option<i32>,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,

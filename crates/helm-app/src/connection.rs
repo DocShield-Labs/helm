@@ -738,6 +738,7 @@ pub(crate) fn to_domain_tree(t: &TreeSnapshot) -> SessionTree {
                                 alt_screen: p.alt_screen,
                                 cwd: p.cwd.clone(),
                                 branch: p.branch.clone(),
+                                root: p.root.clone(),
                                 command: p.command.clone(),
                             })
                             .collect(),
@@ -758,6 +759,7 @@ pub(crate) fn to_domain_block(b: &helm_proto::BlockMeta) -> BlockInfo {
         cmdline: b.cmdline.clone(),
         cwd: b.cwd.clone(),
         branch: b.branch.clone(),
+        root: b.root.clone(),
         exit_code: b.exit_code,
         started_at_ms: b.started_at_ms,
         finished_at_ms: b.finished_at_ms,
