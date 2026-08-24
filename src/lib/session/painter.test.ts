@@ -1,7 +1,18 @@
 import { describe, expect, test } from 'bun:test'
 import { ATTRS, MODES, TRUECOLOR_FLAG } from '@bindings'
 import type { RowInfo } from '@bindings'
-import { cursorSequence, diffSequence, modesSequence, rowSequence, screenSequence, spanSgr } from './painter'
+import type { Terminal } from '@xterm/xterm'
+import { applyDiff, applyScreen } from './screen'
+import {
+  attachPainter,
+  clampCursor,
+  cursorSequence,
+  diffSequence,
+  modesSequence,
+  rowSequence,
+  screenSequence,
+  spanSgr,
+} from './painter'
 
 const ESC = '\x1b'
 
@@ -49,6 +60,12 @@ describe('painter', () => {
     )
   })
 
+  test('clampCursor keeps stale resize frames inside the current grid', () => {
+    const cursor = { row: 37, col: 143, visible: true, shape: 'beam' as const, blink: true }
+    expect(clampCursor(cursor, 120, 28)).toEqual({ ...cursor, row: 27, col: 119 })
+    expect(clampCursor(cursor, 144, 38)).toEqual(cursor)
+  })
+
   test('screenSequence paints every row then the cursor', () => {
     const s = screenSequence(
       [row([{ text: 'hi', fg: -1, bg: -1, attrs: 0, link: null }]), row([])],
@@ -72,5 +89,61 @@ describe('painter', () => {
     expect(s).toBe(
       `${ESC}[?25l${ESC}[2S${ESC}[6;1H${ESC}[0mz${ESC}[0m${ESC}[K${ESC}[6;2H${ESC}[4 q${ESC}[?25h`,
     )
+  })
+
+  test('a skipped diff recovers with an authoritative full repaint', () => {
+    const writes: string[] = []
+    const term = {
+      cols: 4,
+      rows: 2,
+      write(data: string, callback?: () => void) {
+        writes.push(data)
+        callback?.()
+      },
+    } as unknown as Terminal
+    let visible = false
+    applyScreen('paint-host', 'paint-session', {
+      cols: 4,
+      rows: 2,
+      top_line: 0,
+      history_start: 0,
+      lines: [row([{ text: 'old', fg: -1, bg: -1, attrs: 0, link: null }]), row([])],
+      cursor: { row: 1, col: 0, visible: true, shape: 'block', blink: false },
+      modes: 0,
+    })
+    const painter = attachPainter(term, 'paint-host', 'paint-session', () => visible)
+    visible = true
+    applyDiff(
+      'paint-host',
+      'paint-session',
+      0,
+      0,
+      [{ index: 1, row: row([{ text: 'new', fg: -1, bg: -1, attrs: 0, link: null }]) }],
+      { row: 1, col: 3, visible: true, shape: 'block', blink: false },
+      0,
+    )
+    expect(writes).toHaveLength(1)
+    expect(writes[0]).toContain('old')
+    expect(writes[0]).toContain('new')
+    painter.dispose()
+  })
+
+  test('a queued resize cannot run after painter disposal', () => {
+    const callbacks: Array<() => void> = []
+    const term = {
+      cols: 4,
+      rows: 2,
+      write(_data: string, callback?: () => void) {
+        if (callback) callbacks.push(callback)
+      },
+    } as unknown as Terminal
+    const painter = attachPainter(term, 'dispose-host', 'dispose-session', () => false)
+    let resized = false
+    painter.resizeAndRepaint(() => {
+      resized = true
+    })
+    painter.dispose()
+    callbacks.forEach((callback) => callback())
+    expect(resized).toBe(false)
   })
 })

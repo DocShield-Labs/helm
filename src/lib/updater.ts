@@ -7,8 +7,10 @@
  * bar renders an "update available" segment — nothing installs without
  * a click, so a live SSH session is never yanked out from under the
  * user by a surprise relaunch. Install = download + verify signature +
- * swap the .app + relaunch; helmd (local and remote) survives the
- * restart, so sessions reattach exactly where they were.
+ * swap the .app + relaunch. Protocol 7 is Helm's permanent compatibility
+ * baseline, so local and remote helmd processes survive the restart and
+ * sessions reattach exactly where they were. A future parallel protocol
+ * must retain the protocol-7 adapter while old sessions drain.
  *
  * Check failures (offline, rate-limited, endpoint missing) are
  * intentionally silent — a personal terminal app shouldn't nag about

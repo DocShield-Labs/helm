@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use helm_proto::{
     BlockId, BlockMeta, DaemonMsg, Notification, NotificationId, NotificationKind, PathCompletion,
@@ -55,6 +55,7 @@ struct Core {
     sessions: HashMap<SessionId, Arc<Session>>,
     clients: HashMap<ClientId, ClientHandle>,
     pending: Vec<Notification>,
+    draining: bool,
 }
 
 pub struct Daemon {
@@ -66,6 +67,7 @@ pub struct Daemon {
     next_client: AtomicU64,
     next_notification: AtomicU64,
     completion_slots: Arc<Semaphore>,
+    shutdown: Notify,
 }
 
 fn now_ms() -> u64 {
@@ -88,6 +90,7 @@ impl Daemon {
             next_client: AtomicU64::new(1),
             next_notification: AtomicU64::new(1),
             completion_slots: Arc::new(Semaphore::new(4)),
+            shutdown: Notify::new(),
         });
         (daemon, events_rx)
     }
@@ -127,6 +130,26 @@ impl Daemon {
     pub fn attach(&self, client: ClientId) {
         if let Some(h) = self.core.lock().clients.get_mut(&client) {
             h.attached = true;
+        }
+    }
+
+    pub fn begin_drain(&self) {
+        let mut core = self.core.lock();
+        core.draining = true;
+        self.shutdown_if_drained_and_empty(&core);
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    pub async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
+    }
+
+    fn shutdown_if_drained_and_empty(&self, core: &Core) {
+        if core.draining && core.sessions.is_empty() {
+            self.shutdown.notify_one();
         }
     }
 
@@ -248,6 +271,10 @@ impl Daemon {
         cwd: Option<String>,
         command: Option<Vec<String>>,
     ) -> Result<SessionId, String> {
+        let mut core = self.core.lock();
+        if core.draining {
+            return Err("daemon is draining; create the session on the current daemon".into());
+        }
         let session_id = SessionId(self.next_session.fetch_add(1, Ordering::Relaxed));
         let spec = SpawnSpec {
             cols: 80,
@@ -256,14 +283,15 @@ impl Daemon {
             command,
             env: integration_env(),
         };
-        let session =
-            Session::spawn(session_id, &spec, self.events_tx.clone()).map_err(|e| e.to_string())?;
+        // Spawn while holding the lifecycle lock so drain, insertion and
+        // a very short-lived child's `Exited` event have one total order.
+        let session = Session::spawn(session_id, &spec, self.events_tx.clone())
+            .map_err(|error| error.to_string())?;
         let session_name = name
             .or_else(|| session.meta.lock().command.clone())
             .unwrap_or_else(|| "shell".to_string());
         *session.name.lock() = session_name;
 
-        let mut core = self.core.lock();
         core.sessions.insert(session_id, session);
         broadcast_tree(&core);
         Ok(session_id)
@@ -277,6 +305,7 @@ impl Daemon {
             .ok_or_else(|| format!("no session {session_id}"))?;
         session.kill();
         broadcast_tree(&core);
+        self.shutdown_if_drained_and_empty(&core);
         Ok(())
     }
 
@@ -456,6 +485,7 @@ impl Daemon {
                 );
                 core.sessions.remove(&session_id);
                 broadcast_tree(&core);
+                self.shutdown_if_drained_and_empty(&core);
             }
         }
     }

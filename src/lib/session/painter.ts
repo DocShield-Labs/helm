@@ -15,7 +15,7 @@ import type { Terminal } from '@xterm/xterm'
 import { ATTRS, MODES } from '@bindings'
 import type { CursorInfo, HostId, RowInfo, SpanInfo } from '@bindings'
 import { colorSgr } from './palette'
-import { getSessionScreen, screenInfoOf, subscribePaint, type PaintEvent } from './screen'
+import { getSessionScreen, subscribePaint, type PaintEvent } from './screen'
 
 const ESC = '\x1b'
 const CSI = `${ESC}[`
@@ -118,6 +118,8 @@ export function screenSequence(
 export interface Painter {
   /** Catch up after being hidden, if anything was missed. */
   repaintIfDirty(): void
+  /** Drain queued writes, resize xterm, then repaint from the daemon mirror. */
+  resizeAndRepaint(resize: () => void): void
   dispose(): void
 }
 
@@ -138,29 +140,91 @@ export function attachPainter(
   // What xterm's modes are right now; each paint transitions them.
   let modes = 0
   let dirty = false
-  const paint = (ev: PaintEvent) => {
-    if (!visible()) {
+  let resizing = false
+  let disposed = false
+  let pendingResize: (() => void) | null = null
+
+  const modelFitsTerminal = () => {
+    const screen = getSessionScreen(hostId, sessionId)
+    return screen.loaded && screen.cols === term.cols && screen.rows === term.rows
+  }
+
+  const repaint = () => {
+    if (disposed) return
+    const screen = getSessionScreen(hostId, sessionId)
+    if (!screen.loaded || screen.cols !== term.cols || screen.rows !== term.rows) {
       dirty = true
+      return
+    }
+    dirty = false
+    term.write(
+      screenSequence(screen.grid, clampCursor(screen.cursor, term.cols, term.rows), screen.modes, modes),
+    )
+    modes = screen.modes
+  }
+
+  const paint = (ev: PaintEvent) => {
+    if (disposed) return
+    if (!visible() || resizing || !modelFitsTerminal()) {
+      dirty = true
+      return
+    }
+    if (dirty) {
+      repaint()
       return
     }
     if (ev.kind === 'screen') {
       const { lines, cursor, modes: next } = ev.screen
-      term.write(screenSequence(lines.slice(0, term.rows), cursor, next, modes))
+      term.write(screenSequence(lines, clampCursor(cursor, term.cols, term.rows), next, modes))
       modes = next
     } else {
       const rows = ev.rows.filter((r) => r.index < term.rows)
-      term.write(diffSequence(rows, ev.cursor, ev.modes, modes, ev.scroll))
+      term.write(
+        diffSequence(rows, clampCursor(ev.cursor, term.cols, term.rows), ev.modes, modes, ev.scroll),
+      )
       modes = ev.modes
     }
   }
+
+  const runResize = () => {
+    if (resizing || !pendingResize) return
+    resizing = true
+    // `write` is asynchronous. An empty write callback is a barrier after
+    // every already-queued synthetic diff, so none can execute against the
+    // new dimensions. Events arriving meanwhile only dirty the mirror.
+    term.write('', () => {
+      if (disposed) return
+      const resize = pendingResize
+      pendingResize = null
+      resize?.()
+      resizing = false
+      repaint()
+      if (pendingResize) runResize()
+    })
+  }
+
   const unsubscribe = subscribePaint(hostId, sessionId, paint)
   return {
     repaintIfDirty() {
       if (!dirty) return
-      dirty = false
-      const s = getSessionScreen(hostId, sessionId)
-      if (s.loaded) paint({ kind: 'screen', screen: screenInfoOf(s) })
+      repaint()
     },
-    dispose: unsubscribe,
+    resizeAndRepaint(resize) {
+      pendingResize = resize
+      runResize()
+    },
+    dispose() {
+      disposed = true
+      pendingResize = null
+      unsubscribe()
+    },
+  }
+}
+
+export function clampCursor(cursor: CursorInfo, cols: number, rows: number): CursorInfo {
+  return {
+    ...cursor,
+    row: Math.max(0, Math.min(rows - 1, cursor.row)),
+    col: Math.max(0, Math.min(cols - 1, cursor.col)),
   }
 }

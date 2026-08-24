@@ -87,10 +87,26 @@ failure mode).
 ### Remote install/upgrade
 
 Reuse the existing base64-over-exec install path (same as integration scripts):
-upload a per-arch static binary to `~/.helm/bin/helmd`, `chmod +x`, version
-handshake on `Hello`; on mismatch, re-upload and restart `serve` (sessions die
-on upgrade — acceptable, same as a tmux server upgrade; later: graceful
-`helmd upgrade` with PTY fd handoff if it ever matters).
+upload a per-arch static binary to `~/.helm/bin/helmd`, `chmod +x`, and verify
+the version before launching it. A running compatible daemon is never replaced.
+
+### Session-safe upgrades
+
+- Protocol 7 is the permanent compatibility baseline. Released enum indices,
+  field layouts, and encodings never change; `helm-proto/tests/wire_compat.rs`
+  enforces the contract and simulates a client skipping directly to protocol 9.
+- New behavior travels through capability-gated extension envelopes. New clients
+  advertise negotiation support in `Hello.client_name`; old daemons ignore the
+  marker, and new daemons only send capability frames to clients that requested
+  them. This keeps both upgrade directions safe.
+- The connection coordinator can put a superseded daemon into
+  `helm.daemon.drain.v1`: it rejects new sessions, continues serving every
+  existing PTY, and exits only after the final session ends. Compatible
+  protocol-7 upgrades simply keep using the old daemon until it becomes empty,
+  then retire it and reconnect to the atomically-installed current binary.
+- A fundamentally incompatible redesign runs as a parallel, versioned protocol
+  and socket. The app retains its protocol-7 adapter and merges legacy sessions
+  until their draining daemon exits; no updater may kill a daemon with sessions.
 
 ## Milestones
 
@@ -304,9 +320,9 @@ styled rows with no ANSI stripping · helmd's raw ring is unnecessary.
 
 Emulation fidelity now rests on alacritty_terminal (complete VT, but
 e.g. sixel is out). Mouse-heavy TUIs depend on the mode flags being
-forwarded faithfully. Protocol bump = daemon restart on upgrade (the
-version handshake already handles it; sessions die, as with any helmd
-upgrade).
+forwarded faithfully. Protocol evolution is constrained by the wire-contract
+and drain tests so upgrades never require killing live sessions. A parallel
+protocol must retain the protocol-7 adapter until its legacy daemon drains.
 
 ## Status
 

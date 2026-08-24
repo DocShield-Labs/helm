@@ -87,6 +87,29 @@ describe('session screen mirror', () => {
     expect(texts(getSessionScreen(H, p), 2, 3)).toEqual([[2, 'x']])
   })
 
+  test('an agent transcript is stable as live rows cross into history', () => {
+    const p = 'agent-resize'
+    applyHistoryAppend(H, p, 0, [r('notice')])
+    applyScreen(H, p, screenOf(1, ['first', 'second', 'footer']))
+    const before = getSessionScreen(H, p)
+    expect(texts(before, 0, before.topLine + agentUsedRows(before))).toEqual([
+      [0, 'notice'],
+      [1, 'first'],
+      [2, 'second'],
+      [3, 'footer'],
+    ])
+
+    applyHistoryAppend(H, p, 1, [r('first')])
+    applyScreen(H, p, screenOf(2, ['second', 'footer']))
+    const after = getSessionScreen(H, p)
+    expect(texts(after, 0, after.topLine + agentUsedRows(after))).toEqual([
+      [0, 'notice'],
+      [1, 'first'],
+      [2, 'second'],
+      [3, 'footer'],
+    ])
+  })
+
   test('an append with a gap does not extend the loaded range, nor move the grid', () => {
     const p = 'p2'
     applyScreen(H, p, screenOf(5, ['', '']))

@@ -43,14 +43,21 @@ pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
     tokio::spawn(daemon.clone().run(events_rx));
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let daemon = daemon.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(daemon, stream).await {
-                tracing::debug!("client ended: {e}");
+        tokio::select! {
+            _ = daemon.shutdown_requested() => break,
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted?;
+                let daemon = daemon.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client(daemon, stream).await {
+                        tracing::debug!("client ended: {e}");
+                    }
+                });
             }
-        });
+        }
     }
+    tracing::info!(socket = %socket_path.display(), "helmd stopped");
+    Ok(())
 }
 
 async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> anyhow::Result<()> {
@@ -136,6 +143,12 @@ fn dispatch(
             }
             tracing::info!("client {client_id} connected: {client_name}");
             let _ = tx.send(daemon.hello_ack(DAEMON_VERSION));
+            if wants_capabilities(&client_name) {
+                let _ = tx.send(DaemonMsg::Capabilities {
+                    compatibility_baseline: helm_proto::COMPATIBILITY_BASELINE,
+                    extensions: vec![helm_proto::extensions::DRAIN.into()],
+                });
+            }
         }
         ClientMsg::Attach => daemon.attach(client_id),
         ClientMsg::Input { session, bytes } => {
@@ -256,9 +269,37 @@ fn dispatch(
         ClientMsg::AckNotifications { up_to } => daemon.ack_notifications(up_to),
         ClientMsg::Shutdown => {
             tracing::info!("shutdown requested by client {client_id}");
-            std::process::exit(0);
+            daemon.request_shutdown();
+        }
+        ClientMsg::Extension {
+            req_id,
+            name,
+            payload,
+        } => {
+            if name == helm_proto::extensions::DRAIN && payload.is_empty() {
+                daemon.begin_drain();
+                let _ = tx.send(DaemonMsg::Extension {
+                    req_id,
+                    name,
+                    payload: Vec::new(),
+                });
+            } else {
+                err(
+                    req_id,
+                    "extension",
+                    format!("unsupported extension {name:?}"),
+                );
+            }
         }
     }
+}
+
+fn wants_capabilities(client_name: &str) -> bool {
+    let marker = helm_proto::CAPABILITIES_MARKER.trim_start_matches("; ");
+    client_name
+        .split(';')
+        .map(str::trim)
+        .any(|token| token == marker)
 }
 
 // -------------------------------------------------------------------
@@ -312,4 +353,83 @@ pub fn stdio_bridge(socket_path: &Path) -> anyhow::Result<()> {
     }
     let _ = to_sock.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_are_only_sent_to_clients_that_opt_in() {
+        let (daemon, _events) = Daemon::new();
+
+        let (legacy_tx, mut legacy_rx) = unbounded_channel();
+        let legacy_id = daemon.add_client(legacy_tx.clone());
+        dispatch(
+            &daemon,
+            legacy_id,
+            &legacy_tx,
+            ClientMsg::Hello {
+                protocol_version: helm_proto::PROTOCOL_VERSION,
+                client_name: "helm-app 0.2.7".into(),
+            },
+        );
+        assert!(matches!(
+            legacy_rx.try_recv(),
+            Ok(DaemonMsg::HelloAck { .. })
+        ));
+        assert!(legacy_rx.try_recv().is_err());
+
+        let (current_tx, mut current_rx) = unbounded_channel();
+        let current_id = daemon.add_client(current_tx.clone());
+        dispatch(
+            &daemon,
+            current_id,
+            &current_tx,
+            ClientMsg::Hello {
+                protocol_version: helm_proto::PROTOCOL_VERSION,
+                client_name: format!("helm-app 0.2.8{}", helm_proto::CAPABILITIES_MARKER),
+            },
+        );
+        assert!(matches!(
+            current_rx.try_recv(),
+            Ok(DaemonMsg::HelloAck { .. })
+        ));
+        assert!(matches!(
+            current_rx.try_recv(),
+            Ok(DaemonMsg::Capabilities { extensions, .. })
+                if extensions.iter().any(|name| name == helm_proto::extensions::DRAIN)
+        ));
+        assert!(!wants_capabilities(
+            "helm-app 0.2.8; note=helm-capabilities=1-but-not-opted-in"
+        ));
+    }
+
+    #[test]
+    fn drain_extension_rejects_new_sessions() {
+        let (daemon, _events) = Daemon::new();
+        let (tx, mut rx) = unbounded_channel();
+        let client_id = daemon.add_client(tx.clone());
+        dispatch(
+            &daemon,
+            client_id,
+            &tx,
+            ClientMsg::Extension {
+                req_id: Some(7),
+                name: helm_proto::extensions::DRAIN.into(),
+                payload: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonMsg::Extension {
+                req_id: Some(7),
+                ..
+            })
+        ));
+        assert!(daemon
+            .new_session(None, None, None)
+            .unwrap_err()
+            .contains("draining"));
+    }
 }

@@ -1733,6 +1733,7 @@ dependencies = [
  "helm-ssh",
  "parking_lot",
  "security-framework 2.11.1",
+ "semver",
  "serde",
  "serde_json",
  "specta",
