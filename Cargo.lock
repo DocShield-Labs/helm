@@ -1720,7 +1720,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helm-app"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "helm-domain"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "serde",
  "specta",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "helm-proto"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bincode",
  "helmd",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "helm-ssh"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "helmd"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
