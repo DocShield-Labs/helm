@@ -84,6 +84,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
         commands::session::window_rename,
         commands::session::session_search,
         commands::session::session_blocks,
+        commands::session::session_path_complete,
         commands::session::session_ping,
         commands::notifications::notifications_list,
         commands::notifications::notification_dismiss,

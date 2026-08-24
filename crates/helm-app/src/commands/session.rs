@@ -5,7 +5,10 @@
 //! event channel; these commands are the control plane.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use helm_domain::{BlockInfo, HistoryPage, HostId, ScreenInfo, SearchHit, SessionTree};
+use helm_domain::{
+    BlockInfo, HistoryPage, HostId, PathCompletion, PathCompletionResult, PathEntryKind,
+    ScreenInfo, SearchHit, SessionTree,
+};
 use helm_proto::{DaemonMsg, PaneId, SearchScope, WindowId, WorkspaceId};
 use serde::Serialize;
 use specta::Type;
@@ -278,6 +281,39 @@ pub async fn session_blocks(
     let pane = pane_id.parse::<PaneId>()?;
     match session.request(|id| session.client.blocks(id, pane)).await? {
         DaemonMsg::Blocks { blocks, .. } => Ok(blocks.iter().map(to_domain_block).collect()),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn session_path_complete(
+    state: State<'_, AppState>,
+    host_id: HostId,
+    pane_id: String,
+    path: String,
+    directories_only: bool,
+    max_results: u32,
+) -> Result<PathCompletionResult, String> {
+    let session = session_for(&state, host_id).await?;
+    let pane = pane_id.parse::<PaneId>()?;
+    match session
+        .request(|id| session.client.complete_path(id, pane, path, directories_only, max_results))
+        .await?
+    {
+        DaemonMsg::PathCompletions { candidates, truncated, .. } => Ok(PathCompletionResult {
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| PathCompletion {
+                    value: candidate.value,
+                    kind: match candidate.kind {
+                        helm_proto::PathEntryKind::File => PathEntryKind::File,
+                        helm_proto::PathEntryKind::Directory => PathEntryKind::Directory,
+                    },
+                })
+                .collect(),
+            truncated,
+        }),
         other => Err(format!("unexpected reply: {other:?}")),
     }
 }

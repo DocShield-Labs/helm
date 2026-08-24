@@ -28,7 +28,7 @@ pub mod client;
 /// as a different variant entirely. The app treats any non-`HelloAck`
 /// first message as a stale daemon for that reason — don't rely on the
 /// rejection text surviving a version gap.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Upper bound on a single frame. History pages are capped well below
 /// this; the cap exists so a corrupt length prefix fails fast instead
@@ -257,6 +257,16 @@ pub enum ClientMsg {
     /// The pane's block table (historical blocks are not streamed —
     /// a reattaching client asks once per pane). Answered with `Blocks`.
     Blocks { req_id: u64, pane: PaneId },
+    /// Filesystem path candidates relative to the pane's current cwd.
+    /// `path` is an unescaped shell token prefix; quoting and insertion
+    /// remain a client concern. Answered with `PathCompletions`.
+    CompletePath {
+        req_id: u64,
+        pane: PaneId,
+        path: String,
+        directories_only: bool,
+        max_results: u32,
+    },
     /// Round-trip probe (the app's latency readout). Answered with `Pong`.
     Ping { req_id: u64 },
     /// The client has shown these to the user; drop them from the
@@ -343,6 +353,12 @@ pub enum DaemonMsg {
     /// Reply to `Blocks`: every block the daemon retains for the pane,
     /// oldest first.
     Blocks { req_id: u64, pane: PaneId, blocks: Vec<BlockMeta> },
+    PathCompletions {
+        req_id: u64,
+        pane: PaneId,
+        candidates: Vec<PathCompletion>,
+        truncated: bool,
+    },
     Pong { req_id: u64 },
     Notification { note: Notification },
     /// A failed operation. `req_id` is set when the failure answers a
@@ -359,12 +375,26 @@ impl DaemonMsg {
             DaemonMsg::Created { req_id, .. }
             | DaemonMsg::SearchResults { req_id, .. }
             | DaemonMsg::Blocks { req_id, .. }
+            | DaemonMsg::PathCompletions { req_id, .. }
             | DaemonMsg::History { req_id, .. }
             | DaemonMsg::Pong { req_id } => Some(*req_id),
             DaemonMsg::Screen { req_id, .. } | DaemonMsg::Error { req_id, .. } => *req_id,
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathCompletion {
+    /// Completed token value, without shell escaping.
+    pub value: String,
+    pub kind: PathEntryKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +667,13 @@ mod tests {
                 scope: SearchScope::All,
                 max_results: 60,
             },
+            ClientMsg::CompletePath {
+                req_id: 10,
+                pane: PaneId(7),
+                path: "src/co".into(),
+                directories_only: false,
+                max_results: 100,
+            },
         ]
     }
 
@@ -689,6 +726,15 @@ mod tests {
             DaemonMsg::ModeChange {
                 pane: PaneId(7),
                 alt_screen: true,
+            },
+            DaemonMsg::PathCompletions {
+                req_id: 10,
+                pane: PaneId(7),
+                candidates: vec![PathCompletion {
+                    value: "src/components/".into(),
+                    kind: PathEntryKind::Directory,
+                }],
+                truncated: false,
             },
         ]
     }
@@ -760,6 +806,16 @@ mod tests {
             }
             .req_id(),
             Some(8)
+        );
+        assert_eq!(
+            DaemonMsg::PathCompletions {
+                req_id: 9,
+                pane: PaneId(1),
+                candidates: vec![],
+                truncated: false,
+            }
+            .req_id(),
+            Some(9)
         );
     }
 

@@ -293,8 +293,7 @@ async fn pump(
             DaemonMsg::HelloAck { .. } => {
                 tracing::debug!("unexpected HelloAck mid-stream on {host_id:?}");
             }
-            // Replies (Created / SearchResults / Blocks / Pong / Error with
-            // a req_id) go to whoever is waiting; an unclaimed reply means
+            // Correlated replies go to whoever is waiting; an unclaimed reply means
             // the waiter already timed out.
             reply => {
                 if let Some(id) = reply.req_id() {

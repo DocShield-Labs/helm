@@ -555,6 +555,17 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
           onModeChange={onModeChange}
           onSend={onSend}
           onRaw={(bytes) => void screen.sendInput(hostId, paneId, bytes)}
+          onPathComplete={async (path, directoriesOnly) => {
+            const result = await commands.sessionPathComplete(
+              hostId,
+              paneId,
+              path,
+              directoriesOnly,
+              100,
+            )
+            if (result.status === 'error') throw new Error(result.error)
+            return result.data
+          }}
           focusKey={focusKey}
         />
       )}

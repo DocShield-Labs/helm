@@ -13,6 +13,7 @@
 //!   server   — unix-socket accept loop + `helmd stdio` bridge
 
 pub mod env;
+pub mod completion;
 pub mod daemon;
 pub mod markers;
 pub mod pane;

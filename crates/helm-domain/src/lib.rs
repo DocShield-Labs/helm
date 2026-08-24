@@ -97,6 +97,25 @@ pub struct PaneInfo {
     pub command: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum PathEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct PathCompletion {
+    pub value: String,
+    pub kind: PathEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct PathCompletionResult {
+    pub candidates: Vec<PathCompletion>,
+    pub truncated: bool,
+}
+
 // ---------- terminal rows (the daemon's model, mirrored) ----------
 //
 // Colors are packed into one number to keep history pages small on the

@@ -23,11 +23,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use helm_proto::{
     BlockId, BlockMeta, DaemonMsg, Notification, NotificationId, NotificationKind, PaneId,
-    PaneInfo, SearchMatch, SearchScope, TreeSnapshot, WindowId, WindowInfo, WorkspaceId,
-    WorkspaceInfo,
+    PaneInfo, PathCompletion, SearchMatch, SearchScope, TreeSnapshot, WindowId, WindowInfo,
+    WorkspaceId, WorkspaceInfo,
 };
 
 use crate::markers::{IngestEvent, Osc133};
@@ -80,6 +81,7 @@ pub struct Daemon {
     next_pane: AtomicU64,
     next_client: AtomicU64,
     next_notification: AtomicU64,
+    completion_slots: Arc<Semaphore>,
 }
 
 fn now_ms() -> u64 {
@@ -103,6 +105,7 @@ impl Daemon {
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
             next_notification: AtomicU64::new(1),
+            completion_slots: Arc::new(Semaphore::new(4)),
         });
         (daemon, events_rx)
     }
@@ -186,6 +189,47 @@ impl Daemon {
             top_line,
         });
         Ok(())
+    }
+
+    pub fn complete_path(
+        &self,
+        pane_id: PaneId,
+        path: &str,
+        directories_only: bool,
+        max_results: u32,
+    ) -> Result<(Vec<PathCompletion>, bool), String> {
+        if path.len() > 4096 {
+            return Err("completion path is too long".into());
+        }
+        let pane = self
+            .core
+            .lock()
+            .panes
+            .get(&pane_id)
+            .cloned()
+            .ok_or_else(|| format!("no pane {pane_id}"))?;
+        let home = dirs::home_dir();
+        let cwd = pane
+            .meta
+            .lock()
+            .cwd
+            .clone()
+            .or_else(|| home.as_ref().map(|path| path.to_string_lossy().into_owned()))
+            .ok_or("pane cwd is unavailable")?;
+        crate::completion::complete_path(
+            std::path::Path::new(&cwd),
+            home.as_deref(),
+            path,
+            directories_only,
+            max_results,
+        )
+    }
+
+    pub fn completion_permit(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.completion_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "completion service is busy".into())
     }
 
     // ---------------------------------------------------------------

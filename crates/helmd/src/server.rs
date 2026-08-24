@@ -205,6 +205,37 @@ fn dispatch(
             let blocks = daemon.blocks(pane);
             let _ = tx.send(DaemonMsg::Blocks { req_id, pane, blocks });
         }
+        ClientMsg::CompletePath { req_id, pane, path, directories_only, max_results } => {
+            let permit = match daemon.completion_permit() {
+                Ok(permit) => permit,
+                Err(message) => {
+                    err(Some(req_id), "complete_path", message);
+                    return;
+                }
+            };
+            let daemon = daemon.clone();
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                match daemon.complete_path(pane, &path, directories_only, max_results) {
+                    Ok((candidates, truncated)) => {
+                        let _ = tx.send(DaemonMsg::PathCompletions {
+                            req_id,
+                            pane,
+                            candidates,
+                            truncated,
+                        });
+                    }
+                    Err(message) => {
+                        let _ = tx.send(DaemonMsg::Error {
+                            req_id: Some(req_id),
+                            context: "complete_path".into(),
+                            message,
+                        });
+                    }
+                }
+            });
+        }
         ClientMsg::Ping { req_id } => {
             let _ = tx.send(DaemonMsg::Pong { req_id });
         }

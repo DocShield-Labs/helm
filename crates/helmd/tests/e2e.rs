@@ -7,7 +7,9 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use helm_proto::{encode_frame, ClientMsg, DaemonMsg, FrameDecoder, SearchScope, WorkspaceId};
+use helm_proto::{
+    encode_frame, ClientMsg, DaemonMsg, FrameDecoder, PathEntryKind, SearchScope, WorkspaceId,
+};
 
 struct TestClient {
     stream: UnixStream,
@@ -136,6 +138,11 @@ fn screen_texts(msgs: &[DaemonMsg], pane_id: helm_proto::PaneId) -> Vec<String> 
 #[test]
 fn full_session_lifecycle() {
     let (socket, mut c, mut seen, ws_id) = start_daemon("lifecycle");
+    let completion_root =
+        std::env::temp_dir().join(format!("helmd-completion-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&completion_root);
+    std::fs::create_dir_all(completion_root.join("Code")).unwrap();
+    std::fs::write(completion_root.join("config.toml"), "").unwrap();
 
     // A window running a script that walks the full OSC 133 block
     // lifecycle (A → B → C → output → D;3), then lingers so the pane
@@ -152,7 +159,7 @@ fn full_session_lifecycle() {
         req_id: 2,
         workspace: ws_id,
         name: Some("e2e-window".into()),
-        cwd: None,
+        cwd: Some(completion_root.to_string_lossy().into_owned()),
         command: Some(vec!["/bin/sh".into(), "-c".into(), script.into()]),
     });
     let (window_id, pane_id) = c.recv_until(5, &mut seen, |m| match m {
@@ -232,6 +239,26 @@ fn full_session_lifecycle() {
         _ => None,
     });
 
+    // Path completion resolves against the pane's own cwd and returns
+    // canonical entry casing without running shell code.
+    c.send(&ClientMsg::CompletePath {
+        req_id: 6,
+        pane: pane_id,
+        path: "co".into(),
+        directories_only: true,
+        max_results: 20,
+    });
+    c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::PathCompletions { req_id: 6, candidates, truncated, .. } => {
+            assert!(!truncated);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].value, "Code/");
+            assert_eq!(candidates[0].kind, PathEntryKind::Directory);
+            Some(())
+        }
+        _ => None,
+    });
+
     // Kill the window; it disappears from the tree (the workspace's
     // auto-spawned initial window remains).
     c.send(&ClientMsg::KillWindow { window: window_id });
@@ -246,6 +273,7 @@ fn full_session_lifecycle() {
     });
 
     let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(completion_root);
 }
 
 /// The M8 guarantee: output that scrolls out of the grid is retained as

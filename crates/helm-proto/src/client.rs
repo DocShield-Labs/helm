@@ -263,6 +263,16 @@ impl HelmdClient {
     pub fn blocks(&self, req_id: u64, pane: PaneId) -> Result<(), ClientError> {
         self.send(ClientMsg::Blocks { req_id, pane })
     }
+    pub fn complete_path(
+        &self,
+        req_id: u64,
+        pane: PaneId,
+        path: String,
+        directories_only: bool,
+        max_results: u32,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::CompletePath { req_id, pane, path, directories_only, max_results })
+    }
     pub fn ping(&self, req_id: u64) -> Result<(), ClientError> {
         self.send(ClientMsg::Ping { req_id })
     }
