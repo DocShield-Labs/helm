@@ -112,10 +112,17 @@ fn dispatch(
     msg: ClientMsg,
 ) {
     let err = |req_id: Option<u64>, context: &str, message: String| {
-        let _ = tx.send(DaemonMsg::Error { req_id, context: context.into(), message });
+        let _ = tx.send(DaemonMsg::Error {
+            req_id,
+            context: context.into(),
+            message,
+        });
     };
     match msg {
-        ClientMsg::Hello { protocol_version, client_name } => {
+        ClientMsg::Hello {
+            protocol_version,
+            client_name,
+        } => {
             if protocol_version != helm_proto::PROTOCOL_VERSION {
                 err(
                     None,
@@ -131,79 +138,117 @@ fn dispatch(
             let _ = tx.send(daemon.hello_ack(DAEMON_VERSION));
         }
         ClientMsg::Attach => daemon.attach(client_id),
-        ClientMsg::Input { pane, bytes } => {
-            if let Err(e) = daemon.input(pane, &bytes) {
+        ClientMsg::Input { session, bytes } => {
+            if let Err(e) = daemon.input(session, &bytes) {
                 err(None, "input", e);
             }
         }
-        ClientMsg::Resize { pane, cols, rows } => {
-            if let Err(e) = daemon.resize(pane, cols, rows) {
+        ClientMsg::Resize {
+            session,
+            cols,
+            rows,
+        } => {
+            if let Err(e) = daemon.resize(session, cols, rows) {
                 err(None, "resize", e);
             }
         }
-        ClientMsg::Screen { req_id, pane } => {
-            if let Err(e) = daemon.screen(client_id, req_id, pane) {
+        ClientMsg::Screen { req_id, session } => {
+            if let Err(e) = daemon.screen(client_id, req_id, session) {
                 err(Some(req_id), "screen", e);
             }
         }
-        ClientMsg::History { req_id, pane, from_line, to_line } => {
-            if let Err(e) = daemon.history(client_id, req_id, pane, from_line, to_line) {
+        ClientMsg::History {
+            req_id,
+            session,
+            from_line,
+            to_line,
+        } => {
+            if let Err(e) = daemon.history(client_id, req_id, session, from_line, to_line) {
                 err(Some(req_id), "history", e);
             }
         }
-        ClientMsg::NewWorkspace { req_id, name } => match daemon.new_workspace(name) {
-            Ok((workspace, window, pane)) => {
-                let _ = tx.send(DaemonMsg::Created {
-                    req_id,
-                    workspace,
-                    window: Some(window),
-                    pane: Some(pane),
-                });
+        ClientMsg::NewSession {
+            req_id,
+            name,
+            cwd,
+            command,
+        } => match daemon.new_session(name, cwd, command) {
+            Ok(session) => {
+                let _ = tx.send(DaemonMsg::Created { req_id, session });
             }
-            Err(e) => err(Some(req_id), "new_workspace", e),
+            Err(e) => err(Some(req_id), "new_session", e),
         },
-        ClientMsg::NewWindow { req_id, workspace, name, cwd, command } => {
-            match daemon.new_window(workspace, name, cwd, command) {
-                Ok((window, pane)) => {
-                    let _ = tx.send(DaemonMsg::Created {
-                        req_id,
-                        workspace,
-                        window: Some(window),
-                        pane: Some(pane),
-                    });
-                }
-                Err(e) => err(Some(req_id), "new_window", e),
+        ClientMsg::KillSession { session } => {
+            if let Err(e) = daemon.kill_session(session) {
+                err(None, "kill_session", e);
             }
         }
-        ClientMsg::KillWindow { window } => {
-            if let Err(e) = daemon.kill_window(window) {
-                err(None, "kill_window", e);
+        ClientMsg::RenameSession { session, name } => {
+            if let Err(e) = daemon.rename_session(session, name) {
+                err(None, "rename_session", e);
             }
         }
-        ClientMsg::KillWorkspace { workspace } => {
-            if let Err(e) = daemon.kill_workspace(workspace) {
-                err(None, "kill_workspace", e);
-            }
-        }
-        ClientMsg::RenameWorkspace { workspace, name } => {
-            if let Err(e) = daemon.rename_workspace(workspace, name) {
-                err(None, "rename_workspace", e);
-            }
-        }
-        ClientMsg::RenameWindow { window, name } => {
-            if let Err(e) = daemon.rename_window(window, name) {
-                err(None, "rename_window", e);
-            }
-        }
-        ClientMsg::Search { req_id, query, regex: _, case_sensitive, scope, max_results } => {
+        ClientMsg::Search {
+            req_id,
+            query,
+            regex: _,
+            case_sensitive,
+            scope,
+            max_results,
+        } => {
             // Regex search lands with M6; substring covers the palette
             // flow until then.
             let (matches, truncated) = daemon.search(&query, case_sensitive, scope, max_results);
-            let _ = tx.send(DaemonMsg::SearchResults { req_id, matches, truncated });
+            let _ = tx.send(DaemonMsg::SearchResults {
+                req_id,
+                matches,
+                truncated,
+            });
         }
-        ClientMsg::Blocks { req_id, pane } => {
-            let blocks = daemon.blocks(pane);
-            let _ = tx.send(DaemonMsg::Blocks { req_id, pane, blocks });
+        ClientMsg::Blocks { req_id, session } => {
+            let blocks = daemon.blocks(session);
+            let _ = tx.send(DaemonMsg::Blocks {
+                req_id,
+                session,
+                blocks,
+            });
+        }
+        ClientMsg::CompletePath {
+            req_id,
+            session,
+            path,
+            directories_only,
+            max_results,
+        } => {
+            let permit = match daemon.completion_permit() {
+                Ok(permit) => permit,
+                Err(message) => {
+                    err(Some(req_id), "complete_path", message);
+                    return;
+                }
+            };
+            let daemon = daemon.clone();
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                match daemon.complete_path(session, &path, directories_only, max_results) {
+                    Ok((candidates, truncated)) => {
+                        let _ = tx.send(DaemonMsg::PathCompletions {
+                            req_id,
+                            session,
+                            candidates,
+                            truncated,
+                        });
+                    }
+                    Err(message) => {
+                        let _ = tx.send(DaemonMsg::Error {
+                            req_id: Some(req_id),
+                            context: "complete_path".into(),
+                            message,
+                        });
+                    }
+                }
+            });
         }
         ClientMsg::Ping { req_id } => {
             let _ = tx.send(DaemonMsg::Pong { req_id });

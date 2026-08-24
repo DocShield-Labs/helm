@@ -11,23 +11,23 @@ import { memo, type CSSProperties } from 'react'
 import type { BlockInfo, HostId } from '@bindings'
 import { formatDuration } from '@lib/format'
 import { homeRelative } from '@lib/path'
-import { getPaneScreen, rowsBetween } from '@lib/session/screen'
+import { getSessionScreen, rowsBetween } from '@lib/session/screen'
 import { CopyIcon, TerminalIcon } from '@features/sessions/icons'
 import { RowsView, rowsToText } from './Rows'
 
 interface BlockProps {
   hostId: HostId
-  paneId: string
+  sessionId: string
   block: BlockInfo
   /** Rows to render, `[lo, hi)`. */
   lo: number
   hi: number
 }
 
-export const Block = memo(function Block({ hostId, paneId, block, lo, hi }: BlockProps) {
+export const Block = memo(function Block({ hostId, sessionId, block, lo, hi }: BlockProps) {
   const failed = block.exit_code !== null && block.exit_code !== 0
   const copyOutput = () =>
-    void navigator.clipboard.writeText(rowsToText(rowsBetween(getPaneScreen(hostId, paneId), lo, hi)))
+    void navigator.clipboard.writeText(rowsToText(rowsBetween(getSessionScreen(hostId, sessionId), lo, hi)))
 
   return (
     <div
@@ -37,7 +37,7 @@ export const Block = memo(function Block({ hostId, paneId, block, lo, hi }: Bloc
       <BlockHeader block={block} copyOutput={copyOutput} />
       {hi > lo ? (
         <pre className="helm-block-output">
-          <RowsView hostId={hostId} paneId={paneId} from={lo} to={hi} />
+          <RowsView hostId={hostId} sessionId={sessionId} from={lo} to={hi} />
         </pre>
       ) : (
         <div className="h-4" />

@@ -61,7 +61,6 @@ pub trait HostKeyPrompter: Send + Sync {
     ) -> HostKeyDecision;
 }
 
-
 #[derive(Debug, Error)]
 pub enum SshError {
     #[error("connect: {0}")]
@@ -114,12 +113,10 @@ pub enum SshAuth {
 /// Multi-channel: a single `SshSession` can host any number of exec
 /// channels, opened one at a time via `open_exec`. The I/O thread is a
 /// long-running event loop that handles channel-open requests + the
-/// teardown signal, so each tmux control client (one per workspace)
-/// shares the same TCP/auth handshake instead of re-doing it N times.
+/// teardown signal, so every remote stream shares one TCP/auth handshake.
 pub struct SshSession {
     /// Send a session request to the I/O thread. Variants cover the
-    /// long-lived PTY-bound exec channel (used for tmux control
-    /// clients) and the short-lived no-PTY exec used for one-shot
+    /// long-lived PTY-bound exec channel and the short-lived no-PTY exec used for one-shot
     /// remote commands (read/write a config file, query env, etc.).
     request_tx: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
     /// Set once per session. Sending fires the cleanup path on the I/O
@@ -226,7 +223,7 @@ impl Drop for SshSession {
     }
 }
 
-/// Sync byte streams to feed helm-tmux. The reader and writer are backed
+/// Sync byte streams for the protocol client. The reader and writer are backed
 /// by `std::io::pipe()` halves; the I/O thread on the other end pumps
 /// bytes between these and the russh channel.
 ///
@@ -295,7 +292,7 @@ pub fn connect_session(
 /// `let s = connect_session(...); let c = s.open_exec(command)?; Ok(SshConnection { ... })`.
 ///
 /// New callers should use `connect_session` + `open_exec` directly so
-/// multiple tmux control clients can share one TCP/auth handshake.
+/// multiple remote streams can share one TCP/auth handshake.
 pub fn connect(
     target: SshTarget,
     auth: SshAuth,
@@ -431,11 +428,7 @@ async fn open_exec_channel(
 /// Spawn the duplex pump pair for one channel. The pumps `spawn_blocking`
 /// on the sync pipe ends so the current-thread runtime stays responsive
 /// while sync I/O blocks.
-fn spawn_channel_pumps(
-    stream: ChannelStream<Msg>,
-    from_app: PipeReader,
-    to_app: PipeWriter,
-) {
+fn spawn_channel_pumps(stream: ChannelStream<Msg>, from_app: PipeReader, to_app: PipeWriter) {
     let (mut chan_read, mut chan_write) = tokio::io::split(stream);
 
     // app → ssh: drain the sync pipe on the blocking pool, forward each
@@ -531,9 +524,7 @@ async fn run_oneshot_channel(
             ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
             // ext == 1 is stderr per RFC 4254 §5.2; other extended
             // data types are ignored (we don't expect any).
-            ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
-                stderr.extend_from_slice(&data)
-            }
+            ChannelMsg::ExtendedData { data, ext } if ext == 1 => stderr.extend_from_slice(&data),
             ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
             ChannelMsg::Eof | ChannelMsg::Close => break,
             _ => {}
@@ -722,7 +713,13 @@ impl client::Handler for Client {
         let fingerprint = format!("SHA256:{}", server_public_key.fingerprint());
 
         let decision = prompter
-            .prompt(&self.hostname, self.port, algorithm, &fingerprint, kind.clone())
+            .prompt(
+                &self.hostname,
+                self.port,
+                algorithm,
+                &fingerprint,
+                kind.clone(),
+            )
             .await;
 
         match decision {

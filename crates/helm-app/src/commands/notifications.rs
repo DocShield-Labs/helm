@@ -1,6 +1,6 @@
-//! Inbox commands. The list/dismiss surface for the per-pane
+//! Inbox commands. The list/dismiss surface for the per-session
 //! notifications managed by `crate::notifications`. `set_focus` lives
-//! here too — it's the active-window suppression knob the inbox layer
+//! here too — it's the active-session suppression knob the inbox layer
 //! consults on every event.
 
 use helm_domain::{HostEvent, HostId};
@@ -29,7 +29,7 @@ pub async fn notifications_list(
 
 /// Dismiss a single notification by id. No-op if the id no longer exists
 /// (the inbox row may have been auto-dismissed by another path — host
-/// disconnect, window kill, dismiss-on-keystroke).
+/// disconnect, session kill, dismiss-on-keystroke).
 #[tauri::command]
 #[specta::specta]
 pub async fn notification_dismiss(
@@ -41,8 +41,8 @@ pub async fn notification_dismiss(
         return Ok(());
     };
     state
-        .notification_by_pane
-        .remove(&(notif.host_id, notif.pane_id));
+        .notification_by_session
+        .remove(&(notif.host_id, notif.session_id));
     emit_event(
         &event_tx,
         HostEvent::NotificationDismissed {
@@ -53,52 +53,37 @@ pub async fn notification_dismiss(
     Ok(())
 }
 
-/// Dismiss every notification whose pane sits inside `window_id`. Used
-/// by the dismiss-on-keystroke path in `TmuxPane`: the user typed into
-/// the window, so any in-flight inbox rows for that window are stale.
-///
-/// Resolves panes via the cached `pane_runtime` index. We don't fall
-/// through to a live `list-panes` call here — if the index doesn't know
-/// about a pane yet, it has no notification entry to dismiss anyway.
+/// Dismiss the notification for a session after the user types into it.
 #[tauri::command]
 #[specta::specta]
-pub async fn notification_dismiss_for_window(
+pub async fn notification_dismiss_for_session(
     state: State<'_, AppState>,
     host_id: HostId,
-    window_id: String,
+    session_id: String,
 ) -> Result<(), String> {
     let event_tx = state.event_tx.lock().await.clone();
-    let pane_ids: Vec<String> = state
-        .pane_runtime
-        .iter()
-        .filter(|r| r.key().0 == host_id && r.value().window_id == window_id)
-        .map(|r| r.key().1.clone())
-        .collect();
-    if pane_ids.is_empty() {
-        return Ok(());
-    }
     let notif_ctx = state.notifications_ctx();
-    crate::notifications::dismiss_for_panes(&notif_ctx, &event_tx, host_id, &pane_ids);
+    crate::notifications::dismiss_for_sessions(&notif_ctx, &event_tx, host_id, &[session_id]);
     Ok(())
 }
 
-/// Tell the backend which (host, window) the user is currently looking
+/// Tell the backend which (host, session) the user is currently looking
 /// at. Pass `None`s to clear (helm window lost OS focus / minimized) so
-/// backgrounded windows resume getting notifications.
+/// backgrounded sessions resume getting notifications.
 ///
 /// The notifications post-processor consults this on every event and
-/// suppresses inbox rows for the focused window — the user is already
+/// suppresses inbox rows for the focused session — the user is already
 /// watching that output, an inbox entry would just be noise.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_focus(
     state: State<'_, AppState>,
     host_id: Option<HostId>,
-    window_id: Option<String>,
+    session_id: Option<String>,
 ) -> Result<(), String> {
     let mut guard = state.focus.lock();
-    *guard = match (host_id, window_id) {
-        (Some(h), Some(w)) if !w.is_empty() => Some((h, w)),
+    *guard = match (host_id, session_id) {
+        (Some(host), Some(session)) if !session.is_empty() => Some((host, session)),
         _ => None,
     };
     Ok(())

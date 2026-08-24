@@ -10,6 +10,7 @@
 
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { correctedLineHeight, domLinePx } from './cellHeight'
 import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
@@ -23,16 +24,16 @@ export type { Theme } from './themes'
 // WebGL renderer with `onContextLoss` fallback. The atlas-cached glyphs
 // look noticeably crisper than the DOM renderer, especially at small
 // font sizes. The historical concern was browser per-page context
-// caps (Chromium ~16) blowing up under workspace churn — fixed here by
+// caps (Chromium ~16) blowing up under session churn — fixed here by
 // disposing the addon when a context is lost, which makes xterm fall
-// back to its built-in DOM renderer for the affected pane. Construction
+// back to its built-in DOM renderer for the affected session. Construction
 // is wrapped in try/catch so headless or no-GPU environments degrade
 // silently instead of throwing.
 
 export interface HelmTerminal {
   term: Terminal
   fit: FitAddon
-  /** In-pane find (Cmd+F). The SearchOverlay drives findNext/findPrevious
+  /** In-session find (Cmd+F). The SearchOverlay drives findNext/findPrevious
    * and reads match counts via `onDidChangeResults`. Decorations are
    * passed per-call by the overlay so highlight colours track the theme. */
   search: SearchAddon
@@ -64,10 +65,10 @@ export interface AttachOptions {
 }
 
 /** Registry of every currently-attached terminal. The theme picker
- * fans out via `setThemeForAllTerminals` so we don't need each pane
- * to maintain its own store subscription — relevant when many panes
+ * fans out via `setThemeForAllTerminals` so we don't need each session
+ * to maintain its own store subscription — relevant when many sessions
  * are mounted at once and the user is rapidly cycling preview themes
- * (one xterm atlas rebuild per pane per keypress otherwise). */
+ * (one xterm atlas rebuild per session per keypress otherwise). */
 const attached = new Set<HelmTerminal>()
 
 /** Push a theme into every live xterm. Safe to call from anywhere;
@@ -105,9 +106,13 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       opts.fontFamily ??
       '"Hack", "Berkeley Mono", "JetBrains Mono", "SF Mono", ui-monospace, monospace',
     fontSize: opts.fontSize ?? 13,
-    // 20px cells: the same `--helm-line-px` rows rendered as DOM use,
-    // so the live band and the finished block it turns into line up.
-    lineHeight: opts.lineHeight ?? 20 / 13,
+    // Cells must be `--helm-line-px` (20px) tall — the rows finished
+    // blocks render as DOM — so the live band and the block it turns
+    // into line up. xterm's `lineHeight` multiplies the font's measured
+    // natural height (~1.2× the size), not `fontSize`, so this is only
+    // a first guess; `measureCellSize` corrects it from the rendered
+    // cell (see cellHeight.ts).
+    lineHeight: opts.lineHeight ?? 1.25,
     letterSpacing: 0,
     fontWeight: 400,
     fontWeightBold: 600,
@@ -145,7 +150,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   const fit = new FitAddon()
   term.loadAddon(fit)
 
-  // In-pane find. Loaded eagerly (cheap) so Cmd+F is instant; the
+  // In-session find. Loaded eagerly (cheap) so Cmd+F is instant; the
   // overlay UI (SearchOverlay) is what's lazily mounted on demand.
   const search = new SearchAddon()
   term.loadAddon(search)
@@ -220,7 +225,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // the host's dimensions. If construction fails (no WebGL2, blocked
   // context) or the context is lost later (GPU process churn,
   // browser-cap eviction), we dispose the addon and xterm reverts to
-  // its built-in DOM renderer for this pane. No reload, no crash.
+  // its built-in DOM renderer for this session. No reload, no crash.
   let webgl: WebglAddon | null = null
   try {
     const addon = new WebglAddon()
@@ -230,47 +235,93 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   } catch {
     /* no WebGL2 — xterm falls back to its DOM renderer automatically */
   }
-  try {
-    fit.fit()
-  } catch {
-    /* terminal not visible yet */
-  }
+  // The first fit waits for the first render (below): fit() → term.resize
+  // → syncScrollArea reads `renderer.dimensions`, which is undefined until
+  // the renderer has painted — and loading the WebGL addon above swaps the
+  // renderer, so a fit here throws an (async, uncatchable) TypeError.
 
   // Cached cell dimensions in pixels. Measure from `.xterm-screen / rows`
   // (and cols) — that's xterm's internal layout, not CSS line-height,
-  // so we sidestep rounding drift between the two. The pane's wheel
-  // handler reads it to turn line-mode wheel deltas into pixels.
-  // (The grid has no scrollback, so xterm never scrolls itself: the
-  // pane decides what a wheel over the grid means — see BlockPane.)
-  // 20px tall by construction (see `lineHeight`); measured to confirm.
-  let cachedCellH = 20
+  // so we sidestep rounding drift between the two. The session's wheel
+  // handler reads it to turn line-mode wheel deltas into pixels, and
+  // SessionView sizes the live band from it. (The grid has no scrollback,
+  // so xterm never scrolls itself: the session decides what a wheel over
+  // the grid means — see SessionView.)
+  //
+  // The measurement also closes the loop on `lineHeight`: when the
+  // rendered cell isn't the DOM row height, set the lineHeight that
+  // makes it so and refit. xterm resizes `.xterm-screen` in response,
+  // which re-measures and finds nothing left to correct.
+  const linePx = domLinePx()
+  let cachedCellH = linePx
   let cachedCellW = 8
-  const measureCellSize = () => {
+  // Pure measurement: read the rendered cell into the cache. NEVER
+  // mutates layout — an observer that resized what it observes would
+  // loop. Returns the measured cell height, or 0 if nothing's laid out.
+  const measureCellSize = (): number => {
     const screen = host.querySelector('.xterm-screen') as HTMLElement | null
     if (screen && term.rows > 0 && term.cols > 0) {
       const rect = screen.getBoundingClientRect()
-      if (rect.height > 0) cachedCellH = rect.height / term.rows
-      if (rect.width > 0) cachedCellW = rect.width / term.cols
-      if (rect.height > 0) return
+      if (rect.height > 0) {
+        cachedCellH = rect.height / term.rows
+        if (rect.width > 0) cachedCellW = rect.width / term.cols
+        return cachedCellH
+      }
     }
     const row = host.querySelector('.xterm-rows > div') as HTMLElement | null
     if (row) {
       const rect = row.getBoundingClientRect()
       if (rect.height > 0) cachedCellH = rect.height
       if (rect.width > 0 && term.cols > 0) cachedCellW = rect.width / term.cols
+      return cachedCellH
     }
+    return 0
   }
-  measureCellSize()
 
-  // Re-measure on host resize (font-size or DPR changes) and once on
-  // the first xterm render (covers the WebGL post-init race where the
-  // screen element settles to its final dimensions a tick after
-  // `term.open`). Both feed the same cache so all consumers stay in
-  // sync; no measurement happens on the wheel/hover/render hot paths.
-  const ro = new ResizeObserver(measureCellSize)
+  // Make xterm's cell exactly `--helm-line-px` tall (see cellHeight.ts).
+  // A bounded one-shot, decoupled from the ResizeObserver: each pass
+  // measures, and if the cell is off, sets the lineHeight that fixes it
+  // and refits — which resizes the screen, so we re-check on the next
+  // frame. Capped so a font that never lands on an exact device pixel
+  // can't loop; whatever cell we have after that is what the band uses.
+  let corrections = 0
+  const correctLineHeight = () => {
+    const measured = measureCellSize()
+    if (measured <= 0) {
+      if (corrections < 8) {
+        corrections++
+        requestAnimationFrame(correctLineHeight)
+      }
+      return
+    }
+    const lh = correctedLineHeight(measured, term.options.lineHeight ?? 1, window.devicePixelRatio || 1, linePx)
+    if (lh === null || corrections >= 4) return
+    corrections++
+    term.options.lineHeight = lh
+    try {
+      fit.fit()
+    } catch {
+      /* not laid out yet */
+    }
+    requestAnimationFrame(correctLineHeight)
+  }
+
+  // Re-measure (cache only) on host resize — font-size or DPR changes.
+  const ro = new ResizeObserver(() => measureCellSize())
   ro.observe(host)
+  // Start the lineHeight correction only once xterm has actually
+  // rendered: fit()/syncScrollArea read `renderer.dimensions`, which is
+  // undefined until the first paint (throws otherwise), and the screen
+  // element only settles a tick after `term.open` anyway.
   let firstRender: { dispose(): void } | null = term.onRender(() => {
-    measureCellSize()
+    // Renderer has painted now — `dimensions` is populated, so fit() is
+    // safe. Size to the viewport, then correct the cell height.
+    try {
+      fit.fit()
+    } catch {
+      /* not laid out yet */
+    }
+    correctLineHeight()
     firstRender?.dispose()
     firstRender = null
   })

@@ -14,7 +14,7 @@ export interface PaletteProps {
   query: string
   onQueryChange?: (q: string) => void
   /** Filter chips rendered between the ⌘ glyph and the input. Each entry
-   * is a sub-mode label (`@workspaces`, `#windows`, `$hosts`) or, when
+   * is a sub-mode label (`#sessions`, `$hosts`) or, when
    * the user has drilled into a row, a single `↳ <parent>` breadcrumb. */
   chips?: readonly string[]
   /** Body — rendered between the header and footer. Scrolls when long. */

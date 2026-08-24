@@ -1,5 +1,5 @@
 /**
- * BlockPane — one pane: history as DOM, the live grid in one xterm, and
+ * SessionView — one session: history as DOM, the live grid in one xterm, and
  * the composer.
  *
  * Model (PLAN.md M8): helmd owns the terminal. Rows that scroll out of
@@ -19,57 +19,57 @@
  *                its block's rows without anything moving: Warp's
  *                active tail.
  *
- * Input is the composer, not the shell's prompt (see paneState.ts):
+ * Input is the composer, not the shell's prompt (see sessionState.ts):
  *   prompt   → grid hidden, blocks pinned to the bottom, composer
  *   running  → grid shows the command; composer hidden for a shell,
  *              shown in Agent mode for an agent (Claude Code)
  *   alt      → the TUI owns the grid; agent composer if it's an agent
  *   raw      → plain terminal (no integration, or the process exited)
- * An agent that rings the bell is blocked on the user (a permission
- * prompt — the Claude hook only rings for those; end of turn is an
- * OSC 9 message): the composer closes and keys go straight to the TUI
- * until the user answers or presses ⏎ to reply.
+ * Agent bells feed notifications, but do not change the input surface:
+ * terminal programs use bells for both attention and ordinary turn
+ * completion, so they are not reliable evidence of a permission prompt.
  *
  * Stays mounted across switches: when `isVisible` flips to false the
  * parent hides us via `display: none`; the mirror keeps updating and
  * the painter catches up when we're shown again.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { MAX_HISTORY_PAGE } from '@bindings'
 import type { HostId } from '@bindings'
 import { commands } from '@lib/ipc'
 import { attachTerminal, getTheme, type HelmTerminal } from '@lib/terminal'
-import { locatePane, useStore } from '@lib/store'
+import { useStore } from '@lib/store'
 import * as blocks from '@lib/session/blocks'
 import {
   bodyStartLine,
   consumeJump,
   lastFinished,
-  usePaneBlocks,
+  useSessionBlocks,
   usePendingJump,
 } from '@lib/session/blocks'
 import * as screen from '@lib/session/screen'
 import { useScreenMeta } from '@lib/session/screen'
 import { attachPainter, type Painter } from '@lib/session/painter'
 import {
-  forgetPane,
+  forgetSession,
   reportEffective,
   setComposerMode,
   useComposerMode,
   type ComposerMode,
 } from '@lib/session/composer'
-import { AGENT_LAUNCH_COMMAND, derivePaneState, shellQuote } from '@lib/session/paneState'
+import { deriveSessionState } from '@lib/session/sessionState'
+import { agentName, agentNameForCommand, buildAgentCommand } from '@lib/session/agents'
 import { BlockHeader } from './Block'
 import { BlockList } from './BlockList'
 import { Composer } from './Composer'
 import { RowsView, rowsToText } from './Rows'
 import { SearchOverlay } from './SearchOverlay'
-import { ChevronDownIcon, SparkIcon } from '@features/sessions/icons'
+import { ChevronDownIcon } from '@features/sessions/icons'
 
-interface BlockPaneProps {
+interface SessionViewProps {
   hostId: HostId
-  paneId: string
+  sessionId: string
   isVisible?: boolean
 }
 
@@ -84,7 +84,7 @@ interface ScrollAnchor {
   scrollTop: number
 }
 
-export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) {
+export function SessionView({ hostId, sessionId, isVisible = true }: SessionViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const sentinelRef = useRef<HTMLDivElement>(null)
@@ -103,34 +103,58 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
   const [searchOpen, setSearchOpen] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
   const [focusKey, setFocusKey] = useState(0)
-  const pb = usePaneBlocks(hostId, paneId)
-  const meta = useScreenMeta(hostId, paneId)
-  const jump = usePendingJump(hostId, paneId)
+  const pb = useSessionBlocks(hostId, sessionId)
+  const meta = useScreenMeta(hostId, sessionId)
+  const jump = usePendingJump(hostId, sessionId)
 
-  // Primitive selectors: zustand re-renders on reference change.
-  const paneCwd = useStore((s) => locatePane(s.sessions.get(hostId), paneId)?.pane.cwd ?? null)
-  const paneBranch = useStore((s) => locatePane(s.sessions.get(hostId), paneId)?.pane.branch ?? null)
-  const spawned = useStore((s) => locatePane(s.sessions.get(hostId), paneId)?.pane.command ?? null)
+  const session = useStore((s) => s.sessions.get(hostId)?.sessions.get(sessionId))
+  const runningSession = useStore((s) => s.runningSessions.get(`${hostId}::${sessionId}`))
+  const sessionCwd = session?.cwd ?? null
+  const sessionBranch = session?.branch ?? null
+  const spawned = session?.command ?? null
+  const defaultAgentId = useStore((s) => s.defaultAgentId)
+  const customAgentTemplate = useStore((s) => s.customAgentTemplate)
 
-  const ps = useMemo(() => derivePaneState(pb, spawned || null), [pb, spawned])
-  const mode = useComposerMode(hostId, paneId, ps.kind)
-  reportEffective(hostId, paneId, ps.kind, mode)
-
-  // Bells acknowledged so far; an agent pane with a newer bell is blocked.
-  const [ackedBells, setAckedBells] = useState(pb.bells)
-  const bellsRef = useRef(pb.bells)
-  bellsRef.current = pb.bells
-  const blocked = ps.kind === 'agent' && pb.bells > ackedBells
-  const blockedRef = useRef(blocked)
-  blockedRef.current = blocked
-  const ackBells = () => setAckedBells(bellsRef.current)
+  const ps = useMemo(
+    () => deriveSessionState(pb, spawned || null, customAgentTemplate, runningSession?.agentName),
+    [pb, spawned, customAgentTemplate, runningSession?.agentName],
+  )
+  const defaultAgentName = agentName(defaultAgentId, customAgentTemplate)
+  const runningAgentName =
+    runningSession?.agentName ??
+    agentNameForCommand(ps.current?.cmdline ?? spawned, customAgentTemplate) ??
+    defaultAgentName
+  const mode = useComposerMode(hostId, sessionId, ps.kind)
+  reportEffective(hostId, sessionId, ps.kind, mode)
 
   const xtermShown = ps.phase !== 'prompt'
-  const composerShown =
-    ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent' && !blocked)
-  /** Agent pane in Terminal mode: typing lands in the TUI; keep the
+  const shownRef = useRef(xtermShown)
+  shownRef.current = xtermShown
+
+  // Fit the xterm to the viewport, at most once per frame. Called live
+  // from the viewport ResizeObserver so the grid grows and shrinks with
+  // the window instead of snapping after a debounce. fit() only resizes
+  // the PTY when the row/col count actually changes, so a drag that
+  // doesn't cross a cell boundary costs nothing downstream.
+  const fitRafRef = useRef(0)
+  const scheduleFit = useCallback(() => {
+    if (fitRafRef.current) return
+    fitRafRef.current = requestAnimationFrame(() => {
+      fitRafRef.current = 0
+      const t = termRef.current
+      if (!t || !visibleRef.current || !shownRef.current) return
+      try {
+        t.fit.fit()
+      } catch {
+        /* not laid out yet */
+      }
+    })
+  }, [])
+  useEffect(() => () => cancelAnimationFrame(fitRafRef.current), [])
+  const composerShown = ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent')
+  /** Agent session in Terminal mode: typing lands in the TUI; keep the
    * mode control reachable. */
-  const nativeBar = ps.kind === 'agent' && mode === 'terminal' && !blocked
+  const nativeBar = ps.kind === 'agent' && mode === 'terminal'
 
   const history = useMemo(() => {
     const out: string[] = []
@@ -158,7 +182,8 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
   // use. Lines below the band render as DOM.
   const cellH = termRef.current?.getCellSize().height ?? 20
   const liveStartRow = meta.alt ? 0 : Math.max(0, Math.min(meta.rows, bodyFrom - meta.topLine))
-  const liveEndRow = meta.alt ? meta.rows : Math.max(meta.usedRows, liveStartRow + 1)
+  const usedRows = ps.kind === 'agent' ? meta.agentUsedRows : meta.usedRows
+  const liveEndRow = meta.alt ? meta.rows : Math.max(usedRows, liveStartRow + 1)
   /** First absolute line the grid shows; DOM renders lines below it. */
   const gridFrom = xtermShown ? meta.topLine + liveStartRow : Infinity
   /** The xterm is always viewport-sized: that is the grid. */
@@ -166,7 +191,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
   const liveHeight = Math.min(hostHeight, (liveEndRow - liveStartRow) * cellH)
   const copyRunning = () =>
     void navigator.clipboard.writeText(
-      rowsToText(screen.rowsBetween(screen.getPaneScreen(hostId, paneId), bodyFrom, meta.topLine + liveEndRow)),
+      rowsToText(screen.rowsBetween(screen.getSessionScreen(hostId, sessionId), bodyFrom, meta.topLine + liveEndRow)),
     )
 
   // ---- xterm lifecycle + first paint ----
@@ -179,36 +204,28 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     const { term, dispose } = attached
     termRef.current = attached
     setHelmTerm(attached)
-    const painter = attachPainter(term, hostId, paneId, () => visibleRef.current)
+    const painter = attachPainter(term, hostId, sessionId, () => visibleRef.current)
     painterRef.current = painter
 
     void (async () => {
-      await Promise.all([blocks.ensureLoaded(hostId, paneId), screen.ensureScreen(hostId, paneId)])
+      await Promise.all([blocks.ensureLoaded(hostId, sessionId), screen.ensureScreen(hostId, sessionId)])
       if (ac.signal.aborted) return
       setReady(true)
-      const top = screen.getPaneScreen(hostId, paneId).topLine
-      void screen.ensureHistory(hostId, paneId, top - MAX_HISTORY_PAGE)
-      void commands.sessionResize(hostId, paneId, term.cols, term.rows)
+      const top = screen.getSessionScreen(hostId, sessionId).topLine
+      void screen.ensureHistory(hostId, sessionId, top - MAX_HISTORY_PAGE)
+      void commands.sessionResize(hostId, sessionId, term.cols, term.rows)
     })()
 
     const inputDisp = term.onData((data) => {
       if (ac.signal.aborted || !visibleRef.current) return
       if (isUserKeystroke(data)) {
-        dismissNotificationsFor(hostId, paneId)
-        if (blockedRef.current) {
-          // The user answered the agent — or asked to reply (⏎).
-          ackBells()
-          if (data === '\r') {
-            setFocusKey((k) => k + 1)
-            return
-          }
-        }
+        dismissNotificationsFor(hostId, sessionId)
       }
-      void screen.sendInput(hostId, paneId, data)
+      void screen.sendInput(hostId, sessionId, data)
     })
     const resizeDisp = term.onResize(({ cols, rows }) => {
       if (ac.signal.aborted) return
-      void commands.sessionResize(hostId, paneId, cols, rows)
+      void commands.sessionResize(hostId, sessionId, cols, rows)
     })
 
     return () => {
@@ -217,21 +234,21 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
       inputDisp.dispose()
       resizeDisp.dispose()
       dispose()
-      forgetPane(hostId, paneId)
+      forgetSession(hostId, sessionId)
       termRef.current = null
       painterRef.current = null
       setHelmTerm(null)
       setReady(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, paneId])
+  }, [hostId, sessionId])
 
-  // ---- the wheel over the grid scrolls the pane, not the terminal ----
+  // ---- the wheel over the grid scrolls the session, not the terminal ----
   // The grid has no scrollback, so there is nothing for xterm to
   // scroll; left to itself it would hand the wheel to an application
   // that asked for mouse reports (Claude Code turns those on and
   // treats wheel-up as "previous input"). Capture it on the host,
-  // scroll the pane's document, and keep it from xterm. Alt-screen
+  // scroll the session's document, and keep it from xterm. Alt-screen
   // TUIs (vim, less, htop) own the wheel as before, and Option+wheel
   // passes through to any application that wants it.
   useEffect(() => {
@@ -273,6 +290,9 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     }
     const viewport = new ResizeObserver((entries) => {
       setSlotHeight(Math.floor(entries[0]?.contentRect.height ?? 0))
+      // Fit live so the grid tracks the window during a drag, not 30ms
+      // after it stops.
+      scheduleFit()
       pin()
     })
     const body = new ResizeObserver(pin)
@@ -283,20 +303,14 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
       viewport.disconnect()
       body.disconnect()
     }
-  }, [])
+  }, [scheduleFit])
 
+  // Refit on the state transitions that change the grid's slot without a
+  // viewport resize: the session becoming visible, the composer showing or
+  // hiding, alt-screen toggling. The live resize above covers dragging.
   useEffect(() => {
-    const t = termRef.current
-    if (!t || slotHeight <= 0 || !xtermShown || !isVisible) return
-    const id = window.setTimeout(() => {
-      try {
-        t.fit.fit()
-      } catch {
-        /* not laid out yet */
-      }
-    }, 30)
-    return () => window.clearTimeout(id)
-  }, [slotHeight, ready, xtermShown, meta.alt, isVisible])
+    if (ready && xtermShown && isVisible) scheduleFit()
+  }, [ready, xtermShown, meta.alt, isVisible, scheduleFit])
 
   // ---- history paging: the sentinel at the top pulls older rows ----
   useEffect(() => {
@@ -306,19 +320,19 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     const io = new IntersectionObserver(
       (entries) => {
         if (!entries.some((e) => e.isIntersecting)) return
-        const s = screen.getPaneScreen(hostId, paneId)
+        const s = screen.getSessionScreen(hostId, sessionId)
         anchorRef.current = {
           loadedFrom: s.loadedFrom,
           scrollHeight: root.scrollHeight,
           scrollTop: root.scrollTop,
         }
-        void screen.ensureHistory(hostId, paneId, (s.loadedFrom ?? s.topLine) - MAX_HISTORY_PAGE)
+        void screen.ensureHistory(hostId, sessionId, (s.loadedFrom ?? s.topLine) - MAX_HISTORY_PAGE)
       },
       { root, rootMargin: '400px 0px 0px 0px' },
     )
     io.observe(el)
     return () => io.disconnect()
-  }, [hostId, paneId, ready, isVisible, moreAbove, meta.loadedFrom])
+  }, [hostId, sessionId, ready, isVisible, moreAbove, meta.loadedFrom])
 
   // ---- pin after every commit ----
   // Runs synchronously after each DOM update, before the browser can
@@ -342,7 +356,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     }
   }, [meta.loadedFrom, meta.historyVersion, isVisible, ready])
 
-  // ---- focus follows the input surface; a shown pane repaints ----
+  // ---- focus follows the input surface; a shown session repaints ----
   useEffect(() => {
     visibleRef.current = isVisible
     if (!isVisible) return
@@ -354,7 +368,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     }
   }, [isVisible, composerShown, ready])
 
-  // ---- Cmd+F: find across rows + the live grid (visible pane only) ----
+  // ---- Cmd+F: find across rows + the live grid (visible session only) ----
   useEffect(() => {
     if (!isVisible) return
     const onKeyDown = (e: KeyboardEvent) => {
@@ -373,9 +387,9 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     if (!jump || !ready || !isVisible) return
     const sc = scrollRef.current
     if (!sc) return
-    const s = screen.getPaneScreen(hostId, paneId)
+    const s = screen.getSessionScreen(hostId, sessionId)
     if (jump.line >= s.historyStart && jump.line < (s.loadedFrom ?? s.topLine)) {
-      void screen.ensureHistory(hostId, paneId, jump.line - 40)
+      void screen.ensureHistory(hostId, sessionId, jump.line - 40)
       return // re-runs when the page lands (meta.loadedFrom changes)
     }
     consumeJump(jump)
@@ -391,7 +405,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     } else {
       scrollToBottom(sc)
     }
-  }, [jump, ready, isVisible, hostId, paneId, meta.loadedFrom])
+  }, [jump, ready, isVisible, hostId, sessionId, meta.loadedFrom])
 
   // Following stops only when the position actually moves up — a
   // wheel, a scrollbar drag. Content growing underneath (the position
@@ -414,7 +428,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     else termRef.current?.term.focus()
   }
 
-  /** Text to the pane as typed input, ending with ⏎.
+  /** Text to the session as typed input, ending with ⏎.
    *
    * To an agent, always a bracketed paste followed by ⏎ in a separate
    * write: unbracketed text makes Claude Code's paste heuristic wait
@@ -424,40 +438,40 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
    * next tick. A shell gets `text⏎` in one write, multi-line as a
    * bracketed paste so it runs as a unit. */
   const sendText = (text: string) => {
-    dismissNotificationsFor(hostId, paneId)
+    dismissNotificationsFor(hostId, sessionId)
     const multiline = text.includes('\n')
     const bracketed = `\x1b[200~${text}\x1b[201~`
     if (ps.kind === 'agent') {
       void screen
-        .sendInput(hostId, paneId, bracketed)
+        .sendInput(hostId, sessionId, bracketed)
         .then(() => new Promise<void>((r) => window.setTimeout(r, 8)))
-        .then(() => screen.sendInput(hostId, paneId, '\r'))
+        .then(() => screen.sendInput(hostId, sessionId, '\r'))
     } else if (multiline) {
       void screen
-        .sendInput(hostId, paneId, bracketed)
+        .sendInput(hostId, sessionId, bracketed)
         .then(() => new Promise<void>((r) => window.setTimeout(r, 30)))
-        .then(() => screen.sendInput(hostId, paneId, '\r'))
+        .then(() => screen.sendInput(hostId, sessionId, '\r'))
     } else {
-      void screen.sendInput(hostId, paneId, `${text}\r`)
+      void screen.sendInput(hostId, sessionId, `${text}\r`)
     }
     atBottomRef.current = true
   }
 
   const onSend = (text: string) => {
     if (mode === 'agent' && ps.kind !== 'agent') {
-      sendText(`${AGENT_LAUNCH_COMMAND} ${shellQuote(text)}`)
+      sendText(buildAgentCommand(defaultAgentId, customAgentTemplate, text))
       return
     }
     // `clear` clears the block list too (Warp does the same); the
     // shell still runs it so its own state agrees.
     if (mode === 'terminal' && /^(clear|reset)$/.test(text.trim())) {
-      blocks.clearBefore(hostId, paneId, meta.topLine + meta.rows)
+      blocks.clearBefore(hostId, sessionId, meta.topLine + meta.rows)
     }
     sendText(text)
   }
 
   const onModeChange = (m: ComposerMode) => {
-    setComposerMode(hostId, paneId, ps.kind, m)
+    setComposerMode(hostId, sessionId, ps.kind, m)
     if (m === 'terminal' && ps.kind === 'agent') termRef.current?.term.focus()
   }
 
@@ -487,7 +501,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
               )}
               <BlockList
                 hostId={hostId}
-                paneId={paneId}
+                sessionId={sessionId}
                 blocks={pb.blocks}
                 clearedBefore={pb.clearedBefore}
                 meta={meta}
@@ -496,7 +510,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
             </>
           )}
           {/* The running block. Its xterm host keeps this exact spot in
-              the tree whatever the pane's phase, so the terminal is
+              the tree whatever the session's phase, so the terminal is
               attached once; the pre around it hides at a prompt. */}
           <div
             className={running ? 'helm-block group relative' : undefined}
@@ -505,7 +519,7 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
             {ready && running && <BlockHeader block={running} copyOutput={copyRunning} />}
             <pre className="helm-block-output" style={xtermShown ? undefined : { display: 'none' }}>
               {ready && xtermShown && !meta.alt && bodyFrom < gridFrom && (
-                <RowsView hostId={hostId} paneId={paneId} from={bodyFrom} to={gridFrom} />
+                <RowsView hostId={hostId} sessionId={sessionId} from={bodyFrom} to={gridFrom} />
               )}
               {/* The band: the viewport-sized xterm, clipped by sliding
                   it up to the running command's first row. `clip`, not
@@ -528,37 +542,31 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
         <Composer
           mode={mode}
           kind={ps.kind}
-          cwd={paneCwd}
-          branch={paneBranch}
+          cwd={sessionCwd}
+          branch={sessionBranch}
           history={history}
-          agentName={AGENT_LAUNCH_COMMAND}
+          agentName={ps.kind === 'agent' ? runningAgentName : defaultAgentName}
           onModeChange={onModeChange}
           onSend={onSend}
-          onRaw={(bytes) => void screen.sendInput(hostId, paneId, bytes)}
+          onRaw={(bytes) => void screen.sendInput(hostId, sessionId, bytes)}
+          onPathComplete={async (path, directoriesOnly) => {
+            const result = await commands.sessionPathComplete(
+              hostId,
+              sessionId,
+              path,
+              directoriesOnly,
+              100,
+            )
+            if (result.status === 'error') throw new Error(result.error)
+            return result.data
+          }}
           focusKey={focusKey}
         />
-      )}
-      {blocked && (
-        <button
-          type="button"
-          onClick={() => {
-            ackBells()
-            setFocusKey((k) => k + 1)
-          }}
-          className="helm-bar text-left"
-          title="Reply in the composer"
-        >
-          <SparkIcon size={14} className="shrink-0 text-[var(--terminal-claude,#D97757)]" />
-          <span className="flex-1 text-[12px] text-text-secondary">
-            {AGENT_LAUNCH_COMMAND} needs your approval — keys go straight to it
-          </span>
-          <span className="font-mono text-[11px] text-text-disabled">⏎ reply</span>
-        </button>
       )}
       {nativeBar && (
         <div className="helm-bar">
           <span className="flex-1 text-[12px] text-text-tertiary">
-            typing in {AGENT_LAUNCH_COMMAND} directly
+            typing in {runningAgentName} directly
           </span>
           <button
             type="button"
@@ -608,16 +616,13 @@ function scrollToBottom(el: HTMLElement | null) {
   el.scrollTop = el.scrollHeight
 }
 
-/** Dismiss-on-keystroke: a real keypress in this pane means the user
- * is acting on whatever notifications sat on its window. */
-function dismissNotificationsFor(hostId: HostId, paneId: string) {
+/** Dismiss-on-keystroke: a real keypress acknowledges this session. */
+function dismissNotificationsFor(hostId: HostId, sessionId: string) {
   const store = useStore.getState()
-  const windowId = locatePane(store.sessions.get(hostId), paneId)?.pane.windowId
-  if (!windowId) return
   const hasNotif = [...store.notifications.values()].some(
-    (n) => n.host_id === hostId && (n.window_id === windowId || n.pane_id === paneId),
+    (n) => n.host_id === hostId && n.session_id === sessionId,
   )
-  if (hasNotif) void commands.notificationDismissForWindow(hostId, windowId)
+  if (hasNotif) void commands.notificationDismissForSession(hostId, sessionId)
 }
 
 /** True iff `data` is real user input and NOT a terminal-state report

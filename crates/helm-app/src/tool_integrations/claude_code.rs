@@ -5,19 +5,19 @@
 //!
 //!   - `Notification` — Claude needs the user's input (tool approval,
 //!     idle-waiting). The headline use case for the inbox: "Claude is
-//!     waiting on me in workspace 3."
+//!     waiting on me in the build session."
 //!   - `Stop` — Claude finished a turn. Surfaces "task done" without
-//!     the user having to keep that pane focused.
+//!     the user having to keep that session focused.
 //!
-//! Both hooks write a BEL to `$HELM_TTY` — the pane's tty, exported by
+//! Both hooks write a BEL to `$HELM_TTY` — the session's tty, exported by
 //! helm's shell integration when the shell starts, so every process in
-//! the pane (Claude included) inherits it. helmd sees the BEL on the
-//! pane's PTY and turns it into a notification.
+//! the session (Claude included) inherits it. helmd sees the BEL on the
+//! session's PTY and turns it into a notification.
 //!
 //! NB: we deliberately do *not* use `printf '\a' > /dev/tty`. Claude
 //! runs hook commands with **no controlling terminal**, so `/dev/tty`
 //! doesn't exist and the write silently fails — earlier versions
-//! shipped exactly that and the bell never fired. Writing to the pane's
+//! shipped exactly that and the bell never fired. Writing to the session's
 //! tty by path is the reliable route. See `NOTIFICATION_HOOK_CMD` /
 //! `STOP_HOOK_CMD`. Install migrates
 //! legacy hooks (the `/dev/tty` one and the tmux-era `$TMUX_PANE` one)
@@ -72,13 +72,13 @@ const LEGACY_SENTINEL: &str = "helm-claude-notify";
 
 /// The `Notification` hook. Reads the event JSON from stdin: a
 /// permission prompt (or elicitation dialog) means Claude is *blocked*
-/// on the user, so it rings the bell — helmd raises a Bell and the pane
+/// on the user, so it rings the bell — helmd raises a Bell and the session
 /// hands keys to Claude. Anything else (idle prompt, auth) is an OSC 9
 /// message: an inbox row, no blocking.
 ///
 /// `$HELM_TTY` is exported by helm's shell integration (`zsh.zshrc`,
-/// `bash.sh`, `fish.fish`) as the pane's tty path. Writing there lands
-/// on the pane's PTY, where helmd picks it up. The guard makes this a
+/// `bash.sh`, `fish.fish`) as the session's tty path. Writing there lands
+/// on the session's PTY, where helmd picks it up. The guard makes this a
 /// no-op outside helm; the trailing `; true` keeps the hook's exit
 /// status 0 so a miss never disrupts Claude's flow.
 const NOTIFICATION_HOOK_CMD: &str = r#"[ -n "$HELM_TTY" ] && { p=$(cat); case "$p" in *permission_prompt*|*elicitation_dialog*) printf '\a';; *) printf '\033]9;Claude is waiting for input\a';; esac; } > "$HELM_TTY" 2>/dev/null; true # helm-notify:v3"#;
@@ -88,7 +88,11 @@ const NOTIFICATION_HOOK_CMD: &str = r#"[ -n "$HELM_TTY" ] && { p=$(cat); case "$
 const STOP_HOOK_CMD: &str = r#"[ -n "$HELM_TTY" ] && printf '\033]9;Claude finished\a' > "$HELM_TTY" 2>/dev/null; true # helm-notify:v3"#;
 
 fn hook_command(event: &str) -> &'static str {
-    if event == "Stop" { STOP_HOOK_CMD } else { NOTIFICATION_HOOK_CMD }
+    if event == "Stop" {
+        STOP_HOOK_CMD
+    } else {
+        NOTIFICATION_HOOK_CMD
+    }
 }
 
 /// Hook commands we wrote in earlier versions and should clean up on
@@ -124,16 +128,20 @@ impl ToolIntegration for ClaudeCodeIntegration {
 
     fn description(&self) -> &'static str {
         "Add Notification + Stop hooks to ~/.claude/settings.json so \
-         Helm knows when Claude needs your approval or finishes a turn. \
-         The inbox surfaces the session; the composer hands keys over \
-         while Claude waits on a prompt."
+         Helm knows when Claude needs attention or finishes a turn. \
+         The inbox surfaces the session while the composer remains \
+         available for replies and terminal controls."
     }
 
     fn process_names(&self) -> &'static [&'static str] {
         &["claude", "claude-code"]
     }
 
-    async fn is_installed(&self, host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<bool, String> {
+    async fn is_installed(
+        &self,
+        host: &Host,
+        ssh: Option<&Arc<SshSession>>,
+    ) -> Result<bool, String> {
         let value = read_settings(host, ssh).await?;
         Ok(has_hook(&value, "Notification") && has_hook(&value, "Stop"))
     }
@@ -196,8 +204,7 @@ async fn write_settings(
     ssh: Option<&Arc<SshSession>>,
     value: &Value,
 ) -> Result<(), String> {
-    let serialized =
-        serde_json::to_string_pretty(value).map_err(|e| format!("serialize: {e}"))?;
+    let serialized = serde_json::to_string_pretty(value).map_err(|e| format!("serialize: {e}"))?;
     if host.port == 0 {
         let path = local_settings_path()?;
         return write_atomic_local(&path, &serialized);
@@ -251,7 +258,10 @@ fn parse_or_empty(s: &str) -> Result<Value, String> {
 /// returns false for them and the install path runs to migrate them.
 /// Ignores unrelated hook entries (the user may have their own).
 fn has_hook(value: &Value, event: &str) -> bool {
-    let Some(arr) = value.pointer(&format!("/hooks/{event}")).and_then(|e| e.as_array()) else {
+    let Some(arr) = value
+        .pointer(&format!("/hooks/{event}"))
+        .and_then(|e| e.as_array())
+    else {
         return false;
     };
     arr.iter().any(|matcher| {
@@ -325,8 +335,7 @@ fn remove_hook(value: &mut Value, event: &str) {
 /// host persistence layer uses.
 fn write_atomic_local(path: &std::path::Path, serialized: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("json.helm.tmp");
     fs::write(&tmp, serialized).map_err(|e| format!("write tmp: {e}"))?;
@@ -434,7 +443,8 @@ mod tests {
 
     #[test]
     fn tmux_era_hook_is_ours_but_not_current() {
-        let v1 = r#"p="$TMUX_PANE"; [ -n "$p" ] && { printf '\a' > "$t"; }; true # helm-claude-notify"#;
+        let v1 =
+            r#"p="$TMUX_PANE"; [ -n "$p" ] && { printf '\a' > "$t"; }; true # helm-claude-notify"#;
         assert!(command_is_ours(v1));
         assert!(!command_is_current(v1));
     }
@@ -455,7 +465,10 @@ mod tests {
         )
         .unwrap();
         // Legacy broken hook present, but not recognized as "installed".
-        assert!(!has_hook(&v, "Notification"), "legacy doesn't count as installed");
+        assert!(
+            !has_hook(&v, "Notification"),
+            "legacy doesn't count as installed"
+        );
         ensure_hook(&mut v, "Notification");
         assert!(has_hook(&v, "Notification"), "current hook now installed");
         let arr = v
@@ -484,16 +497,17 @@ mod tests {
         )
         .unwrap();
         remove_hook(&mut v, "Stop");
-        let arr = v
-            .pointer("/hooks/Stop")
-            .and_then(|n| n.as_array())
-            .unwrap();
+        let arr = v.pointer("/hooks/Stop").and_then(|n| n.as_array()).unwrap();
         assert!(arr.is_empty(), "legacy broken hook cleaned up on uninstall");
     }
 
     #[test]
     fn parse_or_empty_handles_empty_file() {
         assert!(parse_or_empty("").unwrap().as_object().unwrap().is_empty());
-        assert!(parse_or_empty("   \n").unwrap().as_object().unwrap().is_empty());
+        assert!(parse_or_empty("   \n")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .is_empty());
     }
 }

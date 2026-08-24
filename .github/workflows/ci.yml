@@ -18,6 +18,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
+      # tauri-build checks that every `bundle.externalBin` sidecar exists
+      # at compile time, so helm-app won't even build until helmd is
+      # staged at crates/helm-app/binaries/helmd-<triple>.
+      - run: bash scripts/build-helmd.sh
       - run: cargo test --workspace
 
       - uses: oven-sh/setup-bun@v2

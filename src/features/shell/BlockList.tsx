@@ -1,5 +1,5 @@
 /**
- * Finished blocks for a pane, oldest first, each with the row range it
+ * Finished blocks for a session, oldest first, each with the row range it
  * should render right now — the one place that knows how the loaded
  * history, the live grid and a block's line range combine:
  *
@@ -23,7 +23,7 @@ const MAX_RENDERED = 400
 
 interface BlockListProps {
   hostId: HostId
-  paneId: string
+  sessionId: string
   blocks: readonly BlockInfo[]
   clearedBefore: number
   meta: ScreenMeta
@@ -31,7 +31,7 @@ interface BlockListProps {
   gridFrom: number
 }
 
-export function BlockList({ hostId, paneId, blocks, clearedBefore, meta, gridFrom }: BlockListProps) {
+export function BlockList({ hostId, sessionId, blocks, clearedBefore, meta, gridFrom }: BlockListProps) {
   const { loadedFrom, topLine } = meta
   const shown = useMemo(() => {
     const from = loadedFrom ?? topLine
@@ -50,7 +50,7 @@ export function BlockList({ hostId, paneId, blocks, clearedBefore, meta, gridFro
       {shown.map(({ block, lo, hi }, i) => (
         <div key={block.id}>
           {i > 0 && <div className="helm-divider" />}
-          <Block hostId={hostId} paneId={paneId} block={block} lo={lo} hi={hi} />
+          <Block hostId={hostId} sessionId={sessionId} block={block} lo={lo} hi={hi} />
         </div>
       ))}
       <div className="helm-divider" />

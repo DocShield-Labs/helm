@@ -1,18 +1,17 @@
 /**
- * NotificationPeek — hover an inbox row and the pane's recent output
- * slides down from the top of the pane area, so "still spinning" vs
- * "really done" is answerable without switching windows.
+ * NotificationPeek — hover an inbox row and the session's recent output
+ * slides down from the top of the terminal area.
  *
- * Source data is the pane's model mirror (`lib/session/screen`): the
+ * Source data is the session's model mirror (`lib/session/screen`): the
  * grid plus the last few history rows, paged in on demand. The peek
- * re-renders on every screen change while open, so a live pane's
+ * re-renders on every screen change while open, so a live session's
  * output keeps moving under the cursor.
  *
  * Two behaviours layered on the hover:
  *   - a short grace period on mouse-leave so the pointer can cross
  *     from the row into the panel;
  *   - a "merge" animation when the row is clicked: the panel lifts and
- *     blurs into the pane that's taking over, then the peek closes.
+ *     blurs into the session that's taking over, then the peek closes.
  */
 
 import { useEffect, useMemo, useRef } from 'react'
@@ -52,52 +51,38 @@ export function NotificationPeek() {
   const notif = peekedId ? notifications.get(peekedId) : undefined
   const host = notif ? hosts.get(notif.host_id) : undefined
 
-  // Make sure the pane's grid and a few rows above it are known, then
+  // Make sure the session's grid and a few rows above it are known, then
   // follow every change while the peek is open.
   const peekHost = notif?.host_id ?? ''
-  const peekPane = notif?.pane_id ?? ''
+  const peekSession = notif?.session_id ?? ''
   useEffect(() => {
-    if (!peekHost || !peekPane) return
-    void screen.ensureScreen(peekHost, peekPane).then(() => {
-      const s = screen.getPaneScreen(peekHost, peekPane)
-      void screen.ensureHistory(peekHost, peekPane, s.topLine - PEEK_ROWS)
+    if (!peekHost || !peekSession) return
+    void screen.ensureScreen(peekHost, peekSession).then(() => {
+      const s = screen.getSessionScreen(peekHost, peekSession)
+      void screen.ensureHistory(peekHost, peekSession, s.topLine - PEEK_ROWS)
     })
-  }, [peekHost, peekPane])
-  const version = screen.useScreenVersion(peekHost, peekPane)
+  }, [peekHost, peekSession])
+  const version = screen.useScreenVersion(peekHost, peekSession)
 
   const text = useMemo(() => {
-    if (!peekHost || !peekPane) return ''
-    return screen.tailText(screen.getPaneScreen(peekHost, peekPane), PEEK_ROWS)
+    if (!peekHost || !peekSession) return ''
+    return screen.tailText(screen.getSessionScreen(peekHost, peekSession), PEEK_ROWS)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [peekHost, peekPane, version])
+  }, [peekHost, peekSession, version])
 
-  // Breadcrumb: "workspace · window" for the notification's window.
-  let windowLabel = ''
+  let sessionLabel = ''
   if (notif) {
     const hs = sessions.get(notif.host_id)
-    if (hs && notif.window_id) {
-      for (const ws of hs.workspaces.values()) {
-        const win = ws.windows.get(notif.window_id)
-        if (win) {
-          windowLabel = `${ws.name} · ${win.name}`
-          break
-        }
-      }
-    }
+    sessionLabel = hs?.sessions.get(notif.session_id)?.name ?? ''
   }
 
-  // Don't peek at the window the user is already looking at.
+  // Don't peek at the session the user is already looking at.
   const activeMatchesPeek = useMemo(() => {
     if (!notif) return false
     if (activeHostId !== notif.host_id) return false
     const hs = sessions.get(notif.host_id)
     if (!hs) return false
-    const ws = hs.activeWorkspaceId ? hs.workspaces.get(hs.activeWorkspaceId) : undefined
-    if (!ws) return false
-    for (const w of ws.windows.values()) {
-      if (w.active && w.id === notif.window_id) return true
-    }
-    return false
+    return hs.activeSessionId === notif.session_id
   }, [notif, activeHostId, sessions])
 
   const merging = !!mergingInboxId && mergingInboxId === peekedId
@@ -151,7 +136,7 @@ export function NotificationPeek() {
             <span className="opacity-50">·</span>
             <span className="text-text-secondary">{host?.name ?? '?'}</span>
             <span className="opacity-50">·</span>
-            <span>{windowLabel || notif.pane_id}</span>
+            <span>{sessionLabel || notif.session_id}</span>
           </div>
           {/* flex-col-reverse pins the pre to the visual bottom; when
               the panel hits maxHeight the body clips from the top so

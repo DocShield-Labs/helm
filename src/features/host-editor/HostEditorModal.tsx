@@ -38,7 +38,6 @@ export function HostEditorModal({ open, initial, onClose, onSaved }: HostEditorM
   const [authChoice, setAuthChoice] = useState<AuthChoice>('agent')
   const [keyPath, setKeyPath] = useState('~/.ssh/id_ed25519')
   const [password, setPassword] = useState('')
-  const [defaultWorkspace, setDefaultWorkspace] = useState('main')
   const [aliases, setAliases] = useState<SshConfigAlias[]>([])
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -54,7 +53,6 @@ export function HostEditorModal({ open, initial, onClose, onSaved }: HostEditorM
       setHostname(initial.hostname)
       setUser(initial.user)
       setPort(String(initial.port || 22))
-      setDefaultWorkspace(initial.default_workspace)
       setPassword('')
       if (initial.auth === 'Agent') setAuthChoice('agent')
       else if (initial.auth === 'Password') setAuthChoice('password')
@@ -70,7 +68,6 @@ export function HostEditorModal({ open, initial, onClose, onSaved }: HostEditorM
       setAuthChoice('agent')
       setKeyPath('~/.ssh/id_ed25519')
       setPassword('')
-      setDefaultWorkspace('main')
     }
   }, [open, initial])
 
@@ -102,7 +99,6 @@ export function HostEditorModal({ open, initial, onClose, onSaved }: HostEditorM
     /^\d+$/.test(port.trim()) &&
     parseInt(port, 10) > 0 &&
     parseInt(port, 10) <= 65535 &&
-    defaultWorkspace.trim().length > 0 &&
     (authChoice !== 'keyfile' || keyPath.trim().length > 0) &&
     (authChoice !== 'password' || isEdit || password.length > 0)
   // For edit mode we tolerate an empty password — user might just be
@@ -129,7 +125,6 @@ export function HostEditorModal({ open, initial, onClose, onSaved }: HostEditorM
         user: user.trim(),
         auth,
         jump_host: initial?.jump_host ?? null,
-        default_workspace: defaultWorkspace.trim(),
         startup_commands: initial?.startup_commands ?? [],
       }
       const res = await commands.hostSave(host)
@@ -287,17 +282,6 @@ export function HostEditorModal({ open, initial, onClose, onSaved }: HostEditorM
           </Field>
         )}
 
-        <Field
-          label="Default workspace"
-          hint="created on first connect if no tmux sessions already exist"
-        >
-          <Input
-            mono
-            value={defaultWorkspace}
-            onChange={(e) => setDefaultWorkspace(e.target.value)}
-            placeholder="main"
-          />
-        </Field>
       </div>
     </Modal>
   )

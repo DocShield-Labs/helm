@@ -1,6 +1,6 @@
 # Helm zsh integration — .zshenv forwarder.
 #
-# helmd starts every pane with ZDOTDIR pointed at this directory so that
+# helmd starts every session with ZDOTDIR pointed at this directory so that
 # zsh picks up OUR .zshrc, which installs the OSC 133 hooks. But zsh reads
 # *every* startup file from $ZDOTDIR, not just .zshrc:
 #

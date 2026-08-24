@@ -8,10 +8,10 @@
 //! stateful across arbitrarily-split reads (see `FrameDecoder`).
 //!
 //! Since v4 the daemon owns the terminal model: clients never see raw
-//! PTY bytes. A pane is a grid (`Screen`, updated by `ScreenDiff`) plus
+//! PTY bytes. A session is a grid (`Screen`, updated by `ScreenDiff`) plus
 //! a line history of rows that scrolled off the top (`HistoryAppend`,
 //! paged with `History`). Positions are absolute line numbers that are
-//! monotonic for the pane's lifetime — blocks, search hits and history
+//! monotonic for the session's lifetime — blocks, search hits and history
 //! pages all address the same line space.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -28,7 +28,7 @@ pub mod client;
 /// as a different variant entirely. The app treats any non-`HelloAck`
 /// first message as a stale daemon for that reason — don't rely on the
 /// rejection text surviving a version gap.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Upper bound on a single frame. History pages are capped well below
 /// this; the cap exists so a corrupt length prefix fails fast instead
@@ -76,9 +76,7 @@ macro_rules! id_newtype {
     };
 }
 
-id_newtype!(WorkspaceId);
-id_newtype!(WindowId);
-id_newtype!(PaneId);
+id_newtype!(SessionId);
 id_newtype!(BlockId);
 id_newtype!(NotificationId);
 
@@ -211,39 +209,52 @@ pub enum ClientMsg {
         client_name: String,
     },
     /// Subscribe to live broadcasts (screen diffs, history, blocks,
-    /// tree changes, notifications). Pane contents are pulled with
-    /// `Screen` / `History` as panes are shown.
+    /// tree changes, notifications). Session contents are pulled with
+    /// `Screen` / `History` as sessions are shown.
     Attach,
-    /// Keystrokes / pasted bytes for a pane's PTY. Raw bytes — no
+    /// Keystrokes / pasted bytes for a session's PTY. Raw bytes — no
     /// encoding, no hex, no send-keys quoting hazards.
-    Input { pane: PaneId, bytes: Vec<u8> },
+    Input {
+        session: SessionId,
+        bytes: Vec<u8>,
+    },
     /// The focused client owns the size. Last writer wins; no unions.
-    Resize { pane: PaneId, cols: u16, rows: u16 },
-    /// The pane's current grid. Answered with `Screen` carrying `req_id`.
-    Screen { req_id: u64, pane: PaneId },
+    Resize {
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    },
+    /// The session's current grid. Answered with `Screen` carrying `req_id`.
+    Screen {
+        req_id: u64,
+        session: SessionId,
+    },
     /// History rows in `[from_line, to_line)`, clamped to what the
     /// daemon retains and to `MAX_HISTORY_PAGE` (from the end, so a
     /// client paging backwards gets the newest rows first). Answered
     /// with `History` carrying `req_id`.
-    History { req_id: u64, pane: PaneId, from_line: u64, to_line: u64 },
-    /// Create a workspace. Also spawns an initial window (default
-    /// shell) so a fresh workspace is immediately usable — the tmux
-    /// "session always has a window" semantic. Answered with `Created`
-    /// carrying `req_id` (plus a `TreeChanged` broadcast).
-    NewWorkspace { req_id: u64, name: Option<String> },
-    /// Answered with `Created` carrying `req_id`.
-    NewWindow {
+    History {
         req_id: u64,
-        workspace: WorkspaceId,
+        session: SessionId,
+        from_line: u64,
+        to_line: u64,
+    },
+    /// Create a long-running terminal session. Answered with `Created`
+    /// carrying `req_id` plus a `TreeChanged` broadcast.
+    NewSession {
+        req_id: u64,
         name: Option<String>,
         cwd: Option<String>,
         /// argv to exec instead of the default login shell.
         command: Option<Vec<String>>,
     },
-    KillWindow { window: WindowId },
-    KillWorkspace { workspace: WorkspaceId },
-    RenameWorkspace { workspace: WorkspaceId, name: String },
-    RenameWindow { window: WindowId, name: String },
+    KillSession {
+        session: SessionId,
+    },
+    RenameSession {
+        session: SessionId,
+        name: String,
+    },
     /// Server-side search over history + grid rows (plain text of each
     /// row). Answered with `SearchResults` carrying `req_id`.
     Search {
@@ -254,14 +265,31 @@ pub enum ClientMsg {
         scope: SearchScope,
         max_results: u32,
     },
-    /// The pane's block table (historical blocks are not streamed —
-    /// a reattaching client asks once per pane). Answered with `Blocks`.
-    Blocks { req_id: u64, pane: PaneId },
+    /// The session's block table (historical blocks are not streamed —
+    /// a reattaching client asks once per session). Answered with `Blocks`.
+    Blocks {
+        req_id: u64,
+        session: SessionId,
+    },
+    /// Filesystem path candidates relative to the session's current cwd.
+    /// `path` is an unescaped shell token prefix; quoting and insertion
+    /// remain a client concern. Answered with `PathCompletions`.
+    CompletePath {
+        req_id: u64,
+        session: SessionId,
+        path: String,
+        directories_only: bool,
+        max_results: u32,
+    },
     /// Round-trip probe (the app's latency readout). Answered with `Pong`.
-    Ping { req_id: u64 },
+    Ping {
+        req_id: u64,
+    },
     /// The client has shown these to the user; drop them from the
     /// daemon's offline queue.
-    AckNotifications { up_to: NotificationId },
+    AckNotifications {
+        up_to: NotificationId,
+    },
     /// Orderly daemon shutdown (dev tooling; the app never sends this).
     Shutdown,
 }
@@ -269,8 +297,7 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SearchScope {
     All,
-    Workspace(WorkspaceId),
-    Pane(PaneId),
+    Session(SessionId),
 }
 
 // ---------------------------------------------------------------------------
@@ -291,14 +318,18 @@ pub enum DaemonMsg {
     /// Full grid. `req_id` is set when answering `ClientMsg::Screen`;
     /// `None` for broadcasts (resize, alt-screen swap, clear — anything
     /// the model reports as full damage).
-    Screen { req_id: Option<u64>, pane: PaneId, screen: Screen },
+    Screen {
+        req_id: Option<u64>,
+        session: SessionId,
+        screen: Screen,
+    },
     /// Rows that changed since the last `Screen` / `ScreenDiff`, with
-    /// the cursor and modes as of now. Coalesced per pane at ≤ 60 Hz.
+    /// the cursor and modes as of now. Coalesced per session at ≤ 60 Hz.
     /// `scroll` rows left the top of the grid first (they arrived as
     /// `HistoryAppend`): shift the grid up by that much, then apply
     /// `rows`, whose indices are post-shift.
     ScreenDiff {
-        pane: PaneId,
+        session: SessionId,
         top_line: u64,
         scroll: u16,
         rows: Vec<(u16, Row)>,
@@ -308,13 +339,17 @@ pub enum DaemonMsg {
     /// Rows that scrolled out of the primary grid since the last flush;
     /// `first_line` is the absolute line of `rows[0]` and the new
     /// `top_line` is `first_line + rows.len()`.
-    HistoryAppend { pane: PaneId, first_line: u64, rows: Vec<Row> },
+    HistoryAppend {
+        session: SessionId,
+        first_line: u64,
+        rows: Vec<Row>,
+    },
     /// Reply to `History`. `from_line` is the absolute line of `rows[0]`
     /// (may be later than asked when clamped); `history_start` is the
     /// oldest line the daemon still holds; `top_line` is the grid top.
     History {
         req_id: u64,
-        pane: PaneId,
+        session: SessionId,
         from_line: u64,
         rows: Vec<Row>,
         history_start: u64,
@@ -322,32 +357,61 @@ pub enum DaemonMsg {
     },
     /// OSC 133 segmentation, parsed statefully at ingest. Sent on block
     /// start (prompt), on command capture, and on finish (exit code).
-    Block { pane: PaneId, block: BlockMeta },
+    Block {
+        session: SessionId,
+        block: BlockMeta,
+    },
     /// DECSET 1049/47 tracking: the frontend swaps the block list for a
     /// plain grid while a TUI holds the alt screen.
-    ModeChange { pane: PaneId, alt_screen: bool },
-    /// Any workspace/window/pane lifecycle change. Full snapshot — small,
+    ModeChange {
+        session: SessionId,
+        alt_screen: bool,
+    },
+    /// Any session lifecycle change. Full snapshot — small,
     /// and it keeps the client trivially convergent.
-    TreeChanged { state: TreeSnapshot },
-    PaneExited { pane: PaneId, status: Option<i32> },
-    /// Reply to `NewWorkspace` / `NewWindow`, sent only to the
-    /// requesting client. `workspace` always set; `window`/`pane` set
-    /// for both ops (a new workspace comes with its initial window).
+    TreeChanged {
+        state: TreeSnapshot,
+    },
+    SessionExited {
+        session: SessionId,
+        status: Option<i32>,
+    },
+    /// Reply to `NewSession`, sent only to the requesting client.
     Created {
         req_id: u64,
-        workspace: WorkspaceId,
-        window: Option<WindowId>,
-        pane: Option<PaneId>,
+        session: SessionId,
     },
-    SearchResults { req_id: u64, matches: Vec<SearchMatch>, truncated: bool },
-    /// Reply to `Blocks`: every block the daemon retains for the pane,
+    SearchResults {
+        req_id: u64,
+        matches: Vec<SearchMatch>,
+        truncated: bool,
+    },
+    /// Reply to `Blocks`: every block the daemon retains for the session,
     /// oldest first.
-    Blocks { req_id: u64, pane: PaneId, blocks: Vec<BlockMeta> },
-    Pong { req_id: u64 },
-    Notification { note: Notification },
+    Blocks {
+        req_id: u64,
+        session: SessionId,
+        blocks: Vec<BlockMeta>,
+    },
+    PathCompletions {
+        req_id: u64,
+        session: SessionId,
+        candidates: Vec<PathCompletion>,
+        truncated: bool,
+    },
+    Pong {
+        req_id: u64,
+    },
+    Notification {
+        note: Notification,
+    },
     /// A failed operation. `req_id` is set when the failure answers a
     /// request/reply message, so the waiter resolves instead of timing out.
-    Error { req_id: Option<u64>, context: String, message: String },
+    Error {
+        req_id: Option<u64>,
+        context: String,
+        message: String,
+    },
 }
 
 impl DaemonMsg {
@@ -359,6 +423,7 @@ impl DaemonMsg {
             DaemonMsg::Created { req_id, .. }
             | DaemonMsg::SearchResults { req_id, .. }
             | DaemonMsg::Blocks { req_id, .. }
+            | DaemonMsg::PathCompletions { req_id, .. }
             | DaemonMsg::History { req_id, .. }
             | DaemonMsg::Pong { req_id } => Some(*req_id),
             DaemonMsg::Screen { req_id, .. } | DaemonMsg::Error { req_id, .. } => *req_id,
@@ -367,33 +432,36 @@ impl DaemonMsg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathCompletion {
+    /// Completed token value, without shell escaping.
+    pub value: String,
+    pub kind: PathEntryKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeSnapshot {
-    pub workspaces: Vec<WorkspaceInfo>,
+    pub sessions: Vec<SessionInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceInfo {
-    pub id: WorkspaceId,
+pub struct SessionInfo {
+    pub id: SessionId,
     pub name: String,
-    pub windows: Vec<WindowInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowInfo {
-    pub id: WindowId,
-    pub name: String,
-    pub panes: Vec<PaneInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaneInfo {
-    pub id: PaneId,
     pub cols: u16,
     pub rows: u16,
     pub alt_screen: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd` (a worktree's own root); `None` outside a
+    /// repo. The sidebar groups sessions by it.
+    pub root: Option<String>,
     /// Foreground command name if known ("claude", "cargo", …).
     pub command: Option<String>,
 }
@@ -412,6 +480,8 @@ pub struct BlockMeta {
     pub cmdline: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd` at the prompt; `None` outside a repo.
+    pub root: Option<String>,
     pub exit_code: Option<i32>,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
@@ -420,7 +490,7 @@ pub struct BlockMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub id: NotificationId,
-    pub pane: PaneId,
+    pub session: SessionId,
     pub kind: NotificationKind,
     /// Last non-empty grid row at event time, ≤ ~120 chars.
     pub preview: String,
@@ -433,7 +503,9 @@ pub enum NotificationKind {
     /// OSC 9 (`ESC ] 9 ; text BEL`) — a notification with a message,
     /// the convention iTerm2 / ConEmu / Windows Terminal use. Unlike a
     /// bell it does not mean the program is blocked on the user.
-    Message { text: String },
+    Message {
+        text: String,
+    },
     /// A command finished with a non-zero exit. Carries what the daemon
     /// already knows from the block so offline notifications are as
     /// rich as live ones.
@@ -446,7 +518,7 @@ pub enum NotificationKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMatch {
-    pub pane: PaneId,
+    pub session: SessionId,
     /// Which block the line belongs to, when block-indexed.
     pub block: Option<BlockId>,
     /// Absolute line of the matched row — the jump anchor.
@@ -565,9 +637,9 @@ pub fn connect_or_spawn_socket(
 /// `Shutdown` frame first (any client may send one — it's the user's
 /// own daemon), then a `pkill` of `helmd serve --socket <socket>` for
 /// daemons too old to understand the frame, then the socket path is
-/// unlinked so a fresh `serve` can bind. Used when a running daemon
-/// speaks another protocol version than the app: the sessions inside
-/// it are unreachable either way, so restarting loses nothing usable.
+/// unlinked so a fresh `serve` can bind. This is an explicit destructive
+/// operation: callers must not use it merely because protocols differ,
+/// since the daemon may own live sessions.
 #[cfg(unix)]
 pub fn shutdown_socket(socket: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write;
@@ -615,11 +687,11 @@ mod tests {
                 client_name: "helm-app test".into(),
             },
             ClientMsg::Input {
-                pane: PaneId(7),
+                session: SessionId(7),
                 bytes: b"cargo test\r".to_vec(),
             },
             ClientMsg::History {
-                pane: PaneId(7),
+                session: SessionId(7),
                 req_id: 4,
                 from_line: 4096,
                 to_line: 8192,
@@ -632,13 +704,26 @@ mod tests {
                 scope: SearchScope::All,
                 max_results: 60,
             },
+            ClientMsg::CompletePath {
+                req_id: 10,
+                session: SessionId(7),
+                path: "src/co".into(),
+                directories_only: false,
+                max_results: 100,
+            },
         ]
     }
 
     fn sample_row() -> Row {
         Row {
             spans: vec![
-                Span { text: "error".into(), style: Style { fg: Color::Indexed(1), ..Default::default() } },
+                Span {
+                    text: "error".into(),
+                    style: Style {
+                        fg: Color::Indexed(1),
+                        ..Default::default()
+                    },
+                },
                 Span {
                     text: ": \u{1f600} wide".into(),
                     style: Style {
@@ -656,16 +741,26 @@ mod tests {
     fn sample_daemon_msgs() -> Vec<DaemonMsg> {
         vec![
             DaemonMsg::ScreenDiff {
-                pane: PaneId(7),
+                session: SessionId(7),
                 top_line: 123_456,
                 scroll: 1,
                 rows: vec![(3, sample_row()), (4, Row::default())],
-                cursor: Cursor { row: 4, col: 0, visible: true, shape: CursorShape::Beam, blink: true },
+                cursor: Cursor {
+                    row: 4,
+                    col: 0,
+                    visible: true,
+                    shape: CursorShape::Beam,
+                    blink: true,
+                },
                 modes: modes::BRACKETED_PASTE | modes::FOCUS_IN_OUT,
             },
-            DaemonMsg::HistoryAppend { pane: PaneId(7), first_line: 123_455, rows: vec![sample_row()] },
+            DaemonMsg::HistoryAppend {
+                session: SessionId(7),
+                first_line: 123_455,
+                rows: vec![sample_row()],
+            },
             DaemonMsg::Block {
-                pane: PaneId(7),
+                session: SessionId(7),
                 block: BlockMeta {
                     id: BlockId(3),
                     start_line: 100,
@@ -675,14 +770,24 @@ mod tests {
                     cmdline: Some("cargo build --release".into()),
                     cwd: Some("/Users/x/code".into()),
                     branch: Some("main".into()),
+                    root: None,
                     exit_code: Some(0),
                     started_at_ms: Some(1_700_000_000_000),
                     finished_at_ms: Some(1_700_000_042_100),
                 },
             },
             DaemonMsg::ModeChange {
-                pane: PaneId(7),
+                session: SessionId(7),
                 alt_screen: true,
+            },
+            DaemonMsg::PathCompletions {
+                req_id: 10,
+                session: SessionId(7),
+                candidates: vec![PathCompletion {
+                    value: "src/components/".into(),
+                    kind: PathEntryKind::Directory,
+                }],
+                truncated: false,
             },
         ]
     }
@@ -735,18 +840,37 @@ mod tests {
             top_line: 0,
             history_start: 0,
             lines: vec![Row::default()],
-            cursor: Cursor { row: 0, col: 0, visible: true, shape: CursorShape::Block, blink: false },
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+                shape: CursorShape::Block,
+                blink: false,
+            },
             modes: 0,
         };
         assert_eq!(
-            DaemonMsg::Screen { req_id: Some(5), pane: PaneId(1), screen: screen.clone() }.req_id(),
+            DaemonMsg::Screen {
+                req_id: Some(5),
+                session: SessionId(1),
+                screen: screen.clone()
+            }
+            .req_id(),
             Some(5)
         );
-        assert_eq!(DaemonMsg::Screen { req_id: None, pane: PaneId(1), screen }.req_id(), None);
+        assert_eq!(
+            DaemonMsg::Screen {
+                req_id: None,
+                session: SessionId(1),
+                screen
+            }
+            .req_id(),
+            None
+        );
         assert_eq!(
             DaemonMsg::History {
                 req_id: 8,
-                pane: PaneId(1),
+                session: SessionId(1),
                 from_line: 0,
                 rows: vec![],
                 history_start: 0,
@@ -754,6 +878,16 @@ mod tests {
             }
             .req_id(),
             Some(8)
+        );
+        assert_eq!(
+            DaemonMsg::PathCompletions {
+                req_id: 9,
+                session: SessionId(1),
+                candidates: vec![],
+                truncated: false,
+            }
+            .req_id(),
+            Some(9)
         );
     }
 

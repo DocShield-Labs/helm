@@ -1,27 +1,27 @@
 /**
  * Registry barrel. Re-exports types and assembles the static action list.
- * Dynamic projections (workspaces, windows, hosts, pins) live in their
+ * Dynamic projections (sessions and hosts) live in their
  * own modules and are pulled in by the palette at open time, not here.
  */
 
 import type { Action } from './types'
 import { chromeActions } from './chrome'
 import { paletteActions } from './palette'
-import { workspaceActions } from './workspace'
-import { windowActions } from './window'
+import { sessionActions } from './session'
 import { inboxActions } from './inbox'
 import { themeActions } from './theme'
 import { composerActions } from './composer'
+import { agentActions } from './agent'
 
 export type { Action, ActionContext, ActionKind, ActionSource } from './types'
 
 export const STATIC_ACTIONS: Action[] = [
   ...chromeActions,
   ...paletteActions,
-  ...workspaceActions,
-  ...windowActions,
+  ...sessionActions,
   ...inboxActions,
   ...themeActions,
+  ...agentActions,
   ...composerActions,
 ]
 

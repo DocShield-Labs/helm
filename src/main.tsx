@@ -21,13 +21,8 @@ import './index.css'
         [...s.sessions.entries()].map(([hid, hs]) => [
           hid,
           {
-            activeWorkspaceId: hs.activeWorkspaceId,
-            workspaces: [...hs.workspaces.values()].map((w) => ({
-              id: w.id,
-              name: w.name,
-              windows: [...w.windows.values()],
-              panes: [...w.panes.values()],
-            })),
+            activeSessionId: hs.activeSessionId,
+            sessions: [...hs.sessions.values()],
           },
         ]),
       ),

@@ -2,14 +2,14 @@
  * Command palette orchestrator.
  *
  * Owns transient input state (query, selected index, drilled-in object),
- * parses the run of leading `@` / `#` / `$` sigils into an ordered list
+ * parses the run of leading `#` / `$` sigils into an ordered list
  * of sub-mode chips, picks a result source (static actions, the union
  * of the active projections, the drilled object's subActions, or
  * recents+actions for the empty state), runs them through the fuzzy
  * ranker, and dispatches the chosen action. Open/close state lives in
  * the store so the keymap engine can flip it via `palette.open`. A
  * paired `paletteInitialQuery` lets entry actions seed the input —
- * Cmd+P opens with `'@#'` so the workspace + window chips are already
+ * Cmd+P opens with `'#'` so the session chip is already
  * applied.
  *
  * Esc walks back one navigation step at a time: drill-out if drilled
@@ -50,7 +50,7 @@ type ListEntry =
   | { type: 'header'; label: string; count?: number }
   | { type: 'item'; action: Action }
 
-const SIGILS = ['@', '#', '$'] as const
+const SIGILS = ['#', '$'] as const
 
 function rankActions(query: string, actions: readonly Action[]): ScoredAction[] {
   const out: ScoredAction[] = []
@@ -69,9 +69,7 @@ function rankActions(query: string, actions: readonly Action[]): ScoredAction[] 
 
 /** Consume every leading sigil in `raw` into an ordered list of
  * sub-mode projections. The query string remains the source of truth
- * for which chips are active — `'@#term'` resolves to `[@workspaces,
- * #windows]` + residual `'term'`. Repeats are deduped on character so
- * `'@@foo'` doesn't render two identical chips. */
+ * for which chips are active. Repeats are deduped on character. */
 function parseInput(raw: string): { subs: SubModeResult[]; residual: string } {
   const subs: SubModeResult[] = []
   const seen = new Set<string>()
@@ -134,11 +132,7 @@ function computeEntries({ drilled, subs, residual, ranked }: ComputeEntriesArgs)
     return ranked.map(({ action }) => ({ type: 'item', action }))
   }
 
-  // Single sigil sub-mode with grouping (e.g. @workspaces, $hosts).
-  // We only keep group headers when exactly one sub is active —
-  // mixing groups across two unrelated projections (e.g. workspaces
-  // grouped by host alongside ungrouped windows) tends to look noisy,
-  // so the multi-chip case falls through to a flat list.
+  // Single sigil sub-mode with grouping (e.g. $hosts).
   if (subs.length === 1 && subs[0].groups) {
     const groups = subs[0].groups
     const out: ListEntry[] = []
@@ -195,8 +189,7 @@ export function PaletteHost() {
   const [drilled, setDrilled] = useState<Action | null>(null)
 
   // Seed the query from `paletteInitialQuery` on each open. Cmd+K
-  // passes empty; Cmd+P passes `'@#'` so the palette boots with the
-  // workspace + window chips already applied.
+  // passes empty; Cmd+P passes `'#'` for sessions.
   useEffect(() => {
     if (open) {
       setQuery(initialQuery)
@@ -207,7 +200,7 @@ export function PaletteHost() {
     }
   }, [open, initialQuery])
 
-  // Search mode: a leading `/` switches the palette into cross-window
+  // Search mode: a leading `/` switches the palette into cross-session
   // grep. The text after the slash is the search term; results are
   // *generated* (not fuzzy-filtered over a fixed list), so this branch
   // bypasses the sigil + ranking machinery below.
@@ -235,8 +228,7 @@ export function PaletteHost() {
   //   - drill-in → the drilled object's subActions
   //   - one or more sigil chips → union of those projections (deduped
   //     by action id; first-seen wins so the chip order controls
-  //     iteration order — `@#` lists workspaces first, `#@` lists
-  //     windows first)
+  //     iteration order follows chip order)
   //   - otherwise → the static registry (default Cmd+K view)
   const sourceActions = useMemo<readonly Action[]>(() => {
     if (searchMode) return searchActions
@@ -259,7 +251,7 @@ export function PaletteHost() {
   const ranked = useMemo(() => {
     if (!open) return []
     // Search results are already matches in buffer order — don't re-rank
-    // them by fuzzy score; preserve the host→workspace→window order.
+    // them by fuzzy score; preserve daemon result order.
     if (searchMode) return sourceActions.map((action) => ({ action, score: 0 }))
     return rankActions(residual, sourceActions)
   }, [open, searchMode, residual, sourceActions])
@@ -420,9 +412,9 @@ export function PaletteHost() {
   if (entries.length === 0) {
     const emptyMsg =
       searchMode && searchTerm.trim().length < 2
-        ? 'Type to search across all windows…'
+        ? 'Type to search across all sessions…'
         : searchMode
-          ? 'No matches in any window.'
+          ? 'No matches in any session.'
           : 'No matches.'
     body = (
       <div

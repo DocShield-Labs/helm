@@ -9,24 +9,21 @@
  * `color-mix`, so swapping the theme re-skins every surface in the
  * app at once.
  *
- * The default values below are the "Helm" theme so the first paint
+ * The default values below are the Adeberry theme so the first paint
  * (before App.tsx's theme effect fires) looks right.
  *
- * Surfaces lighten as you go up the elevation stack on DARK themes;
- * they darken on LIGHT themes. JS sets `data-theme-mode="dark|light"`
- * on the document root from the theme's bg luminance; the conditional
- * blocks below flip the mix direction to match.
+ * Surfaces blend toward the theme foreground as they rise. This matches
+ * Warp's neutral surface derivation and preserves each theme's tint.
  */
 
 :root {
   /* ---------- Theme bases (overridden by JS at runtime) ---------- */
-  --terminal-bg:      #0C0C0E;
-  --terminal-fg:      #F5F4F0;
-  --terminal-accent:  #4B8BF5;
-  --terminal-failed:  #E0564A;
-  --terminal-success: #3DBA7E;
-  --terminal-warning: #E8B04B;
-  --terminal-claude:  #D97757;
+  --terminal-bg:      #1D2022;
+  --terminal-fg:      #E4EEF5;
+  --terminal-accent:  #6C96B4;
+  --terminal-failed:  #C76156;
+  --terminal-success: #57C78A;
+  --terminal-warning: #C8A35A;
   /* One row of terminal output rendered as DOM (Rows.tsx sizes chunks
      from it, so a change here is a change everywhere). */
   --helm-line-px: 20px;
@@ -45,17 +42,12 @@
   --stroke-inverse: color-mix(in srgb, var(--terminal-bg) 40%, transparent);
 
   /* ---------- Accent (theme.accent — saturation untouched, depths via opacity) ----------
-   * The three muted variants give selected rows a clear visual hierarchy
-   * in the sidebar tree:
-   *   - hosts at 6%      (the broadest container, lightest fill)
-   *   - workspaces at 5% (one level in, even lighter)
-   *   - windows / pins at 10% (the actionable leaves — strongest)
+   * Muted variants give selected rows a clear visual hierarchy.
    */
   --accent-default:         var(--terminal-accent);
   --accent-hover:           color-mix(in srgb, var(--terminal-accent) 82%, white 18%);
   --accent-muted:           color-mix(in srgb, var(--terminal-accent) 10%, transparent);
   --accent-muted-host:      color-mix(in srgb, var(--terminal-accent) 6%,  transparent);
-  --accent-muted-workspace: color-mix(in srgb, var(--terminal-accent) 5%,  transparent);
   --accent-border:          color-mix(in srgb, var(--terminal-accent) 30%, transparent);
   --accent-text:            color-mix(in srgb, var(--terminal-accent) 75%, white 25%);
 
@@ -71,7 +63,7 @@
   --activity-failed:    var(--terminal-failed);
   --activity-idle:      color-mix(in srgb, var(--terminal-fg) 50%, transparent);
 
-  /* ---------- Terminal pane chrome (block dividers, status chips) ---------- */
+  /* ---------- Terminal session chrome (block dividers, status chips) ---------- */
   --terminal-fg-30:     color-mix(in srgb, var(--terminal-fg) 30%, transparent);
   --terminal-fg-60:     color-mix(in srgb, var(--terminal-fg) 60%, transparent);
   --terminal-fg-06:     color-mix(in srgb, var(--terminal-fg) 6%,  transparent);
@@ -132,33 +124,31 @@
   --elevation-3: 0 24px 64px rgba(0, 0, 0, 0.60), 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
-/* ---------- Surfaces — direction-aware mixes ----------
- * On a DARK theme each step mixes a touch more white into the bg so
- * elevated surfaces read as raised. On a LIGHT theme we mix toward
- * black instead so the same hierarchy holds visually. The default
- * (no `data-theme-mode` set yet) follows the dark recipe so first
- * paint matches the Helm theme. */
+/* ---------- Surfaces — theme-aware foreground mixes ----------
+ * Warp builds neutral surfaces by blending the theme foreground into
+ * its background. Using the actual foreground rather than pure white
+ * or black retains subtle theme hues such as Adeberry's blue cast. */
 :root,
 [data-theme-mode='dark'] {
   --bg-canvas:   var(--terminal-bg);
-  --bg-sidebar:  color-mix(in srgb, var(--terminal-bg) 95%, white 5%);
-  --bg-elevated: color-mix(in srgb, var(--terminal-bg) 88%, white 12%);
-  --bg-overlay:  color-mix(in srgb, var(--terminal-bg) 84%, white 16%);
-  --bg-hover:    color-mix(in srgb, var(--terminal-bg) 91%, white 9%);
-  --bg-active:   color-mix(in srgb, var(--terminal-bg) 87%, white 13%);
-  --terminal-chip-bg:       color-mix(in srgb, var(--terminal-bg) 88%, white 12%);
-  --terminal-chip-bg-hover: color-mix(in srgb, var(--terminal-bg) 82%, white 18%);
+  --bg-sidebar:  color-mix(in srgb, var(--terminal-bg) 95%, var(--terminal-fg) 5%);
+  --bg-elevated: color-mix(in srgb, var(--terminal-bg) 88%, var(--terminal-fg) 12%);
+  --bg-overlay:  color-mix(in srgb, var(--terminal-bg) 84%, var(--terminal-fg) 16%);
+  --bg-hover:    color-mix(in srgb, var(--terminal-bg) 91%, var(--terminal-fg) 9%);
+  --bg-active:   color-mix(in srgb, var(--terminal-bg) 87%, var(--terminal-fg) 13%);
+  --terminal-chip-bg:       color-mix(in srgb, var(--terminal-bg) 88%, var(--terminal-fg) 12%);
+  --terminal-chip-bg-hover: color-mix(in srgb, var(--terminal-bg) 82%, var(--terminal-fg) 18%);
 }
 
 [data-theme-mode='light'] {
   --bg-canvas:   var(--terminal-bg);
-  --bg-sidebar:  color-mix(in srgb, var(--terminal-bg) 96%, black 4%);
-  --bg-elevated: color-mix(in srgb, var(--terminal-bg) 92%, black 8%);
-  --bg-overlay:  color-mix(in srgb, var(--terminal-bg) 88%, black 12%);
-  --bg-hover:    color-mix(in srgb, var(--terminal-bg) 94%, black 6%);
-  --bg-active:   color-mix(in srgb, var(--terminal-bg) 90%, black 10%);
-  --terminal-chip-bg:       color-mix(in srgb, var(--terminal-bg) 92%, black 8%);
-  --terminal-chip-bg-hover: color-mix(in srgb, var(--terminal-bg) 86%, black 14%);
+  --bg-sidebar:  color-mix(in srgb, var(--terminal-bg) 96%, var(--terminal-fg) 4%);
+  --bg-elevated: color-mix(in srgb, var(--terminal-bg) 92%, var(--terminal-fg) 8%);
+  --bg-overlay:  color-mix(in srgb, var(--terminal-bg) 88%, var(--terminal-fg) 12%);
+  --bg-hover:    color-mix(in srgb, var(--terminal-bg) 94%, var(--terminal-fg) 6%);
+  --bg-active:   color-mix(in srgb, var(--terminal-bg) 90%, var(--terminal-fg) 10%);
+  --terminal-chip-bg:       color-mix(in srgb, var(--terminal-bg) 92%, var(--terminal-fg) 8%);
+  --terminal-chip-bg-hover: color-mix(in srgb, var(--terminal-bg) 86%, var(--terminal-fg) 14%);
 }
 
 /* ---------- Globals ---------- */

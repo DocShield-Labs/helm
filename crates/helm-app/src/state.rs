@@ -5,18 +5,18 @@
 //! whether to reach helmd over a local unix socket or an SSH exec
 //! channel running `helmd stdio`.
 //!
-//! The frontend Zustand store owns the workspace tree projection. The
+//! The frontend Zustand store owns the session tree projection. The
 //! Rust side owns:
 //!   - which hosts exist and their connection state
 //!   - the live helmd session per connected host
 //!   - the single event channel that delivers everything to the frontend
 
+use dashmap::DashMap;
 use helm_domain::{
     Host, HostEvent, HostId, HostKeyDecision, HostStatus, Notification, NotificationId,
 };
 use helm_proto::client::HelmdClient;
 use helm_ssh::SshSession;
-use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,9 +77,9 @@ impl SessionHandle {
             return Err(e.to_string());
         }
         match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
-            Ok(Ok(helm_proto::DaemonMsg::Error { context, message, .. })) => {
-                Err(format!("{context}: {message}"))
-            }
+            Ok(Ok(helm_proto::DaemonMsg::Error {
+                context, message, ..
+            })) => Err(format!("{context}: {message}")),
             Ok(Ok(msg)) => Ok(msg),
             Ok(Err(_)) => Err("connection dropped while waiting for reply".into()),
             Err(_) => {
@@ -183,37 +183,22 @@ pub struct AppState {
     pub wake_signal: watch::Receiver<u64>,
 
     /// All live inbox notifications, keyed by id. Coalesce semantics
-    /// (one per pane, latest event wins) live in `crate::notifications`.
+    /// (one per session, latest event wins) live in `crate::notifications`.
     pub notifications: Arc<DashMap<NotificationId, Notification>>,
 
     /// Coalesce index: the existing notification id (if any) for a
-    /// given (host, pane id string).
-    pub notification_by_pane: Arc<DashMap<(HostId, String), NotificationId>>,
+    /// given (host, session id string).
+    pub notification_by_session: Arc<DashMap<(HostId, String), NotificationId>>,
 
-    /// Per-pane runtime — window/workspace breadcrumbs from the latest
-    /// tree snapshot. Populated by the connection pump.
-    pub pane_runtime: Arc<DashMap<(HostId, String), PaneRuntime>>,
-
-    /// The (host, window) the user is actively looking at, surfaced
+    /// The (host, session) the user is actively looking at, surfaced
     /// from the frontend via `set_focus`. Notifications for the
-    /// focused window are suppressed.
+    /// focused session are suppressed.
     pub focus: Arc<parking_lot::Mutex<Option<(HostId, String)>>>,
 
     /// Per-(host, integration_id) flag tracking whether we've already
     /// surfaced (or the user has dismissed) the suggestion toast for
     /// a tool integration this app session.
     pub tool_integration_seen: Arc<DashMap<(HostId, String), ()>>,
-
-}
-
-/// Per-pane state the connection pump maintains between events.
-#[derive(Debug, Clone, Default)]
-pub struct PaneRuntime {
-    /// Window id (daemon id, stringified) this pane belongs to, from
-    /// the latest tree snapshot.
-    pub window_id: String,
-    /// Workspace id, same source.
-    pub workspace_id: String,
 }
 
 /// Cheap-to-clone bundle of handles for long-running tasks (the
@@ -222,8 +207,7 @@ pub struct PaneRuntime {
 #[derive(Clone)]
 pub struct NotificationsCtx {
     pub notifications: Arc<DashMap<NotificationId, Notification>>,
-    pub notification_by_pane: Arc<DashMap<(HostId, String), NotificationId>>,
-    pub pane_runtime: Arc<DashMap<(HostId, String), PaneRuntime>>,
+    pub notification_by_session: Arc<DashMap<(HostId, String), NotificationId>>,
     pub focus: Arc<parking_lot::Mutex<Option<(HostId, String)>>>,
     pub tool_integration_seen: Arc<DashMap<(HostId, String), ()>>,
 }
@@ -233,13 +217,11 @@ impl AppState {
     pub fn notifications_ctx(&self) -> NotificationsCtx {
         NotificationsCtx {
             notifications: self.notifications.clone(),
-            notification_by_pane: self.notification_by_pane.clone(),
-            pane_runtime: self.pane_runtime.clone(),
+            notification_by_session: self.notification_by_session.clone(),
             focus: self.focus.clone(),
             tool_integration_seen: self.tool_integration_seen.clone(),
         }
     }
-
 }
 
 impl Default for AppState {
@@ -264,8 +246,7 @@ impl Default for AppState {
             network_online: crate::reachability::spawn(),
             wake_signal: crate::power::spawn(),
             notifications: Arc::new(DashMap::new()),
-            notification_by_pane: Arc::new(DashMap::new()),
-            pane_runtime: Arc::new(DashMap::new()),
+            notification_by_session: Arc::new(DashMap::new()),
             focus: Arc::new(parking_lot::Mutex::new(None)),
             tool_integration_seen: Arc::new(DashMap::new()),
         }

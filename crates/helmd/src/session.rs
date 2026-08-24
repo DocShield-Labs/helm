@@ -1,9 +1,9 @@
-//! A pane: one PTY, one child process, one terminal model.
+//! A session: one PTY, one child process, and one terminal model.
 //!
-//! The reader thread is the single producer for a pane's state: raw
+//! The reader thread is the single producer for a session's state: raw
 //! PTY bytes → `StreamParser` (strips OSC 133 / bells / OSC 9, detects
-//! alt-screen) → `PaneScreen` (the VT model; rows scroll into history)
-//! → `PaneEvent`s to the daemon core. Markers are positioned by feeding
+//! alt-screen) → `SessionScreen` (the VT model; rows scroll into history)
+//! → `SessionEvent`s to the daemon core. Markers are positioned by feeding
 //! the model up to each one and reading the cursor's absolute line, so
 //! block boundaries and rows can never disagree.
 
@@ -14,10 +14,10 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use helm_proto::{BlockMeta, PaneId};
+use helm_proto::{BlockMeta, SessionId};
 
 use crate::markers::{IngestEvent, StreamParser};
-use crate::screen::{PaneScreen, SharedWriter};
+use crate::screen::{SessionScreen, SharedWriter};
 
 /// Bytes per PTY read — also the most lines one feed can scroll out,
 /// which bounds the model's own scrollback (see `screen.rs`).
@@ -25,23 +25,32 @@ pub const READ_BUF_LEN: usize = 8192;
 
 /// Events flowing from reader/wait threads into the daemon core.
 #[derive(Debug)]
-pub enum PaneEvent {
+pub enum SessionEvent {
     /// Semantic event at an absolute line.
-    Ingest { pane: PaneId, line: u64, event: IngestEvent },
+    Ingest {
+        session: SessionId,
+        line: u64,
+        event: IngestEvent,
+    },
     /// The model changed; the daemon schedules a flush.
-    Dirty { pane: PaneId },
+    Dirty { session: SessionId },
     /// Child exited (or the PTY hit EOF).
-    Exited { pane: PaneId, status: Option<i32> },
+    Exited {
+        session: SessionId,
+        status: Option<i32>,
+    },
 }
 
-/// Mutable pane metadata maintained by the daemon core.
+/// Mutable session metadata maintained by the daemon core.
 #[derive(Debug, Default)]
-pub struct PaneMeta {
+pub struct SessionMeta {
     pub cols: u16,
     pub rows: u16,
     pub alt_screen: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
+    /// Git toplevel of `cwd`, from the last prompt; `None` outside a repo.
+    pub root: Option<String>,
     /// argv[0] basename of what was spawned ("zsh", "claude", …).
     pub command: Option<String>,
     pub blocks: Vec<BlockMeta>,
@@ -51,10 +60,11 @@ pub struct PaneMeta {
     pub exited: bool,
 }
 
-pub struct Pane {
-    pub id: PaneId,
-    pub screen: Mutex<PaneScreen>,
-    pub meta: Mutex<PaneMeta>,
+pub struct Session {
+    pub id: SessionId,
+    pub name: Mutex<String>,
+    pub screen: Mutex<SessionScreen>,
+    pub meta: Mutex<SessionMeta>,
     writer: SharedWriter,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -66,18 +76,18 @@ pub struct SpawnSpec {
     pub cwd: Option<String>,
     /// argv to exec; `None` = the user's login shell.
     pub command: Option<Vec<String>>,
-    /// Extra environment (integration vars) layered on the pane's base
+    /// Extra environment (integration vars) layered on the session's base
     /// env — see `crate::env` for what that base is and why it is not
     /// the daemon's own environment.
     pub env: Vec<(String, String)>,
 }
 
-impl Pane {
+impl Session {
     pub fn spawn(
-        id: PaneId,
+        id: SessionId,
         spec: &SpawnSpec,
-        events: UnboundedSender<PaneEvent>,
-    ) -> anyhow::Result<Arc<Pane>> {
+        events: UnboundedSender<SessionEvent>,
+    ) -> anyhow::Result<Arc<Session>> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
             rows: spec.rows.max(2),
@@ -100,17 +110,17 @@ impl Pane {
             cmd.cwd(home);
         }
         // Start from a fixed base, not from whatever launched helmd —
-        // a pane must look the same whether the app came from the Dock,
-        // an `open` inside tmux, or a dev build inside a Helm pane. The
+        // a session must look the same whether the app came from the Dock,
+        // an `open` inside tmux, or a dev build inside Helm. The
         // user's dotfiles build the rest, as in any other terminal.
         cmd.env_clear();
-        for (k, v) in crate::env::pane_env(std::env::vars()) {
+        for (k, v) in crate::env::session_env(std::env::vars()) {
             cmd.env(k, v);
         }
-        // The pane's tty path, inherited by every process in the pane.
+        // The session's tty path, inherited by every process in the session.
         // Tools that run hooks with no controlling terminal (Claude
         // Code) write their BEL here and helmd sees it on this PTY —
-        // works for explicit-command windows too, which never source a
+        // works for explicit-command sessions too, which never source a
         // shell integration script.
         if let Some(tty) = pair.master.as_raw_fd().and_then(slave_tty_name) {
             cmd.env("HELM_TTY", tty);
@@ -137,10 +147,11 @@ impl Pane {
             })
         });
 
-        let pane = Arc::new(Pane {
+        let session = Arc::new(Session {
             id,
-            screen: Mutex::new(PaneScreen::new(spec.cols, spec.rows, writer.clone())),
-            meta: Mutex::new(PaneMeta {
+            name: Mutex::new(String::new()),
+            screen: Mutex::new(SessionScreen::new(spec.cols, spec.rows, writer.clone())),
+            meta: Mutex::new(SessionMeta {
                 cols: spec.cols,
                 rows: spec.rows,
                 command: command_name,
@@ -154,25 +165,28 @@ impl Pane {
 
         // Reader thread: PTY → parser → model → events.
         {
-            let pane = pane.clone();
+            let session = session.clone();
             let events = events.clone();
             std::thread::Builder::new()
-                .name(format!("pane-{id}-read"))
-                .spawn(move || reader_loop(pane, reader, events))?;
+                .name(format!("session-{id}-read"))
+                .spawn(move || reader_loop(session, reader, events))?;
         }
 
         // Wait thread: child exit status.
         {
             let events = events.clone();
             std::thread::Builder::new()
-                .name(format!("pane-{id}-wait"))
+                .name(format!("session-{id}-wait"))
                 .spawn(move || {
                     let status = child.wait().ok().map(|s| s.exit_code() as i32);
-                    let _ = events.send(PaneEvent::Exited { pane: id, status });
+                    let _ = events.send(SessionEvent::Exited {
+                        session: id,
+                        status,
+                    });
                 })?;
         }
 
-        Ok(pane)
+        Ok(session)
     }
 
     /// Write client keystrokes to the PTY. Raw bytes, no translation.
@@ -223,9 +237,9 @@ fn slave_tty_name(fd: std::os::unix::io::RawFd) -> Option<String> {
 }
 
 fn reader_loop(
-    pane: Arc<Pane>,
+    session: Arc<Session>,
     mut reader: Box<dyn Read + Send>,
-    events: UnboundedSender<PaneEvent>,
+    events: UnboundedSender<SessionEvent>,
 ) {
     let mut parser = StreamParser::new();
     let mut buf = [0u8; READ_BUF_LEN];
@@ -239,10 +253,10 @@ fn reader_loop(
         parser.feed(&buf[..n], &mut out, &mut ingest);
 
         // Feed the model up to each marker and read where the cursor is:
-        // that line is the marker's position in the pane's line space.
+        // that line is the marker's position in the session's line space.
         let mut positioned = Vec::with_capacity(ingest.len());
         {
-            let mut screen = pane.screen.lock();
+            let mut screen = session.screen.lock();
             let mut fed = 0usize;
             for e in ingest {
                 let at = e.offset.min(out.len());
@@ -255,13 +269,23 @@ fn reader_loop(
 
         for (line, event) in positioned {
             if events
-                .send(PaneEvent::Ingest { pane: pane.id, line, event })
+                .send(SessionEvent::Ingest {
+                    session: session.id,
+                    line,
+                    event,
+                })
                 .is_err()
             {
                 return; // daemon gone
             }
         }
-        if !out.is_empty() && events.send(PaneEvent::Dirty { pane: pane.id }).is_err() {
+        if !out.is_empty()
+            && events
+                .send(SessionEvent::Dirty {
+                    session: session.id,
+                })
+                .is_err()
+        {
             return;
         }
     }

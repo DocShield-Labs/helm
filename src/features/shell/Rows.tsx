@@ -3,7 +3,7 @@
  *
  * Rows come from the daemon's model (`lib/session/screen.ts`): styled
  * spans per physical row plus a soft-wrap flag. Wrapped rows join into
- * one logical line so the browser reflows them at the pane's current
+ * one logical line so the browser reflows them at the session's current
  * width — history resizes the way a terminal reflows, without anyone
  * re-wrapping anything.
  *
@@ -59,13 +59,13 @@ export function rowsToText(rows: ReadonlyArray<[number, RowInfo]>): string {
 
 export interface RowsViewProps {
   hostId: HostId
-  paneId: string
+  sessionId: string
   /** Absolute line range `[from, to)`. */
   from: number
   to: number
 }
 
-export const RowsView = memo(function RowsView({ hostId, paneId, from, to }: RowsViewProps) {
+export const RowsView = memo(function RowsView({ hostId, sessionId, from, to }: RowsViewProps) {
   // A range must be finite: an open-ended `to` (the grid's first line
   // while the grid is hidden is Infinity) would loop forever here.
   if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return null
@@ -77,7 +77,7 @@ export const RowsView = memo(function RowsView({ hostId, paneId, from, to }: Row
       <RowsChunk
         key={c}
         hostId={hostId}
-        paneId={paneId}
+        sessionId={sessionId}
         from={Math.max(from, c * CHUNK)}
         to={Math.min(to, (c + 1) * CHUNK)}
       />,
@@ -86,8 +86,8 @@ export const RowsView = memo(function RowsView({ hostId, paneId, from, to }: Row
   return <>{chunks}</>
 })
 
-const RowsChunk = memo(function RowsChunk({ hostId, paneId, from, to }: RowsViewProps) {
-  const rows = useRows(hostId, paneId, from, to)
+const RowsChunk = memo(function RowsChunk({ hostId, sessionId, from, to }: RowsViewProps) {
+  const rows = useRows(hostId, sessionId, from, to)
   const lines = useMemo(() => joinWrapped(rows), [rows])
   if (lines.length === 0) return null
   return (

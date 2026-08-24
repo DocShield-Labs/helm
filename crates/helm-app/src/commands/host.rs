@@ -2,9 +2,7 @@
 //! sanity-ping command.
 
 use async_trait::async_trait;
-use helm_domain::{
-    Host, HostEvent, HostId, HostKeyDecision, HostKeyPromptKind, HostStatus,
-};
+use helm_domain::{Host, HostEvent, HostId, HostKeyDecision, HostKeyPromptKind, HostStatus};
 use helm_ssh::HostKeyPrompter;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -311,23 +309,12 @@ pub async fn host_subscribe(
 /// Connect to a host. Localhost talks to helmd over its unix socket
 /// (spawning the daemon if needed); remote hosts open an SSH session
 /// and run `helmd stdio` on the far end.
-///
-/// `bootstrap_workspace` overrides `Host.default_workspace` for this
-/// connect attempt. Useful when the user's "+ workspace" button needs to
-/// reconnect: instead of creating a stray `main` session and *then* the
-/// requested workspace, we create the requested workspace directly as
-/// the bootstrap session.
-///
 /// Idempotent: any prior session is dropped first; the daemon and its
 /// processes live on, so reattaching is a clean recovery.
 #[tauri::command]
 #[specta::specta]
-pub async fn host_connect(
-    state: State<'_, AppState>,
-    host_id: HostId,
-    bootstrap_workspace: Option<String>,
-) -> Result<(), String> {
-    connect_host_impl(&state, host_id, bootstrap_workspace).await
+pub async fn host_connect(state: State<'_, AppState>, host_id: HostId) -> Result<(), String> {
+    connect_host_impl(&state, host_id).await
 }
 
 /// The body of `host_connect`, callable from places other than a Tauri
@@ -339,7 +326,6 @@ pub async fn host_connect(
 pub(crate) async fn connect_host_impl(
     state: &State<'_, AppState>,
     host_id: HostId,
-    bootstrap_workspace: Option<String>,
 ) -> Result<(), String> {
     let entry = state
         .entry(host_id)
@@ -369,7 +355,6 @@ pub(crate) async fn connect_host_impl(
         entry,
         host_id,
         event_tx,
-        bootstrap_workspace,
         prompter,
         network_online,
         wake_signal,
@@ -397,11 +382,14 @@ pub async fn host_disconnect(state: State<'_, AppState>, host_id: HostId) -> Res
         guard.shutdown_session();
         guard.status = HostStatus::Disconnected;
     }
-    emit_event(&event_tx, HostEvent::Status {
-        host_id,
-        status: HostStatus::Disconnected,
-        error: None,
-    });
+    emit_event(
+        &event_tx,
+        HostEvent::Status {
+            host_id,
+            status: HostStatus::Disconnected,
+            error: None,
+        },
+    );
     notifications::dismiss_for_host(&notif_ctx, &event_tx, host_id);
     Ok(())
 }

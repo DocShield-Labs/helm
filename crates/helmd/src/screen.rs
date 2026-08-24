@@ -1,4 +1,4 @@
-//! The terminal model: one `alacritty_terminal` VT emulator per pane
+//! The terminal model: one `alacritty_terminal` VT emulator per session
 //! plus the line history that scrolled off its top.
 //!
 //! Everything a client can see comes from here as *rows* — styled runs
@@ -7,7 +7,7 @@
 //!   - the live grid, read on demand (`snapshot`) or as what changed
 //!     since the last flush (`take_update`);
 //!   - history: rows the primary grid scrolled out, addressed by an
-//!     absolute line number that is monotonic for the pane's lifetime
+//!     absolute line number that is monotonic for the session's lifetime
 //!     (`history_start ..< top_line`), capped by row count;
 //!   - terminal queries (DA, DSR/CPR, color, text-area size) answered by
 //!     the model itself, straight to the PTY, so no client ever sees a
@@ -39,10 +39,10 @@ use parking_lot::Mutex;
 
 use helm_proto::{attrs, modes, Color, Cursor, CursorShape, Row, Screen, Span, Style};
 
-use crate::pane::READ_BUF_LEN;
+use crate::session::READ_BUF_LEN;
 
-/// Rows of history retained per pane. ~100 B per row of typical output,
-/// so this is ~10 MB for a pane that has scrolled 100k rows — a day of
+/// Rows of history retained per session. ~100 B per row of typical output,
+/// so this is ~10 MB for a session that has scrolled 100k rows — a day of
 /// agent output. Phase 2 moves the tail to disk.
 pub const MAX_HISTORY_ROWS: usize = 100_000;
 
@@ -53,7 +53,7 @@ pub const MAX_HISTORY_ROWS: usize = 100_000;
 /// generous and `drain_history` asserts it.
 const MODEL_SCROLLBACK: usize = 4 * READ_BUF_LEN;
 
-/// The PTY writer, shared between the pane (client input) and the
+/// The PTY writer, shared between the session (client input) and the
 /// model (query answers).
 pub type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -65,7 +65,13 @@ pub enum Update {
     Full(Screen),
     /// The grid scrolled up by `scroll` rows (those rows went to
     /// history), then only `rows` differ from what was last sent.
-    Partial { top_line: u64, scroll: u16, rows: Vec<(u16, Row)>, cursor: Cursor, modes: u32 },
+    Partial {
+        top_line: u64,
+        scroll: u16,
+        rows: Vec<(u16, Row)>,
+        cursor: Cursor,
+        modes: u32,
+    },
 }
 
 fn pack(cols: u16, rows: u16) -> u32 {
@@ -75,7 +81,7 @@ fn pack(cols: u16, rows: u16) -> u32 {
 /// alacritty's event sink. Only the events that are answers to the
 /// application matter here; titles, clipboard and bells are either
 /// handled upstream (the marker parser strips bells and OSC 9) or not
-/// yet surfaced (phase 2: OSC 52 → app clipboard, title → window name).
+/// yet surfaced (phase 2: OSC 52 → app clipboard, title → session name).
 struct Listener {
     writer: SharedWriter,
     /// `pack(cols, rows)` — the model's size, for text-area queries.
@@ -115,10 +121,22 @@ impl EventListener for Listener {
 /// "dark"; per-host theme plumbing is a later concern.
 fn default_color(index: usize) -> Rgb {
     const ANSI16: [(u8, u8, u8); 16] = [
-        (0x3a, 0x3a, 0x3e), (0xe0, 0x56, 0x4a), (0x3d, 0xba, 0x7e), (0xe8, 0xb0, 0x4b),
-        (0x4b, 0x8b, 0xf5), (0xc6, 0x78, 0xdd), (0x56, 0xb6, 0xc2), (0xd7, 0xd6, 0xd2),
-        (0x6b, 0x6b, 0x70), (0xff, 0x7b, 0x70), (0x5e, 0xd3, 0x9a), (0xf5, 0xc5, 0x6b),
-        (0x7a, 0xa8, 0xff), (0xd9, 0x8f, 0xe8), (0x7b, 0xd0, 0xda), (0xf5, 0xf4, 0xf0),
+        (0x3a, 0x3a, 0x3e),
+        (0xe0, 0x56, 0x4a),
+        (0x3d, 0xba, 0x7e),
+        (0xe8, 0xb0, 0x4b),
+        (0x4b, 0x8b, 0xf5),
+        (0xc6, 0x78, 0xdd),
+        (0x56, 0xb6, 0xc2),
+        (0xd7, 0xd6, 0xd2),
+        (0x6b, 0x6b, 0x70),
+        (0xff, 0x7b, 0x70),
+        (0x5e, 0xd3, 0x9a),
+        (0xf5, 0xc5, 0x6b),
+        (0x7a, 0xa8, 0xff),
+        (0xd9, 0x8f, 0xe8),
+        (0x7b, 0xd0, 0xda),
+        (0xf5, 0xf4, 0xf0),
     ];
     let (r, g, b) = match index {
         0..=15 => ANSI16[index],
@@ -138,7 +156,7 @@ fn default_color(index: usize) -> Rgb {
     Rgb { r, g, b }
 }
 
-pub struct PaneScreen {
+pub struct SessionScreen {
     term: Term<Listener>,
     parser: Processor,
     size: Arc<AtomicU32>,
@@ -163,7 +181,7 @@ pub struct PaneScreen {
     empty_hash: u64,
 }
 
-impl PaneScreen {
+impl SessionScreen {
     pub fn new(cols: u16, rows: u16, writer: SharedWriter) -> Self {
         Self::with_limits(cols, rows, writer, MAX_HISTORY_ROWS)
     }
@@ -172,9 +190,19 @@ impl PaneScreen {
         let cols = cols.max(2);
         let rows = rows.max(1);
         let size = Arc::new(AtomicU32::new(pack(cols, rows)));
-        let config = Config { scrolling_history: MODEL_SCROLLBACK, ..Config::default() };
-        let listener = Listener { writer, size: size.clone() };
-        let mut term = Term::new(config, &TermSize::new(cols as usize, rows as usize), listener);
+        let config = Config {
+            scrolling_history: MODEL_SCROLLBACK,
+            ..Config::default()
+        };
+        let listener = Listener {
+            writer,
+            size: size.clone(),
+        };
+        let mut term = Term::new(
+            config,
+            &TermSize::new(cols as usize, rows as usize),
+            listener,
+        );
         // Unfocused alacritty renders a hollow cursor; we have one focus.
         term.is_focused = true;
         Self {
@@ -225,7 +253,8 @@ impl PaneScreen {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(2);
         let rows = rows.max(1);
-        self.term.resize(TermSize::new(cols as usize, rows as usize));
+        self.term
+            .resize(TermSize::new(cols as usize, rows as usize));
         self.size.store(pack(cols, rows), Ordering::Relaxed);
         // Shrinking pushes the top rows into alacritty's scrollback.
         self.drain_history();
@@ -242,7 +271,10 @@ impl PaneScreen {
         if n == 0 {
             return;
         }
-        debug_assert!(n < MODEL_SCROLLBACK, "alacritty scrollback saturated: lines would drift");
+        debug_assert!(
+            n < MODEL_SCROLLBACK,
+            "alacritty scrollback saturated: lines would drift"
+        );
         for i in (1..=n).rev() {
             self.history.push_back(self.grid_row(-(i as i32)));
         }
@@ -340,7 +372,13 @@ impl PaneScreen {
         }
         self.sent_cursor = Some(cursor);
         self.sent_modes = modes;
-        Update::Partial { top_line: self.top_line, scroll: scroll as u16, rows, cursor, modes }
+        Update::Partial {
+            top_line: self.top_line,
+            scroll: scroll as u16,
+            rows,
+            cursor,
+            modes,
+        }
     }
 
     /// The whole grid.
@@ -405,7 +443,9 @@ impl PaneScreen {
     /// of the first row returned.
     pub fn history_page(&self, from: u64, to: u64) -> (u64, Vec<Row>) {
         let hi = to.min(self.top_line);
-        let lo = from.max(self.history_start).max(hi.saturating_sub(helm_proto::MAX_HISTORY_PAGE));
+        let lo = from
+            .max(self.history_start)
+            .max(hi.saturating_sub(helm_proto::MAX_HISTORY_PAGE));
         if hi <= lo {
             return (hi, Vec::new());
         }
@@ -461,7 +501,9 @@ const STYLE_FLAGS: Flags = Flags::BOLD
 fn is_blank(cell: &Cell) -> bool {
     cell.c == ' '
         && cell.bg == VteColor::Named(NamedColor::Background)
-        && !cell.flags.intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+        && !cell
+            .flags
+            .intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
         && cell.zerowidth().map(|z| z.is_empty()).unwrap_or(true)
         && cell.hyperlink().is_none()
 }
@@ -533,7 +575,12 @@ fn style_of(cell: &Cell) -> Style {
     if f.contains(Flags::HIDDEN) {
         a |= attrs::HIDDEN;
     }
-    Style { fg, bg, attrs: a, link: cell.hyperlink().map(|h| h.uri().to_string()) }
+    Style {
+        fg,
+        bg,
+        attrs: a,
+        link: cell.hyperlink().map(|h| h.uri().to_string()),
+    }
 }
 
 /// Encode one grid row: trailing blanks trimmed, wide-char spacers
@@ -542,16 +589,29 @@ fn style_of(cell: &Cell) -> Style {
 pub fn encode_row(row: &alacritty_terminal::grid::Row<Cell>, cols: usize) -> Row {
     let cells: &[Cell] = &row[..];
     let cells = &cells[..cells.len().min(cols)];
-    let wrapped = cells.last().map(|c| c.flags.contains(Flags::WRAPLINE)).unwrap_or(false);
-    let end = cells.iter().rposition(|c| !is_blank(c)).map(|i| i + 1).unwrap_or(0);
+    let wrapped = cells
+        .last()
+        .map(|c| c.flags.contains(Flags::WRAPLINE))
+        .unwrap_or(false);
+    let end = cells
+        .iter()
+        .rposition(|c| !is_blank(c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let mut spans: Vec<Span> = Vec::new();
     let mut run_start: Option<&Cell> = None;
     for cell in &cells[..end] {
-        if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
             continue;
         }
         if !run_start.is_some_and(|prev| same_run(prev, cell)) {
-            spans.push(Span { text: String::new(), style: style_of(cell) });
+            spans.push(Span {
+                text: String::new(),
+                style: style_of(cell),
+            });
             run_start = Some(cell);
         }
         let text = &mut spans.last_mut().expect("a run was just opened").text;
@@ -580,10 +640,10 @@ mod tests {
         }
     }
 
-    fn screen(cols: u16, rows: u16) -> (PaneScreen, Sink) {
+    fn screen(cols: u16, rows: u16) -> (SessionScreen, Sink) {
         let sink = Sink::default();
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(sink.clone())));
-        (PaneScreen::new(cols, rows, writer), sink)
+        (SessionScreen::new(cols, rows, writer), sink)
     }
 
     fn texts(rows: &[Row]) -> Vec<String> {
@@ -601,7 +661,10 @@ mod tests {
         assert_eq!(s.history_start(), 0);
         let (from, page) = s.history_page(0, u64::MAX);
         assert_eq!(from, 0);
-        assert_eq!(texts(&page), (0..7).map(|i| format!("l{i}")).collect::<Vec<_>>());
+        assert_eq!(
+            texts(&page),
+            (0..7).map(|i| format!("l{i}")).collect::<Vec<_>>()
+        );
         let snap = s.snapshot();
         assert_eq!(texts(&snap.lines), vec!["l7", "l8", "l9", ""]);
         assert_eq!((snap.top_line, snap.history_start), (7, 0));
@@ -685,7 +748,12 @@ mod tests {
         assert!(matches!(s.take_update(), Update::None));
         s.advance(b"x");
         match s.take_update() {
-            Update::Partial { scroll: 0, rows, cursor, .. } => {
+            Update::Partial {
+                scroll: 0,
+                rows,
+                cursor,
+                ..
+            } => {
                 assert_eq!(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0]);
                 assert_eq!(rows[0].1.text(), "x");
                 assert_eq!((cursor.row, cursor.col), (0, 1));
@@ -696,7 +764,12 @@ mod tests {
         // from the shifted frame — not a full repaint.
         s.advance(b"\r\n\r\n\r\n\r\ny");
         match s.take_update() {
-            Update::Partial { scroll: 2, top_line: 2, rows, .. } => {
+            Update::Partial {
+                scroll: 2,
+                top_line: 2,
+                rows,
+                ..
+            } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!((rows[0].0, rows[0].1.text()), (2, "y".into()));
             }
@@ -737,7 +810,7 @@ mod tests {
     fn history_cap_evicts_oldest() {
         let sink = Sink::default();
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(sink)));
-        let mut s = PaneScreen::with_limits(10, 2, writer, 3);
+        let mut s = SessionScreen::with_limits(10, 2, writer, 3);
         for i in 0..8 {
             s.advance(format!("l{i}\r\n").as_bytes());
         }
@@ -814,7 +887,10 @@ mod tests {
         s.advance(b"h0\r\nh1\r\ng0");
         let mut all = Vec::new();
         s.for_each_row(|l, r| all.push((l, r.text())));
-        assert_eq!(all, vec![(0, "h0".into()), (1, "h1".into()), (2, "g0".into())]);
+        assert_eq!(
+            all,
+            vec![(0, "h0".into()), (1, "h1".into()), (2, "g0".into())]
+        );
         assert_eq!(s.top_line(), 1);
         assert_eq!(s.last_nonempty_text(), "g0");
     }

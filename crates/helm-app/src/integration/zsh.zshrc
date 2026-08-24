@@ -25,7 +25,7 @@ ZDOTDIR="${HELM_USER_ZDOTDIR:-$HOME}"
 
 # macOS's /etc/zshrc ran before us, while ZDOTDIR still pointed here, and
 # set HISTFILE relative to it. Repoint history at the user's directory so
-# Helm panes share one history with every other terminal; the user's
+# Helm sessions share one history with every other terminal; the user's
 # .zshrc below can still override it.
 if [[ -n "$HISTFILE" && "$HISTFILE" == "$__helm_shim_dir"/* ]]; then
     HISTFILE="$ZDOTDIR/${HISTFILE:t}"
@@ -69,13 +69,20 @@ __helm_precmd() {
         __helm_command_started=0
     fi
 
-    local cwd="$PWD"
-    local branch
+    # Physical cwd canonicalizes casing on case-insensitive filesystems
+    # and keeps grouping/spawn inheritance on one stable path.
+    local cwd
+    cwd=$(command pwd -P)
+    local branch root
     branch=$(command git symbolic-ref --short HEAD 2>/dev/null)
-    local cwd_b64 branch_b64
+    # The repo root (a worktree's own root): the sidebar groups
+    # sessions by it. Empty outside a repo.
+    root=$(command git rev-parse --show-toplevel 2>/dev/null)
+    local cwd_b64 branch_b64 root_b64
     cwd_b64=$(__helm_b64 "$cwd")
     branch_b64=$(__helm_b64 "$branch")
-    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64}"
+    root_b64=$(__helm_b64 "$root")
+    __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64};root_b64=${root_b64}"
 }
 
 __helm_preexec() {

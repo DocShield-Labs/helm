@@ -1,4 +1,4 @@
-//! Stateful streaming parser for the pane byte stream.
+//! Stateful streaming parser for the session byte stream.
 //!
 //! Consumes raw PTY output and produces (a) the bytes to store/forward
 //! and (b) semantic events: OSC 133 block markers, standalone bells, and
@@ -24,6 +24,9 @@ pub enum Osc133 {
     PromptStart {
         cwd: Option<String>,
         branch: Option<String>,
+        /// Git toplevel of `cwd` (a worktree's own root); `None`
+        /// outside a repo or from an older shim that doesn't send it.
+        root: Option<String>,
     },
     /// `B` — command line accepted.
     CommandStart { cmdline: Option<String> },
@@ -321,16 +324,20 @@ fn parse_osc133(body: &[u8]) -> Option<Osc133> {
             .collect()
     };
     let b64_field = |raw: &[u8], key: &str| -> Option<String> {
-        fields(raw).into_iter().find(|(k, _)| k == key).and_then(|(_, v)| {
-            let bytes = B64.decode(v.as_bytes()).ok()?;
-            let s = String::from_utf8_lossy(&bytes).into_owned();
-            (!s.is_empty()).then_some(s)
-        })
+        fields(raw)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| {
+                let bytes = B64.decode(v.as_bytes()).ok()?;
+                let s = String::from_utf8_lossy(&bytes).into_owned();
+                (!s.is_empty()).then_some(s)
+            })
     };
     match kind {
         b'A' => Some(Osc133::PromptStart {
             cwd: b64_field(rest, "cwd_b64"),
             branch: b64_field(rest, "branch_b64"),
+            root: b64_field(rest, "root_b64"),
         }),
         b'B' => Some(Osc133::CommandStart {
             cmdline: b64_field(rest, "cmdline_b64"),
@@ -372,9 +379,10 @@ mod tests {
     #[test]
     fn osc133_markers_stripped_and_parsed() {
         let input = format!(
-            "\x1b]133;A;cwd_b64={};branch_b64={}\x07before\x1b]133;B;cmdline_b64={}\x07\x1b]133;C\x07out\x1b]133;D;1\x07",
-            b64("/Users/x/code"),
+            "\x1b]133;A;cwd_b64={};branch_b64={};root_b64={}\x07before\x1b]133;B;cmdline_b64={}\x07\x1b]133;C\x07out\x1b]133;D;1\x07",
+            b64("/Users/x/code/src"),
             b64("main"),
+            b64("/Users/x/code"),
             b64("cargo test"),
         );
         let (out, events) = run_whole(input.as_bytes());
@@ -383,8 +391,9 @@ mod tests {
         assert_eq!(
             events[0].event,
             IngestEvent::Marker(Osc133::PromptStart {
-                cwd: Some("/Users/x/code".into()),
+                cwd: Some("/Users/x/code/src".into()),
                 branch: Some("main".into()),
+                root: Some("/Users/x/code".into()),
             })
         );
         assert_eq!(events[0].offset, 0);
@@ -421,7 +430,13 @@ mod tests {
     fn standalone_bell_is_event_not_osc_terminator() {
         let (out, events) = run_whole(b"ding\x07dong");
         assert_eq!(out, b"dingdong");
-        assert_eq!(events, vec![EventAt { offset: 4, event: IngestEvent::Bell }]);
+        assert_eq!(
+            events,
+            vec![EventAt {
+                offset: 4,
+                event: IngestEvent::Bell
+            }]
+        );
     }
 
     #[test]
@@ -431,8 +446,14 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                EventAt { offset: 1, event: IngestEvent::Notify("Claude finished".into()) },
-                EventAt { offset: 2, event: IngestEvent::Notify("st".into()) },
+                EventAt {
+                    offset: 1,
+                    event: IngestEvent::Notify("Claude finished".into())
+                },
+                EventAt {
+                    offset: 2,
+                    event: IngestEvent::Notify("st".into())
+                },
             ]
         );
     }

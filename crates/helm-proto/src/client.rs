@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::{
-    encode_frame, ClientMsg, DaemonMsg, FrameDecoder, Notification, NotificationId, PaneId,
-    ProtoError, SearchScope, TreeSnapshot, WindowId, WorkspaceId, PROTOCOL_VERSION,
+    encode_frame, ClientMsg, DaemonMsg, FrameDecoder, Notification, NotificationId, ProtoError,
+    SearchScope, SessionId, TreeSnapshot, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -87,9 +87,12 @@ pub fn connect_io(
         }
         decoder.feed(&buf[..n]);
         match decoder.next::<DaemonMsg>()? {
-            Some(DaemonMsg::HelloAck { daemon_version, state, pending, .. }) => {
-                break (daemon_version, state, pending)
-            }
+            Some(DaemonMsg::HelloAck {
+                daemon_version,
+                state,
+                pending,
+                ..
+            }) => break (daemon_version, state, pending),
             Some(DaemonMsg::Error { message, .. }) => {
                 return Err(ClientError::HandshakeRejected(message))
             }
@@ -111,7 +114,11 @@ pub fn connect_io(
                         continue;
                     }
                 };
-                if writer.write_all(&frame).and_then(|_| writer.flush()).is_err() {
+                if writer
+                    .write_all(&frame)
+                    .and_then(|_| writer.flush())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -181,11 +188,10 @@ pub fn connect_or_spawn_unix(
     helmd_bin: &Path,
     client_name: &str,
 ) -> Result<Connected, ClientError> {
-    let stream = crate::connect_or_spawn_socket(socket, helmd_bin)
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::TimedOut => ClientError::SpawnTimeout(socket.to_path_buf()),
-            _ => ClientError::Io(e),
-        })?;
+    let stream = crate::connect_or_spawn_socket(socket, helmd_bin).map_err(|e| match e.kind() {
+        std::io::ErrorKind::TimedOut => ClientError::SpawnTimeout(socket.to_path_buf()),
+        _ => ClientError::Io(e),
+    })?;
     let reader = stream.try_clone()?;
     let closer = stream.try_clone()?;
     connect_io(
@@ -206,48 +212,52 @@ impl HelmdClient {
     pub fn attach(&self) -> Result<(), ClientError> {
         self.send(ClientMsg::Attach)
     }
-    pub fn input(&self, pane: PaneId, bytes: Vec<u8>) -> Result<(), ClientError> {
-        self.send(ClientMsg::Input { pane, bytes })
+    pub fn input(&self, session: SessionId, bytes: Vec<u8>) -> Result<(), ClientError> {
+        self.send(ClientMsg::Input { session, bytes })
     }
-    pub fn resize(&self, pane: PaneId, cols: u16, rows: u16) -> Result<(), ClientError> {
-        self.send(ClientMsg::Resize { pane, cols, rows })
+    pub fn resize(&self, session: SessionId, cols: u16, rows: u16) -> Result<(), ClientError> {
+        self.send(ClientMsg::Resize {
+            session,
+            cols,
+            rows,
+        })
     }
-    pub fn screen(&self, req_id: u64, pane: PaneId) -> Result<(), ClientError> {
-        self.send(ClientMsg::Screen { req_id, pane })
+    pub fn screen(&self, req_id: u64, session: SessionId) -> Result<(), ClientError> {
+        self.send(ClientMsg::Screen { req_id, session })
     }
     pub fn history(
         &self,
         req_id: u64,
-        pane: PaneId,
+        session: SessionId,
         from_line: u64,
         to_line: u64,
     ) -> Result<(), ClientError> {
-        self.send(ClientMsg::History { req_id, pane, from_line, to_line })
+        self.send(ClientMsg::History {
+            req_id,
+            session,
+            from_line,
+            to_line,
+        })
     }
-    pub fn new_workspace(&self, req_id: u64, name: Option<String>) -> Result<(), ClientError> {
-        self.send(ClientMsg::NewWorkspace { req_id, name })
-    }
-    pub fn new_window(
+    pub fn new_session(
         &self,
         req_id: u64,
-        workspace: WorkspaceId,
         name: Option<String>,
         cwd: Option<String>,
         command: Option<Vec<String>>,
     ) -> Result<(), ClientError> {
-        self.send(ClientMsg::NewWindow { req_id, workspace, name, cwd, command })
+        self.send(ClientMsg::NewSession {
+            req_id,
+            name,
+            cwd,
+            command,
+        })
     }
-    pub fn kill_window(&self, window: WindowId) -> Result<(), ClientError> {
-        self.send(ClientMsg::KillWindow { window })
+    pub fn kill_session(&self, session: SessionId) -> Result<(), ClientError> {
+        self.send(ClientMsg::KillSession { session })
     }
-    pub fn kill_workspace(&self, workspace: WorkspaceId) -> Result<(), ClientError> {
-        self.send(ClientMsg::KillWorkspace { workspace })
-    }
-    pub fn rename_workspace(&self, workspace: WorkspaceId, name: String) -> Result<(), ClientError> {
-        self.send(ClientMsg::RenameWorkspace { workspace, name })
-    }
-    pub fn rename_window(&self, window: WindowId, name: String) -> Result<(), ClientError> {
-        self.send(ClientMsg::RenameWindow { window, name })
+    pub fn rename_session(&self, session: SessionId, name: String) -> Result<(), ClientError> {
+        self.send(ClientMsg::RenameSession { session, name })
     }
     pub fn search(
         &self,
@@ -258,10 +268,33 @@ impl HelmdClient {
         scope: SearchScope,
         max_results: u32,
     ) -> Result<(), ClientError> {
-        self.send(ClientMsg::Search { req_id, query, regex, case_sensitive, scope, max_results })
+        self.send(ClientMsg::Search {
+            req_id,
+            query,
+            regex,
+            case_sensitive,
+            scope,
+            max_results,
+        })
     }
-    pub fn blocks(&self, req_id: u64, pane: PaneId) -> Result<(), ClientError> {
-        self.send(ClientMsg::Blocks { req_id, pane })
+    pub fn blocks(&self, req_id: u64, session: SessionId) -> Result<(), ClientError> {
+        self.send(ClientMsg::Blocks { req_id, session })
+    }
+    pub fn complete_path(
+        &self,
+        req_id: u64,
+        session: SessionId,
+        path: String,
+        directories_only: bool,
+        max_results: u32,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::CompletePath {
+            req_id,
+            session,
+            path,
+            directories_only,
+            max_results,
+        })
     }
     pub fn ping(&self, req_id: u64) -> Result<(), ClientError> {
         self.send(ClientMsg::Ping { req_id })

@@ -1,7 +1,7 @@
 //! Generalized tool-integration framework.
 //!
 //! Premise: bell (BEL, 0x07) is the canonical "pay attention" signal —
-//! every tool can emit it, helmd detects it per pane, and the inbox
+//! every tool can emit it, helmd detects it per session, and the inbox
 //! routes it. What's missing is *making the tools bell at semantically
 //! meaningful moments*:
 //!
@@ -51,7 +51,11 @@ pub trait ToolIntegration: Send + Sync {
     }
 
     /// `ssh` is the host's SSH session — `None` for localhost.
-    async fn is_installed(&self, host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<bool, String>;
+    async fn is_installed(
+        &self,
+        host: &Host,
+        ssh: Option<&Arc<SshSession>>,
+    ) -> Result<bool, String>;
     async fn install(&self, host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<(), String>;
     async fn uninstall(&self, host: &Host, ssh: Option<&Arc<SshSession>>) -> Result<(), String>;
 
@@ -110,11 +114,15 @@ pub fn detect_from_block(
     host_id: HostId,
     block: &BlockMeta,
 ) {
-    let Some(cmdline) = &block.cmdline else { return };
+    let Some(cmdline) = &block.cmdline else {
+        return;
+    };
     if !any_pending(seen, host_id) {
         return;
     }
-    let Some(program) = program_of(cmdline) else { return };
+    let Some(program) = program_of(cmdline) else {
+        return;
+    };
 
     for integration in registry() {
         let key = (host_id, integration.id().to_string());
@@ -156,7 +164,10 @@ mod tests {
     fn program_of_strips_wrappers_and_paths() {
         assert_eq!(program_of("claude --model x").as_deref(), Some("claude"));
         assert_eq!(program_of("/opt/bin/claude").as_deref(), Some("claude"));
-        assert_eq!(program_of("FOO=1 BAR=2 sudo env claude").as_deref(), Some("claude"));
+        assert_eq!(
+            program_of("FOO=1 BAR=2 sudo env claude").as_deref(),
+            Some("claude")
+        );
         assert_eq!(program_of("   "), None);
     }
 }
