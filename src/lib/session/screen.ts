@@ -256,6 +256,14 @@ export function usedRows(s: SessionScreen): number {
   return last >= 0 ? last + 1 : Math.min(s.grid.length, s.cursor.row + 1)
 }
 
+/** Normal-screen agent extent. TUIs commonly repaint cleared rows as
+ * styled spaces; those rows are layout noise, not visible content. */
+export function agentUsedRows(s: SessionScreen): number {
+  let last = s.grid.length - 1
+  while (last >= 0 && !s.grid[last].spans.some((span) => /\S/.test(span.text))) last--
+  return last >= 0 ? last + 1 : Math.min(s.grid.length, s.cursor.row + 1)
+}
+
 /** Coarse subscription: re-renders when the grid's shape, its used
  * extent, or the history's loaded range changes — not on every cursor
  * move within the used rows. */
@@ -263,6 +271,7 @@ export interface ScreenMeta {
   loaded: boolean
   rows: number
   usedRows: number
+  agentUsedRows: number
   topLine: number
   alt: boolean
   historyStart: number
@@ -278,6 +287,7 @@ function metaOf(k: string): ScreenMeta {
     loaded: s.loaded,
     rows: s.rows,
     usedRows: s.loaded ? usedRows(s) : 0,
+    agentUsedRows: s.loaded ? agentUsedRows(s) : 0,
     topLine: s.topLine,
     alt: (s.modes & MODES.ALT_SCREEN) !== 0,
     historyStart: s.historyStart,

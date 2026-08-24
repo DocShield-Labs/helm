@@ -15,6 +15,7 @@ import {
   sortById,
   useStore,
   type HostSessions,
+  type RunningSession,
   type Session,
 } from '@lib/store'
 import { activateAndConnectHost, selectSession } from '@lib/host'
@@ -22,7 +23,8 @@ import { displayedHostStatus } from '@lib/host-status'
 import { homeRelative } from '@lib/path'
 import { groupRows } from '@lib/session/sidebarGroups'
 import { getSessionBlocks, lastFinished, useHostBlockLoadRevision } from '@lib/session/blocks'
-import { agentPromptOf, commandName, isAgentCommand, type SessionKind } from '@lib/session/sessionState'
+import type { SessionKind } from '@lib/session/sessionState'
+import { agentPromptOf, commandName, isAgentCommand } from '@lib/session/agents'
 import { killSession, openSession } from '@lib/actions/session'
 import { ContextMenu, type ContextMenuItem } from '@ui'
 import { InboxSection } from '@features/activity-feed/InboxSection'
@@ -152,6 +154,7 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
   const activeHostId = useStore((s) => s.activeHostId)
   const notifications = useStore((s) => s.notifications)
   const runningSessions = useStore((s) => s.runningSessions)
+  const customAgentTemplate = useStore((s) => s.customAgentTemplate)
   const blockLoadRevision = useHostBlockLoadRevision(host.id)
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
 
@@ -162,8 +165,8 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
   const isSelectedRow = (r: Row) => isActiveHost && hs?.activeSessionId === r.session.id
 
   const rows = useMemo(
-    () => buildRows(host.id, hs, runningSessions),
-    [host.id, hs, runningSessions, blockLoadRevision],
+    () => buildRows(host.id, hs, runningSessions, customAgentTemplate),
+    [host.id, hs, runningSessions, customAgentTemplate, blockLoadRevision],
   )
   const unreadSessionIds = useMemo(
     () => notificationSessionIds(notifications, host.id),
@@ -358,14 +361,17 @@ const DEFAULT_NAME = /^(zsh|bash|fish|sh|-?\w*sh|\d+|session \d+)$/i
 function buildRows(
   hostId: HostId,
   hs: HostSessions | undefined,
-  runningSessions: Map<string, { hostId: HostId; startedAt: number; command: string | null }>,
+  runningSessions: Map<string, RunningSession>,
+  customAgentTemplate: string,
 ): Row[] {
   if (!hs) return []
   const out: Row[] = []
   for (const session of sortById(hs.sessions.values())) {
       const run = runningSessions.get(`${hostId}::${session.id}`)
       const program = run ? commandName(run.command) : session.command || null
-      const kind: SessionKind = isAgentCommand(program) ? 'agent' : 'shell'
+      const kind: SessionKind = run
+        ? run.agentName !== null ? 'agent' : 'shell'
+        : isAgentCommand(program, customAgentTemplate) ? 'agent' : 'shell'
       const root = session.root
       const cwd = session.cwd
       // The working directory isn't on the card — it's the hover tooltip.
@@ -375,7 +381,7 @@ function buildRows(
       const last = !run ? lastFinished(getSessionBlocks(hostId, session.id).blocks)?.cmdline : null
       const detail =
         kind === 'agent'
-          ? agentPromptOf(run?.command) || program || 'agent'
+          ? run?.agentPrompt || agentPromptOf(session.command, customAgentTemplate) || program || 'agent'
           : run?.command?.trim() || last?.trim() || program || session.name
       const title = renamed ? session.name : detail
 

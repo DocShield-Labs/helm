@@ -20,6 +20,7 @@ import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSu
 import { NotificationPeek } from '@features/activity-feed/NotificationPeek'
 import { ReconnectingOverlay } from '@features/host/ReconnectingOverlay'
 import { PaletteHost } from '@features/palette/PaletteHost'
+import { CustomAgentModal } from '@features/agent-settings/CustomAgentModal'
 import { ToastHost, ConfirmHost, TopBar } from '@ui'
 import { Sidebar } from '@features/sessions/Sidebar'
 import type { Host, HostStatus } from '@bindings'
@@ -296,6 +297,7 @@ export function App() {
 
       <IntegrationSuggestionHost />
       <PaletteHost />
+      <CustomAgentModal />
       <ConfirmHost />
       <ToastHost />
     </div>

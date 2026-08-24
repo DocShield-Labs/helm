@@ -128,9 +128,9 @@ impl ToolIntegration for ClaudeCodeIntegration {
 
     fn description(&self) -> &'static str {
         "Add Notification + Stop hooks to ~/.claude/settings.json so \
-         Helm knows when Claude needs your approval or finishes a turn. \
-         The inbox surfaces the session; the composer hands keys over \
-         while Claude waits on a prompt."
+         Helm knows when Claude needs attention or finishes a turn. \
+         The inbox surfaces the session while the composer remains \
+         available for replies and terminal controls."
     }
 
     fn process_names(&self) -> &'static [&'static str] {

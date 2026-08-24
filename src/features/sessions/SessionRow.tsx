@@ -26,6 +26,10 @@ export interface SessionRowProps {
 
 /** Gap between the sidebar's right edge and the hover card. */
 const HOVER_GAP = 8
+/** Keep short hover cards comfortably readable. */
+const HOVER_MIN_WIDTH = 220
+/** Keep long hover cards inside the app window. */
+const HOVER_VIEWPORT_GAP = 12
 /** How long the cursor must rest on a card before the panel appears. */
 const HOVER_DELAY = 260
 
@@ -93,10 +97,7 @@ export function SessionRow({
     { id: 'kill', label: 'Close session', icon: '×', shortcut: '⌘W', destructive: true, onClick: onKill },
   ]
 
-  // Identity only — quiet at all times. Agents keep a whisper of the
-  // Claude hue; shells stay neutral. State lives in the command's
-  // brightness, never in the icon.
-  const iconColor = kind === 'agent' ? 'text-[var(--terminal-claude,#D97757)]' : 'text-text-tertiary'
+  const iconColor = kind === 'agent' ? 'text-accent' : 'text-text-tertiary'
   const titleColor = running ? 'text-text-primary font-medium' : 'text-text-secondary'
 
   return (
@@ -162,18 +163,24 @@ export function SessionRow({
         !editing &&
         createPortal(
           <div
-            className="pointer-events-none fixed z-50 w-max max-w-[340px] -translate-y-1/2 rounded-lg border border-[var(--stroke-default)] bg-elevated px-3 py-2.5"
-            style={{ left: hover.left, top: hover.top, boxShadow: 'var(--elevation-2)' }}
+            className="pointer-events-none fixed z-50 w-max overflow-hidden -translate-y-1/2 rounded-lg border border-[var(--stroke-default)] bg-elevated px-3 py-2.5"
+            style={{
+              left: hover.left,
+              top: hover.top,
+              minWidth: HOVER_MIN_WIDTH,
+              maxWidth: `calc(100vw - ${hover.left + HOVER_VIEWPORT_GAP}px)`,
+              boxShadow: 'var(--elevation-2)',
+            }}
           >
-            <div className="break-all font-mono text-[12px] text-text-primary">{detail}</div>
+            <div className="truncate whitespace-nowrap font-mono text-[12px] text-text-primary">{detail}</div>
             <div className="mt-2 flex items-center gap-1.5 text-text-secondary">
               <FolderIcon size={12} className="shrink-0" />
-              <span className="break-all font-mono text-[11px]">{dir || '—'}</span>
+              <span className="min-w-0 truncate whitespace-nowrap font-mono text-[11px]">{dir || '—'}</span>
             </div>
             {branch && (
               <div className="mt-1 flex items-center gap-1.5 text-text-tertiary">
                 <BranchIcon size={12} className="shrink-0" />
-                <span className="break-all font-mono text-[11px]">{branch}</span>
+                <span className="min-w-0 truncate whitespace-nowrap font-mono text-[11px]">{branch}</span>
               </div>
             )}
           </div>,

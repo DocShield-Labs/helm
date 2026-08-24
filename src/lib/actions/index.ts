@@ -11,6 +11,7 @@ import { sessionActions } from './session'
 import { inboxActions } from './inbox'
 import { themeActions } from './theme'
 import { composerActions } from './composer'
+import { agentActions } from './agent'
 
 export type { Action, ActionContext, ActionKind, ActionSource } from './types'
 
@@ -20,6 +21,7 @@ export const STATIC_ACTIONS: Action[] = [
   ...sessionActions,
   ...inboxActions,
   ...themeActions,
+  ...agentActions,
   ...composerActions,
 ]
 

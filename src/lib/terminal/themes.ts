@@ -152,14 +152,13 @@ export const THEMES: readonly Theme[] = [
   },
 ]
 
-export const DEFAULT_THEME_NAME = 'Helm'
+export const DEFAULT_THEME_NAME = 'Adeberry'
 
 export function getTheme(name: string | undefined): Theme {
-  if (name) {
-    const found = THEMES.find((t) => t.name === name)
-    if (found) return found
-  }
-  return THEMES[0]
+  const requested = THEMES.find((theme) => theme.name === name)
+  if (requested) return requested
+
+  return THEMES.find((theme) => theme.name === DEFAULT_THEME_NAME) ?? THEMES[0]
 }
 
 /** Convert a hex `#rrggbb` to `rgba(r, g, b, a)`. xterm.js accepts both
@@ -203,9 +202,9 @@ export function isLightTheme(theme: Theme): boolean {
 }
 
 /** Write the theme's base colours to `:root` and stamp
- * `data-theme-mode` so `tokens.css` flips its surface-mix direction
- * (lighten on dark themes, darken on light). All chrome derives from
- * those bases via `color-mix`, so this one call re-skins the app. */
+ * `data-theme-mode` so `tokens.css` can tune foreground blends for
+ * light and dark palettes. All chrome derives from those bases via
+ * `color-mix`, so this one call re-skins the app. */
 export function applyThemeCssVars(theme: Theme): void {
   if (typeof document === 'undefined') return
   const root = document.documentElement

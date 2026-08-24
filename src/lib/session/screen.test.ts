@@ -4,11 +4,13 @@ import {
   applyDiff,
   applyHistoryAppend,
   applyScreen,
+  agentUsedRows,
   getSessionScreen,
   rowAt,
   rowsBetween,
   subscribePaint,
   tailText,
+  usedRows,
 } from './screen'
 import { joinWrapped, rowsToText } from '@features/shell/Rows'
 
@@ -37,6 +39,26 @@ function texts(s: ReturnType<typeof getSessionScreen>, from: number, to: number)
 }
 
 describe('session screen mirror', () => {
+  test('agent rows ignore styled whitespace left below normal-screen content', () => {
+    const p = 'used-rows'
+    applyScreen(H, p, screenOf(0, ['output', 'status', '          ', '']))
+    const s = getSessionScreen(H, p)
+    s.cursor = { ...s.cursor, row: 3 }
+
+    expect(agentUsedRows(s)).toBe(2)
+    expect(usedRows(s)).toBe(3)
+  })
+
+  test('a wholly blank grid still includes its cursor row', () => {
+    const p = 'blank-grid'
+    applyScreen(H, p, screenOf(0, ['   ', '', '']))
+    const s = getSessionScreen(H, p)
+    s.cursor = { ...s.cursor, row: 1 }
+
+    expect(agentUsedRows(s)).toBe(2)
+    expect(usedRows(s)).toBe(1)
+  })
+
   test('a scrolling diff shifts the grid; appends fill history', () => {
     const p = 'p1'
     applyScreen(H, p, screenOf(0, ['a', 'b', '']))

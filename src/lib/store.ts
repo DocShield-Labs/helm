@@ -10,6 +10,14 @@
 
 import { create } from 'zustand'
 import { DEFAULT_THEME_NAME } from '@lib/terminal'
+import {
+  DEFAULT_AGENT_ID,
+  DEFAULT_CUSTOM_AGENT_TEMPLATE,
+  agentNameForCommand,
+  agentPromptOf,
+  isAgentId,
+  type AgentId,
+} from '@lib/session/agents'
 import type {
   Host,
   HostId,
@@ -39,6 +47,16 @@ export interface Session {
   /** Git toplevel of `cwd` (a worktree's own root) at the last refetch;
    * empty outside a repo. The sidebar groups sessions by it. */
   root: string
+}
+
+export interface RunningSession {
+  hostId: HostId
+  startedAt: number
+  command: string | null
+  /** Captured when the command starts so preference edits cannot
+   * reclassify an existing custom-agent session. */
+  agentName: string | null
+  agentPrompt: string | null
 }
 
 export interface HostSessions {
@@ -134,6 +152,14 @@ interface HelmState {
   previewThemeName: string | null
   setPreviewThemeName: (name: string | null) => void
 
+  defaultAgentId: AgentId
+  setDefaultAgentId: (id: AgentId) => void
+  customAgentTemplate: string
+  setCustomAgentTemplate: (template: string) => void
+  customAgentModalOpen: boolean
+  openCustomAgentModal: () => void
+  closeCustomAgentModal: () => void
+
   /** Command palette open state plus an optional initial query string
    * the palette should boot with. Cmd+K passes nothing (empty palette);
    * Cmd+P passes `'#'` so the palette opens with the session filter
@@ -187,7 +213,7 @@ interface HelmState {
 
   // ---------- live running indicator ----------
   /** Sessions with an open block (command accepted, not yet finished). */
-  runningSessions: Map<string, { hostId: HostId; startedAt: number; command: string | null }>
+  runningSessions: Map<string, RunningSession>
   markSessionRunning: (host: HostId, sessionId: string, command: string | null) => void
   markSessionIdle: (host: HostId, sessionId: string) => void
   /** Drop every running entry for a host. Called on disconnect and
@@ -364,6 +390,8 @@ const writeStringPref = (key: string, v: string) => {
 
 const SIDEBAR_COLLAPSED_KEY = 'helm.sidebarCollapsed'
 const THEME_NAME_KEY = 'helm.themeName'
+const DEFAULT_AGENT_KEY = 'helm.defaultAgent'
+const CUSTOM_AGENT_TEMPLATE_KEY = 'helm.customAgentTemplate'
 
 const readBoolPref = (key: string, fallback: boolean): boolean => {
   try {
@@ -402,6 +430,20 @@ export const useStore = create<HelmState>((set) => ({
   },
   previewThemeName: null,
   setPreviewThemeName: (v) => set({ previewThemeName: v }),
+
+  defaultAgentId: readStringPref(DEFAULT_AGENT_KEY, DEFAULT_AGENT_ID, isAgentId),
+  setDefaultAgentId: (id) => {
+    writeStringPref(DEFAULT_AGENT_KEY, id)
+    set({ defaultAgentId: id })
+  },
+  customAgentTemplate: readStringPref(CUSTOM_AGENT_TEMPLATE_KEY, DEFAULT_CUSTOM_AGENT_TEMPLATE),
+  setCustomAgentTemplate: (template) => {
+    writeStringPref(CUSTOM_AGENT_TEMPLATE_KEY, template)
+    set({ customAgentTemplate: template })
+  },
+  customAgentModalOpen: false,
+  openCustomAgentModal: () => set({ customAgentModalOpen: true }),
+  closeCustomAgentModal: () => set({ customAgentModalOpen: false }),
 
   paletteOpen: false,
   paletteInitialQuery: '',
@@ -588,7 +630,13 @@ export const useStore = create<HelmState>((set) => ({
     set((s) => {
       const key = `${host}::${sessionId}`
       const next = new Map(s.runningSessions)
-      next.set(key, { hostId: host, startedAt: Date.now(), command })
+      next.set(key, {
+        hostId: host,
+        startedAt: Date.now(),
+        command,
+        agentName: agentNameForCommand(command, s.customAgentTemplate),
+        agentPrompt: agentPromptOf(command, s.customAgentTemplate),
+      })
       return { runningSessions: next }
     }),
   markSessionIdle: (host, sessionId) =>
@@ -602,7 +650,7 @@ export const useStore = create<HelmState>((set) => ({
   clearRunningForHost: (host) =>
     set((s) => {
       const prefix = `${host}::`
-      const next = new Map<string, { hostId: HostId; startedAt: number; command: string | null }>()
+      const next = new Map<string, RunningSession>()
       for (const [k, v] of s.runningSessions) {
         if (!k.startsWith(prefix)) next.set(k, v)
       }
@@ -753,7 +801,7 @@ export function notificationSessionIds(
 }
 
 export function isSessionRunning(
-  runningSessions: Map<string, { hostId: HostId; startedAt: number; command: string | null }>,
+  runningSessions: Map<string, RunningSession>,
   hostId: HostId,
   sessionId: string,
 ): boolean {

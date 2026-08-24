@@ -25,10 +25,9 @@
  *              shown in Agent mode for an agent (Claude Code)
  *   alt      → the TUI owns the grid; agent composer if it's an agent
  *   raw      → plain terminal (no integration, or the process exited)
- * An agent that rings the bell is blocked on the user (a permission
- * prompt — the Claude hook only rings for those; end of turn is an
- * OSC 9 message): the composer closes and keys go straight to the TUI
- * until the user answers or presses ⏎ to reply.
+ * Agent bells feed notifications, but do not change the input surface:
+ * terminal programs use bells for both attention and ordinary turn
+ * completion, so they are not reliable evidence of a permission prompt.
  *
  * Stays mounted across switches: when `isVisible` flips to false the
  * parent hides us via `display: none`; the mirror keeps updating and
@@ -59,13 +58,14 @@ import {
   useComposerMode,
   type ComposerMode,
 } from '@lib/session/composer'
-import { AGENT_LAUNCH_COMMAND, deriveSessionState, shellQuote } from '@lib/session/sessionState'
+import { deriveSessionState } from '@lib/session/sessionState'
+import { agentName, agentNameForCommand, buildAgentCommand } from '@lib/session/agents'
 import { BlockHeader } from './Block'
 import { BlockList } from './BlockList'
 import { Composer } from './Composer'
 import { RowsView, rowsToText } from './Rows'
 import { SearchOverlay } from './SearchOverlay'
-import { ChevronDownIcon, SparkIcon } from '@features/sessions/icons'
+import { ChevronDownIcon } from '@features/sessions/icons'
 
 interface SessionViewProps {
   hostId: HostId
@@ -108,22 +108,24 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   const jump = usePendingJump(hostId, sessionId)
 
   const session = useStore((s) => s.sessions.get(hostId)?.sessions.get(sessionId))
+  const runningSession = useStore((s) => s.runningSessions.get(`${hostId}::${sessionId}`))
   const sessionCwd = session?.cwd ?? null
   const sessionBranch = session?.branch ?? null
   const spawned = session?.command ?? null
+  const defaultAgentId = useStore((s) => s.defaultAgentId)
+  const customAgentTemplate = useStore((s) => s.customAgentTemplate)
 
-  const ps = useMemo(() => deriveSessionState(pb, spawned || null), [pb, spawned])
+  const ps = useMemo(
+    () => deriveSessionState(pb, spawned || null, customAgentTemplate, runningSession?.agentName),
+    [pb, spawned, customAgentTemplate, runningSession?.agentName],
+  )
+  const defaultAgentName = agentName(defaultAgentId, customAgentTemplate)
+  const runningAgentName =
+    runningSession?.agentName ??
+    agentNameForCommand(ps.current?.cmdline ?? spawned, customAgentTemplate) ??
+    defaultAgentName
   const mode = useComposerMode(hostId, sessionId, ps.kind)
   reportEffective(hostId, sessionId, ps.kind, mode)
-
-  // Bells acknowledged so far; an agent session with a newer bell is blocked.
-  const [ackedBells, setAckedBells] = useState(pb.bells)
-  const bellsRef = useRef(pb.bells)
-  bellsRef.current = pb.bells
-  const blocked = ps.kind === 'agent' && pb.bells > ackedBells
-  const blockedRef = useRef(blocked)
-  blockedRef.current = blocked
-  const ackBells = () => setAckedBells(bellsRef.current)
 
   const xtermShown = ps.phase !== 'prompt'
   const shownRef = useRef(xtermShown)
@@ -149,11 +151,10 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     })
   }, [])
   useEffect(() => () => cancelAnimationFrame(fitRafRef.current), [])
-  const composerShown =
-    ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent' && !blocked)
+  const composerShown = ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent')
   /** Agent session in Terminal mode: typing lands in the TUI; keep the
    * mode control reachable. */
-  const nativeBar = ps.kind === 'agent' && mode === 'terminal' && !blocked
+  const nativeBar = ps.kind === 'agent' && mode === 'terminal'
 
   const history = useMemo(() => {
     const out: string[] = []
@@ -181,7 +182,8 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   // use. Lines below the band render as DOM.
   const cellH = termRef.current?.getCellSize().height ?? 20
   const liveStartRow = meta.alt ? 0 : Math.max(0, Math.min(meta.rows, bodyFrom - meta.topLine))
-  const liveEndRow = meta.alt ? meta.rows : Math.max(meta.usedRows, liveStartRow + 1)
+  const usedRows = ps.kind === 'agent' ? meta.agentUsedRows : meta.usedRows
+  const liveEndRow = meta.alt ? meta.rows : Math.max(usedRows, liveStartRow + 1)
   /** First absolute line the grid shows; DOM renders lines below it. */
   const gridFrom = xtermShown ? meta.topLine + liveStartRow : Infinity
   /** The xterm is always viewport-sized: that is the grid. */
@@ -218,14 +220,6 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       if (ac.signal.aborted || !visibleRef.current) return
       if (isUserKeystroke(data)) {
         dismissNotificationsFor(hostId, sessionId)
-        if (blockedRef.current) {
-          // The user answered the agent — or asked to reply (⏎).
-          ackBells()
-          if (data === '\r') {
-            setFocusKey((k) => k + 1)
-            return
-          }
-        }
       }
       void screen.sendInput(hostId, sessionId, data)
     })
@@ -465,7 +459,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
 
   const onSend = (text: string) => {
     if (mode === 'agent' && ps.kind !== 'agent') {
-      sendText(`${AGENT_LAUNCH_COMMAND} ${shellQuote(text)}`)
+      sendText(buildAgentCommand(defaultAgentId, customAgentTemplate, text))
       return
     }
     // `clear` clears the block list too (Warp does the same); the
@@ -551,7 +545,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
           cwd={sessionCwd}
           branch={sessionBranch}
           history={history}
-          agentName={AGENT_LAUNCH_COMMAND}
+          agentName={ps.kind === 'agent' ? runningAgentName : defaultAgentName}
           onModeChange={onModeChange}
           onSend={onSend}
           onRaw={(bytes) => void screen.sendInput(hostId, sessionId, bytes)}
@@ -569,27 +563,10 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
           focusKey={focusKey}
         />
       )}
-      {blocked && (
-        <button
-          type="button"
-          onClick={() => {
-            ackBells()
-            setFocusKey((k) => k + 1)
-          }}
-          className="helm-bar text-left"
-          title="Reply in the composer"
-        >
-          <SparkIcon size={14} className="shrink-0 text-[var(--terminal-claude,#D97757)]" />
-          <span className="flex-1 text-[12px] text-text-secondary">
-            {AGENT_LAUNCH_COMMAND} needs your approval — keys go straight to it
-          </span>
-          <span className="font-mono text-[11px] text-text-disabled">⏎ reply</span>
-        </button>
-      )}
       {nativeBar && (
         <div className="helm-bar">
           <span className="flex-1 text-[12px] text-text-tertiary">
-            typing in {AGENT_LAUNCH_COMMAND} directly
+            typing in {runningAgentName} directly
           </span>
           <button
             type="button"
