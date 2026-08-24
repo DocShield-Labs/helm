@@ -4,16 +4,9 @@
  * this needs no knowledge of how the mode was derived.
  */
 
-import { useStore } from '@lib/store'
 import { toggleComposerMode } from '@lib/session/composer'
+import { activeSessionSnapshot } from './session'
 import type { Action } from './types'
-
-function activeSessionId(): { hostId: string; sessionId: string } | null {
-  const state = useStore.getState()
-  if (!state.activeHostId) return null
-  const sessionId = state.sessions.get(state.activeHostId)?.activeSessionId
-  return sessionId ? { hostId: state.activeHostId, sessionId } : null
-}
 
 export const composerActions: Action[] = [
   {
@@ -22,10 +15,10 @@ export const composerActions: Action[] = [
     label: 'Toggle composer mode (Terminal ⇄ Agent)',
     icon: '⇄',
     keybinding: 'Cmd+i',
-    canRun: () => activeSessionId() !== null,
+    canRun: () => activeSessionSnapshot() !== null,
     run: () => {
-      const session = activeSessionId()
-      if (session) toggleComposerMode(session.hostId, session.sessionId)
+      const snapshot = activeSessionSnapshot()
+      if (snapshot) toggleComposerMode(snapshot.hostId, snapshot.session.id)
     },
   },
 ]

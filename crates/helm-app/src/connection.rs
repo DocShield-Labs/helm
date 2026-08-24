@@ -7,7 +7,7 @@
 //!   - **Local**: unix socket at `~/.helm/helmd.sock`, auto-spawning
 //!     `helmd serve` from the binary next to the app executable.
 //!   - **Remote**: one SSH session; the integration scripts + helmd
-//!     binary are installed/upgraded on the far side, then a no-PTY
+//!     binary are installed when missing, then a no-PTY
 //!     exec channel runs `helmd stdio` and the same frame protocol
 //!     flows over it.
 //!
@@ -535,13 +535,9 @@ async fn establish_local() -> Result<Established, String> {
     let name = format!("helm-app {}", env!("CARGO_PKG_VERSION"));
     let connected = tokio::task::spawn_blocking(move || {
         match connect_or_spawn_unix(&socket, &bin, &name) {
-            // A daemon from another build owns the socket. Its sessions
-            // are unreachable to us either way; replace it with ours.
-            Err(e) if is_stale_daemon(&e) => {
-                tracing::warn!("local helmd is stale ({e}); restarting it");
-                helm_proto::shutdown_socket(&socket)?;
-                connect_or_spawn_unix(&socket, &bin, &name)
-            }
+            Err(e) if is_stale_daemon(&e) => Err(ClientError::HandshakeRejected(format!(
+                "incompatible local helmd ({e}); existing sessions were left running — reopen them with the matching Helm build or stop that daemon explicitly"
+            ))),
             r => r,
         }
     })
@@ -560,8 +556,8 @@ async fn establish_local() -> Result<Established, String> {
 /// inserts variants ahead of `DaemonMsg::Error`, the old daemon's
 /// rejection decodes on our side as some other variant
 /// (`UnexpectedHello`) or as nothing at all (`Proto(Decode)`). Anything
-/// short of a `HelloAck` means its sessions are unreachable to us
-/// either way, so all three get the same treatment: replace it.
+/// short of a `HelloAck` means the client cannot safely attach. The
+/// daemon may still own live sessions, so callers must leave it alone.
 fn is_stale_daemon(err: &ClientError) -> bool {
     match err {
         ClientError::HandshakeRejected(m) => m.contains("protocol mismatch"),
@@ -573,8 +569,7 @@ fn is_stale_daemon(err: &ClientError) -> bool {
 
 /// The local daemon's socket: `~/.helm/helmd.sock`, or `$HELM_SOCKET`.
 /// The override lets a dev build run against its own daemon while the
-/// installed app keeps its sessions on the default socket — a protocol
-/// bump would otherwise restart the shared daemon on first connect.
+/// installed app keeps its sessions on the default socket.
 fn helmd_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("HELM_SOCKET") {
         if !p.is_empty() {
@@ -658,8 +653,6 @@ async fn establish_remote(
         ensure_remote_helmd(&session)?;
 
         // The bridge channel. No PTY — this is a binary frame stream.
-        // A daemon left running from an older binary rejects our hello;
-        // stop it and let the bridge spawn the current one.
         let bridge = |session: &Arc<helm_ssh::SshSession>| -> Result<Connected, ClientError> {
             let opened = session
                 .open_exec(r#"exec "$HOME/.helm/bin/helmd" stdio"#.to_string())
@@ -672,11 +665,9 @@ async fn establish_remote(
             )
         };
         let connected = match bridge(&session) {
-            Err(e) if is_stale_daemon(&e) => {
-                tracing::warn!("remote helmd is stale ({e}); restarting it");
-                shutdown_remote_helmd(&session)?;
-                bridge(&session).map_err(|e| e.to_string())?
-            }
+            Err(e) if is_stale_daemon(&e) => return Err(format!(
+                "incompatible remote helmd ({e}); existing sessions were left running — reconnect with the matching Helm build or stop that daemon explicitly before retrying"
+            )),
             r => r.map_err(|e| e.to_string())?,
         };
         Ok(Established {
@@ -691,9 +682,8 @@ async fn establish_remote(
 }
 
 /// Make sure the remote has our helmd at `~/.helm/bin/helmd` — right
-/// version, right protocol. Uploads our own binary when missing or
-/// stale, which requires matching OS/arch (cross-arch bundles land
-/// later; helm's fleet is assumed homogeneous until then).
+/// version and protocol. Uploads only when missing: replacing a binary
+/// behind a running daemon can destroy sessions owned by another build.
 fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String> {
     let expected = format!(
         "helmd {} (proto {})",
@@ -701,12 +691,11 @@ fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String
         helm_proto::PROTOCOL_VERSION
     );
     let installed = remote_helmd_version(session)?;
-    if installed == expected {
+    if !should_upload_remote_helmd(&installed, &expected, helm_proto::PROTOCOL_VERSION)? {
         return Ok(());
     }
 
-    // Version mismatch or not installed — check platform compatibility
-    // before shipping our own binary.
+    // Not installed — check platform compatibility before shipping our binary.
     let uname = session
         .run_oneshot("uname -sm".to_string())
         .map_err(|e| e.to_string())?;
@@ -766,24 +755,23 @@ fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String
             "helmd upload verification failed (got {verified:?}, wanted {expected:?})"
         ));
     }
-    // The binary changed under whatever daemon is running; the next
-    // `stdio` bridge spawns the new one once the old has exited.
-    if !installed.is_empty() {
-        shutdown_remote_helmd(session)?;
-    }
     Ok(())
 }
 
-/// Stop the daemon on the remote (`helmd shutdown`, which also pkills
-/// daemons too old to take the frame).
-fn shutdown_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String> {
-    session
-        .run_oneshot(
-            r#""$HOME/.helm/bin/helmd" shutdown 2>/dev/null || pkill -f "helmd serve" || true"#
-                .to_string(),
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+fn should_upload_remote_helmd(
+    installed: &str,
+    expected: &str,
+    protocol_version: u32,
+) -> Result<bool, String> {
+    if installed.is_empty() {
+        return Ok(true);
+    }
+    if installed.contains(&format!("(proto {protocol_version})")) {
+        return Ok(false);
+    }
+    Err(format!(
+        "remote has {installed}; this build requires {expected}. Existing sessions were left running — reconnect with the matching Helm build, or stop and remove the old helmd explicitly before retrying"
+    ))
 }
 
 /// `helmd --version` on the remote (empty string when not installed).
@@ -926,5 +914,20 @@ mod tests {
         )));
         assert!(!is_stale_daemon(&ClientError::HandshakeClosed));
         assert!(!is_stale_daemon(&ClientError::Closed));
+    }
+
+    #[test]
+    fn remote_binary_mismatches_are_never_replaced_automatically() {
+        assert_eq!(
+            should_upload_remote_helmd("", "helmd 2 (proto 7)", 7),
+            Ok(true)
+        );
+        assert_eq!(
+            should_upload_remote_helmd("helmd 1 (proto 7)", "helmd 2 (proto 7)", 7),
+            Ok(false)
+        );
+        let error =
+            should_upload_remote_helmd("helmd 1 (proto 6)", "helmd 2 (proto 7)", 7).unwrap_err();
+        assert!(error.contains("Existing sessions were left running"));
     }
 }

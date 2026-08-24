@@ -637,9 +637,9 @@ pub fn connect_or_spawn_socket(
 /// `Shutdown` frame first (any client may send one — it's the user's
 /// own daemon), then a `pkill` of `helmd serve --socket <socket>` for
 /// daemons too old to understand the frame, then the socket path is
-/// unlinked so a fresh `serve` can bind. Used when a running daemon
-/// speaks another protocol version than the app: the sessions inside
-/// it are unreachable either way, so restarting loses nothing usable.
+/// unlinked so a fresh `serve` can bind. This is an explicit destructive
+/// operation: callers must not use it merely because protocols differ,
+/// since the daemon may own live sessions.
 #[cfg(unix)]
 pub fn shutdown_socket(socket: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write;

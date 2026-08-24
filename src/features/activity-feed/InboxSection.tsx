@@ -28,7 +28,6 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
   const notifications = useStore((s) => s.notifications)
   const hosts = useStore((s) => s.hosts)
   const sessions = useStore((s) => s.sessions)
-  const setActiveHost = useStore((s) => s.setActiveHost)
   const activeHostId = useStore((s) => s.activeHostId)
 
   // Hover-peek glue: a single shared close timer at the section level
@@ -88,9 +87,10 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
     if (state.peekedInboxId === n.id) {
       state.setMergingInboxId(n.id)
     }
-    setActiveHost(n.host_id)
     if (sessions.get(n.host_id)?.sessions.has(n.session_id)) {
       selectSession(n.host_id, n.session_id)
+    } else {
+      state.setActiveHost(n.host_id)
     }
   }
 

@@ -107,10 +107,10 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   const meta = useScreenMeta(hostId, sessionId)
   const jump = usePendingJump(hostId, sessionId)
 
-  // Primitive selectors: zustand re-renders on reference change.
-  const sessionCwd = useStore((s) => s.sessions.get(hostId)?.sessions.get(sessionId)?.cwd ?? null)
-  const sessionBranch = useStore((s) => s.sessions.get(hostId)?.sessions.get(sessionId)?.branch ?? null)
-  const spawned = useStore((s) => s.sessions.get(hostId)?.sessions.get(sessionId)?.command ?? null)
+  const session = useStore((s) => s.sessions.get(hostId)?.sessions.get(sessionId))
+  const sessionCwd = session?.cwd ?? null
+  const sessionBranch = session?.branch ?? null
+  const spawned = session?.command ?? null
 
   const ps = useMemo(() => deriveSessionState(pb, spawned || null), [pb, spawned])
   const mode = useComposerMode(hostId, sessionId, ps.kind)
