@@ -38,6 +38,8 @@ const EMPTY: PaneBlocks = {
 const panes = new Map<string, PaneBlocks>()
 const subs = new Map<string, Set<() => void>>()
 const loading = new Map<string, Promise<void>>()
+const hostLoadRevisions = new Map<string, number>()
+const hostLoadSubs = new Map<string, Set<() => void>>()
 const key = (h: HostId, p: string) => `${h}::${p}`
 
 function update(k: string, f: (cur: PaneBlocks) => PaneBlocks): void {
@@ -95,6 +97,16 @@ export function usePaneBlocks(hostId: HostId, paneId: string): PaneBlocks {
   )
 }
 
+/** Re-render host-level summaries when historical blocks finish loading.
+ * Live block events already update the main store's running state. */
+export function useHostBlockLoadRevision(hostId: HostId): number {
+  return useSyncExternalStore(
+    (cb) => addListener(hostLoadSubs, hostId, cb),
+    () => hostLoadRevisions.get(hostId) ?? 0,
+    () => 0,
+  )
+}
+
 /**
  * Fetch the daemon's retained block table once per pane. Live upserts
  * that raced ahead are preserved (merged by id).
@@ -113,6 +125,8 @@ export function ensureLoaded(hostId: HostId, paneId: string): Promise<void> {
         for (const live of cur.blocks) blocks = insertSorted(blocks, live)
         return { ...cur, blocks, loaded: true }
       })
+      hostLoadRevisions.set(hostId, (hostLoadRevisions.get(hostId) ?? 0) + 1)
+      notifyListeners(hostLoadSubs, hostId)
     })
     .finally(() => loading.delete(k))
   loading.set(k, p)
@@ -126,6 +140,21 @@ export function dropHost(hostId: HostId): void {
       panes.delete(k)
       notifyListeners(subs, k)
     }
+  }
+  hostLoadRevisions.delete(hostId)
+  notifyListeners(hostLoadSubs, hostId)
+}
+
+/** Drop cached block tables for panes no longer present in a host tree. */
+export function retainHostPanes(hostId: HostId, paneIds: ReadonlySet<string>): void {
+  const prefix = `${hostId}::`
+  for (const k of [...panes.keys()]) {
+    if (!k.startsWith(prefix)) continue
+    const paneId = k.slice(prefix.length)
+    if (paneIds.has(paneId)) continue
+    panes.delete(k)
+    loading.delete(k)
+    notifyListeners(subs, k)
   }
 }
 
@@ -203,4 +232,3 @@ export function consumeJump(j: PendingJump): void {
     for (const cb of jumpSubs) cb()
   }
 }
-

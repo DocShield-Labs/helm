@@ -17,12 +17,13 @@ import { useEffect, useMemo, useState } from 'react'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { commands } from '@lib/ipc'
 import {
+  selectedPane,
   sortById,
   useStore,
   type HostSessions,
   type TmuxWorkspace,
 } from '@lib/store'
-import { connectHost, subscribeHostEvents } from '@lib/host'
+import { connectHost, deleteHost, subscribeHostEvents } from '@lib/host'
 import { useAppUpdate } from '@lib/updater'
 import { useGlobalKeymap } from '@lib/keymap-engine'
 import {
@@ -137,10 +138,7 @@ export function App() {
 
   const activePane = useMemo(() => {
     if (!activeWorkspace || !activeWindow) return undefined
-    const inWindow = [...activeWorkspace.panes.values()].filter(
-      (p) => p.windowId === activeWindow.id,
-    )
-    return inWindow.find((p) => p.active) ?? inWindow[0]
+    return selectedPane(activeWorkspace, activeWindow.id)
   }, [activeWorkspace, activeWindow])
 
   const activePaneKey =
@@ -295,22 +293,24 @@ export function App() {
   const title = [activeHost?.name, activeWindow?.name].filter(Boolean).join(' — ')
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-canvas text-text-primary">
-      <Sidebar
-        onAddHost={() => {
-          setEditing(null)
-          setEditorOpen(true)
-        }}
-        onEditHost={(h) => {
-          setEditing(h)
-          setEditorOpen(true)
-        }}
-        onDeleteHost={(h) => void deleteHost(h)}
-      />
+    // Column: the top bar spans the full window; the sidebar and pane
+    // area share the row beneath it.
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-text-primary">
+      <TopBar title={title} update={appUpdate} />
+      <div className="flex min-h-0 flex-1">
+        <Sidebar
+          onAddHost={() => {
+            setEditing(null)
+            setEditorOpen(true)
+          }}
+          onEditHost={(h) => {
+            setEditing(h)
+            setEditorOpen(true)
+          }}
+          onDeleteHost={(h) => void deleteHost(h)}
+        />
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <TopBar title={title} update={appUpdate} />
-        <main className="relative flex flex-1 overflow-hidden">
+        <main className="relative flex min-w-0 flex-1 overflow-hidden">
           {/* Keep-alive pane stack: one BlockPane per pane the user has
               ever visited; only the active one is visible. Hidden panes
               continue to receive live output and keep their xterm
@@ -340,6 +340,7 @@ export function App() {
               hostError={activeHostId ? hostErrors.get(activeHostId) ?? null : null}
               status={activeStatus}
               hs={activeHostSessions}
+              host={activeHost}
             />
           )}
           {activeHost && activeStatus === 'reconnecting' && (
@@ -370,59 +371,16 @@ export function App() {
   )
 }
 
-/** Remove a remote host from the registry. Disconnects (if connected),
- * clears its Keychain entry, and rewrites hosts.json. Confirmation
- * dialog because this is destructive — the user's saved password and
- * other host metadata are gone. The Rust side emits HostRemoved before
- * persistence runs, so the UI updates either way; a toast surfaces the
- * persistence error if the on-disk write failed. */
-async function deleteHost(host: Host): Promise<void> {
-  const ok = await useStore.getState().requestConfirm({
-    title: `Delete host "${host.name}"?`,
-    message:
-      'This removes it from your saved list and clears any stored password. Sessions on the remote machine are unaffected.',
-    confirmLabel: 'Delete',
-    destructive: true,
-  })
-  if (!ok) return
-  let res: Awaited<ReturnType<typeof commands.hostDelete>>
-  try {
-    res = await commands.hostDelete(host.id)
-  } catch (e) {
-    useStore.getState().pushToast({
-      id: `host-delete-error::${host.id}`,
-      message: `Delete threw: ${String(e)}`,
-      durationMs: 8_000,
-    })
-    return
-  }
-  if (res.status !== 'ok') {
-    useStore.getState().pushToast({
-      id: `host-delete-error::${host.id}`,
-      message: `Couldn't fully delete "${host.name}": ${res.error}`,
-      durationMs: 8_000,
-    })
-  }
-}
-
-/** Render a round-trip latency for the connection segment.
- * Sub-millisecond samples (effectively in-process queue) show as `<1ms`
- * so they don't render as a flickery "0ms". Anything ≥ 1s switches to
- * seconds with one decimal — at that point the user cares about magnitude
- * more than precision. Pre-first-sample shows an em-dash. */
+/** Quote a path for insertion into the active shell. */
 function escapeShellPath(p: string): string {
   return p.replace(/([ '"\\$`!*?(){}[\]<>;&|#~])/g, '\\$1')
 }
 
-/** Replace a `/Users/<user>` or `/home/<user>` prefix with `~`. We can't
- * read $HOME from the renderer so we pattern-match the conventional
- * roots; that covers macOS and Linux for both local and remote hosts.
- * Anything else (Windows paths, jails, weird mount points) falls
- * through unchanged. */
+/** Message for a reachable host without an active pane. */
 function emptyStateText(hs: HostSessions | undefined): string {
   if (!hs) return 'Opening session…'
-  if (hs.workspaces.size === 0) return 'No workspaces yet.'
-  if (!hs.activeWorkspaceId) return 'Select a workspace from the sidebar.'
+  if (hs.workspaces.size === 0) return 'No sessions yet.'
+  if (!hs.activeWorkspaceId) return 'Select a session from the sidebar.'
   return 'Opening session…'
 }
 
@@ -437,19 +395,27 @@ function PaneEmptyState({
   hostError,
   status,
   hs,
+  host,
 }: {
   bootError: string | null
   hostError: string | null
   status: HostStatus | undefined
   hs: HostSessions | undefined
+  host: Host | undefined
 }) {
   const isError = !!bootError || (status === 'error' && !!hostError)
+  // A disconnected remote has no sessions to show and can't open one —
+  // say that, and offer the only thing that helps.
+  const offline = !isError && !!host && host.port !== 0 && status === 'disconnected'
   const message = bootError
     ? `error · ${bootError}`
     : status === 'error' && hostError
       ? `error · ${hostError}`
-      : emptyStateText(hs)
-  const showHints = !isError && status !== 'connecting' && status !== 'reconnecting'
+      : offline
+        ? `Not connected to ${host.name}.`
+        : emptyStateText(hs)
+  // ⌘T only means something on a host we can actually reach.
+  const showHints = !isError && !offline && status !== 'connecting' && status !== 'reconnecting'
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-5 px-8 text-center">
       <div
@@ -457,10 +423,19 @@ function PaneEmptyState({
       >
         {message}
       </div>
+      {offline && host && (
+        <button
+          type="button"
+          onClick={() => void connectHost(host.id).catch(() => {})}
+          className="rounded-md bg-accent-muted px-3 py-1 text-[12px] text-accent-text hover:bg-[var(--accent-border)]"
+        >
+          Reconnect
+        </button>
+      )}
       {showHints && (
         <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
           <EmptyHint keys={['⌘', 'K']} label="commands" />
-          <EmptyHint keys={['⌘', 'T']} label="new window" />
+          <EmptyHint keys={['⌘', 'T']} label="new session" />
           <EmptyHint keys={['⌘', '\\']} label="toggle sidebar" />
         </div>
       )}
@@ -485,4 +460,3 @@ function EmptyHint({ keys, label }: { keys: string[]; label: string }) {
     </span>
   )
 }
-

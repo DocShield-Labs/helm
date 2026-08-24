@@ -374,7 +374,21 @@ fn pane_env_is_pristine_not_inherited() {
         DaemonMsg::Screen { req_id: Some(3), pane, screen } if *pane == pane_id => Some(screen.clone()),
         _ => None,
     });
-    let lines: Vec<String> = screen.lines.iter().map(|r| r.text().trim_end().to_string()).collect();
+    // The environment can exceed the 24-row grid. Fetch rows that
+    // scrolled into history so required variables are not mistaken for
+    // missing merely because they moved above the final snapshot.
+    c.send(&ClientMsg::History {
+        req_id: 4,
+        pane: pane_id,
+        from_line: 0,
+        to_line: screen.top_line,
+    });
+    let history = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::History { req_id: 4, rows, .. } => Some(rows.clone()),
+        _ => None,
+    });
+    let mut lines: Vec<String> = history.iter().map(|r| r.text().trim_end().to_string()).collect();
+    lines.extend(screen.lines.iter().map(|r| r.text().trim_end().to_string()));
     let has = |prefix: &str| lines.iter().any(|l| l.starts_with(prefix));
 
     assert!(!has("TMUX="), "TMUX leaked from the daemon's launcher: {lines:?}");

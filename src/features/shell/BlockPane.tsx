@@ -35,7 +35,7 @@
  * the painter catches up when we're shown again.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { MAX_HISTORY_PAGE } from '@bindings'
 import type { HostId } from '@bindings'
 import { commands } from '@lib/ipc'
@@ -126,6 +126,29 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
   const ackBells = () => setAckedBells(bellsRef.current)
 
   const xtermShown = ps.phase !== 'prompt'
+  const shownRef = useRef(xtermShown)
+  shownRef.current = xtermShown
+
+  // Fit the xterm to the viewport, at most once per frame. Called live
+  // from the viewport ResizeObserver so the grid grows and shrinks with
+  // the window instead of snapping after a debounce. fit() only resizes
+  // the PTY when the row/col count actually changes, so a drag that
+  // doesn't cross a cell boundary costs nothing downstream.
+  const fitRafRef = useRef(0)
+  const scheduleFit = useCallback(() => {
+    if (fitRafRef.current) return
+    fitRafRef.current = requestAnimationFrame(() => {
+      fitRafRef.current = 0
+      const t = termRef.current
+      if (!t || !visibleRef.current || !shownRef.current) return
+      try {
+        t.fit.fit()
+      } catch {
+        /* not laid out yet */
+      }
+    })
+  }, [])
+  useEffect(() => () => cancelAnimationFrame(fitRafRef.current), [])
   const composerShown =
     ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent' && !blocked)
   /** Agent pane in Terminal mode: typing lands in the TUI; keep the
@@ -273,6 +296,9 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
     }
     const viewport = new ResizeObserver((entries) => {
       setSlotHeight(Math.floor(entries[0]?.contentRect.height ?? 0))
+      // Fit live so the grid tracks the window during a drag, not 30ms
+      // after it stops.
+      scheduleFit()
       pin()
     })
     const body = new ResizeObserver(pin)
@@ -283,20 +309,14 @@ export function BlockPane({ hostId, paneId, isVisible = true }: BlockPaneProps) 
       viewport.disconnect()
       body.disconnect()
     }
-  }, [])
+  }, [scheduleFit])
 
+  // Refit on the state transitions that change the grid's slot without a
+  // viewport resize: the pane becoming visible, the composer showing or
+  // hiding, alt-screen toggling. The live resize above covers dragging.
   useEffect(() => {
-    const t = termRef.current
-    if (!t || slotHeight <= 0 || !xtermShown || !isVisible) return
-    const id = window.setTimeout(() => {
-      try {
-        t.fit.fit()
-      } catch {
-        /* not laid out yet */
-      }
-    }, 30)
-    return () => window.clearTimeout(id)
-  }, [slotHeight, ready, xtermShown, meta.alt, isVisible])
+    if (ready && xtermShown && isVisible) scheduleFit()
+  }, [ready, xtermShown, meta.alt, isVisible, scheduleFit])
 
   // ---- history paging: the sentinel at the top pulls older rows ----
   useEffect(() => {

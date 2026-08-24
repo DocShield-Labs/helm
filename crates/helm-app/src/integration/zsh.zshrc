@@ -69,7 +69,10 @@ __helm_precmd() {
         __helm_command_started=0
     fi
 
-    local cwd="$PWD"
+    # Physical cwd canonicalizes casing on case-insensitive filesystems
+    # and keeps grouping/spawn inheritance on one stable path.
+    local cwd
+    cwd=$(command pwd -P)
     local branch root
     branch=$(command git symbolic-ref --short HEAD 2>/dev/null)
     # The repo root (a worktree's own root): the sidebar groups

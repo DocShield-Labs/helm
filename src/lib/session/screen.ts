@@ -473,6 +473,19 @@ export function dropHost(hostId: HostId): void {
   }
 }
 
+/** Drop cached screens for panes no longer present in a host tree. */
+export function retainHostPanes(hostId: HostId, paneIds: ReadonlySet<string>): void {
+  const prefix = `${hostId}::`
+  for (const k of [...panes.keys()]) {
+    if (!k.startsWith(prefix)) continue
+    const paneId = k.slice(prefix.length)
+    if (paneIds.has(paneId)) continue
+    panes.delete(k)
+    metaCache.delete(k)
+    notify(k)
+  }
+}
+
 /** Keystrokes / pasted text for a pane. One place owns the wire
  * encoding (base64) for the outbound half. */
 export function sendInput(hostId: HostId, paneId: string, input: string | Uint8Array): Promise<void> {

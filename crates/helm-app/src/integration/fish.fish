@@ -36,7 +36,9 @@ function __helm_precmd --on-event fish_prompt
         set -g __helm_command_started 0
     end
 
-    set -l cwd $PWD
+    # Physical cwd canonicalizes casing on case-insensitive filesystems
+    # and keeps grouping/spawn inheritance on one stable path.
+    set -l cwd (command pwd -P)
     set -l branch (command git symbolic-ref --short HEAD 2>/dev/null)
     # The repo root: the sidebar groups sessions by it. Empty outside a repo.
     set -l root (command git rev-parse --show-toplevel 2>/dev/null)
@@ -48,7 +50,7 @@ function __helm_precmd --on-event fish_prompt
     # Top pad: leave A's row blank, push header onto the next row.
     echo
     if test -z "$HELM_KEEP_PROMPT"
-        set -l cwd_pretty (string replace -r "^$HOME" "~" $PWD)
+        set -l cwd_pretty (string replace -r "^$HOME" "~" $cwd)
         if test -n "$branch"
             printf '\e[38;5;244m%s · %s\e[0m\n' $cwd_pretty $branch
         else

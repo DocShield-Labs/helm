@@ -215,8 +215,8 @@ button:not(:disabled),
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
-  border-radius: 4px;
+  padding: 7px 8px;
+  border-radius: 7px;
   box-shadow: inset 0 0 0 1px transparent;
   cursor: pointer;
   user-select: none;
@@ -227,6 +227,39 @@ button:not(:disabled),
 .helm-row-selected,
 .helm-row-selected:hover {
   background: var(--stroke-default);
+  box-shadow: inset 0 0 0 1px var(--stroke-strong);
+}
+/* Truncate a path from the FRONT, keeping the tail (the leaf folder,
+   which is what identifies the project). `direction: rtl` on the box
+   moves the ellipsis to the start; the inner span forces the text back
+   to LTR so leading neutrals (the `~` and `/`) stay at the start and
+   get clipped, instead of being reordered to the visual end. */
+.helm-truncate-start {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+.helm-truncate-start > * {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+
+/* A session row is a single line — icon + command — with the icon
+   centred on it. Cards are a deliberate ~40px target (Warp's tabs are
+   in that range): big enough to read as the substance of the panel,
+   with the working directory on hover rather than a second line. */
+.helm-row-session {
+  align-items: center;
+  padding-top: 11px;
+  padding-bottom: 11px;
+}
+/* The selected session is where the eye rests: a committed fill, a
+   touch stronger than hover, with a clear hairline. */
+.helm-row-session.helm-row-selected,
+.helm-row-session.helm-row-selected:hover {
+  background: var(--bg-active);
   box-shadow: inset 0 0 0 1px var(--stroke-strong);
 }
 

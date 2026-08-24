@@ -1181,6 +1181,21 @@ export function locatePane(
   return undefined
 }
 
+/** The pane a window should present: its active pane, or the first pane
+ * when selection has not arrived yet. */
+export function selectedPane(
+  workspace: TmuxWorkspace,
+  windowId: string,
+): TmuxPane | undefined {
+  let first: TmuxPane | undefined
+  for (const pane of workspace.panes.values()) {
+    if (pane.windowId !== windowId) continue
+    if (pane.active) return pane
+    first ??= pane
+  }
+  return first
+}
+
 /** Find which workspace owns a given window id (within a host). */
 export function workspaceForWindow(
   hs: HostSessions | undefined,
@@ -1235,6 +1250,26 @@ export function notificationsForWindow(
   }
   out.sort((a, b) => a.created_at - b.created_at)
   return out
+}
+
+/** Window ids with unread notifications for one host. Resolves legacy
+ * notifications without a window id through the current pane tree. */
+export function notificationWindowIds(
+  notifications: Map<NotificationId, Notification>,
+  hostSessions: HostSessions | undefined,
+  hostId: HostId,
+): Set<string> {
+  const ids = new Set<string>()
+  for (const notification of notifications.values()) {
+    if (notification.host_id !== hostId) continue
+    if (notification.window_id) {
+      ids.add(notification.window_id)
+      continue
+    }
+    const windowId = locatePane(hostSessions, notification.pane_id)?.pane.windowId
+    if (windowId) ids.add(windowId)
+  }
+  return ids
 }
 
 /** True when any pane in this window has an open command (we received

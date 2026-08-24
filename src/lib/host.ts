@@ -18,7 +18,7 @@ import { useStore } from '@lib/store'
 import { treeToWorkspaces } from '@lib/session/tree'
 import * as screen from '@lib/session/screen'
 import * as blocks from '@lib/session/blocks'
-import type { HostEvent, HostId, SessionEvent } from '@bindings'
+import type { Host, HostEvent, HostId, SessionEvent, SessionTree } from '@bindings'
 
 let subscribed = false
 
@@ -150,9 +150,10 @@ function handleSessionEvent(hostId: HostId, ev: SessionEvent): void {
     case 'mode_change':
       blocks.setAltScreen(hostId, ev.pane_id, ev.alt_screen)
       return
-    case 'tree':
-      store.setWorkspaces(hostId, treeToWorkspaces(ev.tree))
+    case 'tree': {
+      applyTree(hostId, ev.tree)
       return
+    }
     case 'pane_exited':
       blocks.setExited(hostId, ev.pane_id)
       store.markPaneIdle(hostId, ev.pane_id)
@@ -173,6 +174,48 @@ export async function connectHost(hostId: HostId, bootstrapWorkspace?: string): 
   await refetchTree(hostId)
 }
 
+/** Activate a host and connect it when its transport is offline. */
+export async function activateAndConnectHost(hostId: HostId): Promise<void> {
+  const state = useStore.getState()
+  state.setActiveHost(hostId)
+  const status = state.statuses.get(hostId)
+  if (status === 'connected' || status === 'idle' || status === 'connecting' || status === 'reconnecting') {
+    return
+  }
+  await connectHost(hostId)
+}
+
+/** Confirm and remove a remote host from the registry. */
+export async function deleteHost(host: Host): Promise<void> {
+  const ok = await useStore.getState().requestConfirm({
+    title: `Delete host "${host.name}"?`,
+    message:
+      'This removes it from your saved list and clears any stored password. Sessions on the remote machine are unaffected.',
+    confirmLabel: 'Delete',
+    destructive: true,
+  })
+  if (!ok) return
+
+  let result: Awaited<ReturnType<typeof commands.hostDelete>>
+  try {
+    result = await commands.hostDelete(host.id)
+  } catch (error) {
+    useStore.getState().pushToast({
+      id: `host-delete-error::${host.id}`,
+      message: `Delete threw: ${String(error)}`,
+      durationMs: 8_000,
+    })
+    return
+  }
+  if (result.status !== 'ok') {
+    useStore.getState().pushToast({
+      id: `host-delete-error::${host.id}`,
+      message: `Couldn't fully delete "${host.name}": ${result.error}`,
+      durationMs: 8_000,
+    })
+  }
+}
+
 /** Make `workspaceId` the active workspace for `hostId`. Local state. */
 export async function selectWorkspace(hostId: HostId, workspaceId: string): Promise<void> {
   useStore.getState().setActiveWorkspace(hostId, workspaceId)
@@ -190,5 +233,16 @@ export function selectWindow(hostId: HostId, workspaceId: string, windowId: stri
 export async function refetchTree(hostId: HostId): Promise<void> {
   const res = await commands.sessionTree(hostId)
   if (res.status !== 'ok') return
-  useStore.getState().setWorkspaces(hostId, treeToWorkspaces(res.data))
+  applyTree(hostId, res.data)
+}
+
+function applyTree(hostId: HostId, tree: SessionTree): void {
+  const workspaces = treeToWorkspaces(tree)
+  const paneIds = new Set<string>()
+  for (const workspace of workspaces) {
+    for (const paneId of workspace.panes.keys()) paneIds.add(paneId)
+  }
+  screen.retainHostPanes(hostId, paneIds)
+  blocks.retainHostPanes(hostId, paneIds)
+  useStore.getState().setWorkspaces(hostId, workspaces)
 }

@@ -46,7 +46,10 @@ __helm_precmd() {
     fi
     __helm_pending_cmdline=""
 
-    local cwd="$PWD"
+    # Physical cwd canonicalizes casing on case-insensitive filesystems
+    # and keeps grouping/spawn inheritance on one stable path.
+    local cwd
+    cwd=$(command pwd -P)
     local branch root
     branch=$(command git symbolic-ref --short HEAD 2>/dev/null)
     # The repo root: the sidebar groups sessions by it. Empty outside a repo.
@@ -65,7 +68,7 @@ __helm_precmd() {
     echo
     __helm_emit "A;cwd_b64=${cwd_b64};branch_b64=${branch_b64};root_b64=${root_b64}"
     if [ -z "$HELM_KEEP_PROMPT" ]; then
-        local cwd_pretty="${PWD/#$HOME/~}"
+        local cwd_pretty="${cwd/#$HOME/~}"
         if [ -n "$branch" ]; then
             printf '\033[38;5;244m%s · %s\033[0m\n' "$cwd_pretty" "$branch"
         else

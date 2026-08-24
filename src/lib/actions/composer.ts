@@ -4,7 +4,7 @@
  * this needs no knowledge of how the mode was derived.
  */
 
-import { useStore } from '@lib/store'
+import { selectedPane, useStore } from '@lib/store'
 import { toggleComposerMode } from '@lib/session/composer'
 import { activeWindowSnapshot } from './window'
 import type { Action } from './types'
@@ -12,8 +12,7 @@ import type { Action } from './types'
 function activePaneId(): { hostId: string; paneId: string } | null {
   const snap = activeWindowSnapshot()
   if (!snap) return null
-  const panes = [...snap.workspace.panes.values()].filter((p) => p.windowId === snap.window.id)
-  const pane = panes.find((p) => p.active) ?? panes[0]
+  const pane = selectedPane(snap.workspace, snap.window.id)
   return pane ? { hostId: snap.hostId, paneId: pane.id } : null
 }
 

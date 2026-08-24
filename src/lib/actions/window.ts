@@ -8,7 +8,15 @@
 
 import { commands } from '@lib/ipc'
 import { selectWindow } from '@lib/host'
-import { useStore, pinnedKey, sortById, type TmuxWindow, type TmuxWorkspace } from '@lib/store'
+import {
+  pinnedKey,
+  selectedPane,
+  sortById,
+  useStore,
+  type HostSessions,
+  type TmuxWindow,
+  type TmuxWorkspace,
+} from '@lib/store'
 import type { Action } from './types'
 import type { HostId } from '@bindings'
 import { activeHostId, activeWorkspace } from './workspace'
@@ -18,6 +26,83 @@ function activeWindow(): TmuxWindow | undefined {
   if (!ws) return undefined
   const list = sortById(ws.windows.values())
   return list.find((w) => w.active) ?? list[0]
+}
+
+function inheritedCwd(hostSessions: HostSessions | undefined): string | null {
+  if (!hostSessions?.activeWorkspaceId) return null
+  const ws = hostSessions.workspaces.get(hostSessions.activeWorkspaceId)
+  if (!ws) return null
+  const windows = sortById(ws.windows.values())
+  const win = windows.find((window) => window.active) ?? windows[0]
+  if (!win) return null
+  const pane = selectedPane(ws, win.id)
+  return pane?.cwd || null
+}
+
+function canOpenSession(
+  state: ReturnType<typeof useStore.getState>,
+  hostId: HostId | null,
+): hostId is HostId {
+  if (!hostId) return false
+  const host = state.hosts.get(hostId)
+  if (!host) return false
+  const status = state.statuses.get(hostId)
+  return host.port === 0 || status === 'connected' || status === 'idle'
+}
+
+function reportOpenSessionError(hostId: HostId, message: string): void {
+  useStore.getState().pushToast({
+    id: `new-session-error::${hostId}`,
+    message,
+    durationMs: 8_000,
+  })
+}
+
+/** Open a session on the active host, inheriting the current session's
+ * cwd. Killing the last window strips its (now empty) workspace from
+ * the tree while the undo toast counts down, so there may be no
+ * workspace to put this in — create one rather than making the user
+ * wait out the timer. */
+export async function openSession(targetHostId?: HostId): Promise<void> {
+  const initial = useStore.getState()
+  const hostId = targetHostId ?? initial.activeHostId
+  if (!canOpenSession(initial, hostId)) {
+    if (hostId) reportOpenSessionError(hostId, 'Connect to this host before opening a session.')
+    return
+  }
+
+  const cwd = hostId === initial.activeHostId ? inheritedCwd(initial.sessions.get(hostId)) : null
+  if (targetHostId && targetHostId !== initial.activeHostId) initial.setActiveHost(targetHostId)
+
+  const hs = initial.sessions.get(hostId)
+  let wsId = hs?.activeWorkspaceId ?? hs?.workspaces.keys().next().value ?? null
+  try {
+    if (!wsId) {
+      const created = await commands.workspaceNew(hostId, null)
+      if (created.status !== 'ok') {
+        reportOpenSessionError(hostId, `Couldn't open session: ${created.error}`)
+        return
+      }
+      if (created.data.window_id) {
+        if (useStore.getState().activeHostId === hostId) {
+          selectWindow(hostId, created.data.workspace_id, created.data.window_id)
+        }
+        return
+      }
+      wsId = created.data.workspace_id
+    }
+
+    const result = await commands.windowNew(hostId, wsId, null, cwd, null)
+    if (result.status !== 'ok') {
+      reportOpenSessionError(hostId, `Couldn't open session: ${result.error}`)
+      return
+    }
+    if (result.data.window_id && useStore.getState().activeHostId === hostId) {
+      selectWindow(hostId, wsId, result.data.window_id)
+    }
+  } catch (error) {
+    reportOpenSessionError(hostId, `Couldn't open session: ${String(error)}`)
+  }
 }
 
 export function neighbourWindowId(
@@ -128,22 +213,16 @@ export const windowActions: Action[] = [
   {
     id: 'window.new',
     kind: 'action',
-    label: 'New window',
+    label: 'New session',
     icon: '▢',
     keybinding: 'Cmd+T',
-    canRun: () => useStore.getState().activeHostId !== null && activeWorkspace() !== undefined,
-    run: () => {
-      const hostId = useStore.getState().activeHostId
-      if (!hostId) return
-      const ws = activeWorkspace()
-      if (ws) {
-        void commands.windowNew(hostId, ws.id, null, null, null).then((res) => {
-          if (res.status === 'ok' && res.data.window_id) {
-            selectWindow(hostId, ws.id, res.data.window_id)
-          }
-        })
-      }
+    // A workspace isn't required: openSession creates one when the last
+    // window's kill has stripped it (undo toast still counting down).
+    canRun: () => {
+      const state = useStore.getState()
+      return canOpenSession(state, state.activeHostId)
     },
+    run: () => void openSession(),
   },
   {
     id: 'window.kill',

@@ -35,6 +35,16 @@ export function TerminalIcon(p: IconProps) {
   )
 }
 
+/** A machine — marks a host, so its line can't be mistaken for a project. */
+export function MachineIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <rect x="2" y="4" width="20" height="12" rx="2" />
+      <path d="M8 20h8M12 16v4" />
+    </Svg>
+  )
+}
+
 export function SparkIcon(p: IconProps) {
   return (
     <Svg {...p}>
@@ -110,6 +120,17 @@ export function XIcon(p: IconProps) {
   return (
     <Svg {...p}>
       <path d="M18 6 6 18M6 6l12 12" />
+    </Svg>
+  )
+}
+
+/** Vertical ellipsis — opens the same menu as a right-click. */
+export function MoreVerticalIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <circle cx="12" cy="5" r="1" fill="currentColor" />
+      <circle cx="12" cy="12" r="1" fill="currentColor" />
+      <circle cx="12" cy="19" r="1" fill="currentColor" />
     </Svg>
   )
 }

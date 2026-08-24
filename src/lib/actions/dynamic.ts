@@ -15,7 +15,7 @@
  */
 
 import { commands } from '@lib/ipc'
-import { connectHost, selectWindow, selectWorkspace } from '@lib/host'
+import { activateAndConnectHost, deleteHost, selectWindow, selectWorkspace } from '@lib/host'
 import { useStore, pinnedKey, sortById, type TmuxWindow, type TmuxWorkspace } from '@lib/store'
 import {
   displayedHostStatus,
@@ -191,27 +191,26 @@ export function windowsAsActions(): SubModeResult {
 
 function hostSubActions(host: Host, display: HostDisplayStatus): Action[] {
   const out: Action[] = []
-  if (display === 'connected' || display === 'connecting') {
-    out.push({
-      id: `host.${host.id}.disconnect`,
-      kind: 'action',
-      label: 'Disconnect',
-      icon: '⏏',
-      run: () => {
-        void commands.hostDisconnect(host.id)
-      },
-    })
-  } else {
-    out.push({
-      id: `host.${host.id}.connect`,
-      kind: 'action',
-      label: 'Connect',
-      icon: '⏵',
-      run: () => {
-        useStore.getState().setActiveHost(host.id)
-        void connectHost(host.id).catch(() => {})
-      },
-    })
+  if (host.port !== 0) {
+    if (display === 'connected' || display === 'connecting') {
+      out.push({
+        id: `host.${host.id}.disconnect`,
+        kind: 'action',
+        label: 'Disconnect',
+        icon: '⏏',
+        run: () => {
+          void commands.hostDisconnect(host.id)
+        },
+      })
+    } else {
+      out.push({
+        id: `host.${host.id}.connect`,
+        kind: 'action',
+        label: 'Connect',
+        icon: '⏵',
+        run: () => void activateAndConnectHost(host.id).catch(() => {}),
+      })
+    }
   }
   // Localhost (port 0) can't be removed from the registry.
   if (host.port !== 0) {
@@ -221,36 +220,7 @@ function hostSubActions(host: Host, display: HostDisplayStatus): Action[] {
       label: 'Delete host',
       icon: '×',
       destructive: true,
-      run: () => {
-        void (async () => {
-          const ok = await useStore.getState().requestConfirm({
-            title: `Delete host "${host.name}"?`,
-            message:
-              'This removes it from your saved list and clears any stored password. Sessions on the remote machine are unaffected.',
-            confirmLabel: 'Delete',
-            destructive: true,
-          })
-          if (!ok) return
-          let res: Awaited<ReturnType<typeof commands.hostDelete>>
-          try {
-            res = await commands.hostDelete(host.id)
-          } catch (e) {
-            useStore.getState().pushToast({
-              id: `host-delete-error::${host.id}`,
-              message: `Delete threw: ${String(e)}`,
-              durationMs: 8_000,
-            })
-            return
-          }
-          if (res.status !== 'ok') {
-            useStore.getState().pushToast({
-              id: `host-delete-error::${host.id}`,
-              message: `Couldn't fully delete "${host.name}": ${res.error}`,
-              durationMs: 8_000,
-            })
-          }
-        })()
-      },
+      run: () => void deleteHost(host),
     })
   }
   return out
@@ -292,12 +262,7 @@ export function hostsAsActions(): SubModeResult {
       label: host.name,
       sublabel,
       icon: '●',
-      run: () => {
-        state.setActiveHost(host.id)
-        if (display === 'disconnected' || display === 'error') {
-          void connectHost(host.id).catch(() => {})
-        }
-      },
+      run: () => void activateAndConnectHost(host.id).catch(() => {}),
       subActions: () => hostSubActions(host, display),
     })
     const header = headerByDisplay.get(display)
