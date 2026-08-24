@@ -1,6 +1,6 @@
 /**
  * App-chrome actions — verbs that don't belong to any single
- * host/workspace/window/palette: sidebar, undo, etc.
+ * host/session/palette: sidebar, undo, etc.
  */
 
 import { useStore } from '@lib/store'

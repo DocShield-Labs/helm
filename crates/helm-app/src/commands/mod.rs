@@ -4,9 +4,9 @@
 //!   - [`host`]            — host registry, connect/disconnect, host-key
 //!                           prompts, `~/.ssh/config` autocomplete, ping
 //!   - [`session`]         — everything that talks to a host's helmd:
-//!                           input, resize, replay, workspace/window
+//!                           input, resize, replay, session
 //!                           lifecycle, search
-//!   - [`notifications`]   — inbox: list/dismiss/dismiss-by-window, focus
+//!   - [`notifications`]   — inbox: list/dismiss/dismiss-by-session, focus
 //!   - [`tools`]           — tool-integration framework commands
 //!
 //! The connection state machine (connect, pump, supervisor) lives in

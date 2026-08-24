@@ -1,8 +1,8 @@
 /**
  * Palette entry actions. Both keybindings open the same palette overlay;
  * they differ only in the initial query passed to it. Cmd+K boots empty
- * (default actions view). Cmd+P boots with `@#` so the palette opens
- * with the workspace + window filter chips already applied — the user
+ * (default actions view). Cmd+P boots with `#` so the palette opens
+ * with the session filter chip applied — the user
  * can backspace them off to land back in the default palette.
  */
 
@@ -24,11 +24,11 @@ export const paletteActions: Action[] = [
     id: 'switcher.open',
     kind: 'action',
     label: 'Quick switcher',
-    sublabel: '· workspaces and windows',
+    sublabel: '· sessions',
     icon: '◫',
     keybinding: 'Cmd+p',
     run: () => {
-      useStore.getState().openPalette('@#')
+      useStore.getState().openPalette('#')
     },
   },
 ]

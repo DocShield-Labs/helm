@@ -1,4 +1,4 @@
-/** Keyed listener sets: the subscribe half of every per-pane store. */
+/** Keyed listener sets: the subscribe half of every per-session store. */
 
 export function addListener<F>(map: Map<string, Set<F>>, key: string, cb: F): () => void {
   let set = map.get(key)

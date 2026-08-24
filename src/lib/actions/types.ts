@@ -6,12 +6,11 @@
  * Two flavours of Action exist:
  *
  *   - **Static actions** declared in `actions/<area>.ts` modules and
- *     gathered into `STATIC_ACTIONS`. These are verbs (`window.kill`,
- *     `chrome.toggle-sidebar`) that don't depend on instance data —
- *     they look up "what window is active" themselves at run time.
+ *     gathered into `STATIC_ACTIONS`. These are verbs (`session.kill`,
+ *     `chrome.toggle-sidebar`) that don't depend on instance data.
  *
  *   - **Dynamic objects** projected from store state at palette open
- *     time. Each workspace, window, host, pin, etc. is materialised as
+ *     time. Each session or host is materialised as
  *     an Action with the same shape but a `kind` that tags it as an
  *     object. Their `run` and `subActions` close over the specific
  *     instance.
@@ -35,11 +34,9 @@ export interface ActionContext {
 }
 
 export type ActionKind =
-  | 'action'    // verb (kill window, toggle sidebar)
-  | 'workspace' // object — primary action is "switch to"
-  | 'window'    // object — primary action is "jump to"
+  | 'action'    // verb (kill session, toggle sidebar)
+  | 'session'   // object — primary action is "jump to"
   | 'host'      // object — primary action is "make active"
-  | 'pin'       // object — primary action is "jump to pinned window"
 
 export interface Action {
   /** Stable id, dotted by area. Used as the key in the keymap override
@@ -49,19 +46,19 @@ export interface Action {
   /** Primary text shown in the palette row. */
   label: string
   /** Muted, monospace tail rendered after the label, e.g.
-   * "· iad-prod-01 · 2 windows". */
+   * "· iad-prod-01 · 2 sessions". */
   sublabel?: string
   /** Single-character glyph rendered in the leading icon slot. Strings
    * keep the type free of React; if we later need real icons we'll
    * switch to ReactNode. */
   icon?: string
   /** Which sub-mode this action lives in, for the sigil-prefixed views
-   * (`@workspaces`, `#windows`, `$hosts`). Static action verbs set this
+   * (`#sessions`, `$hosts`). Static action verbs set this
    * to undefined — they appear in the no-sigil mode. */
-  sigil?: '@' | '#' | '$'
+  sigil?: '#' | '$'
   /** Default keyboard binding(s), in the form `Cmd+K`, `Cmd+Shift+W`,
    * `Cmd+]`. Pass an array when an action accepts aliases — e.g.
-   * `['Cmd+]', 'Cmd+ArrowRight']` for next-window. The engine parses
+   * `['Cmd+]', 'Cmd+ArrowRight']` for next-session. The engine parses
    * each into a normalized combo at boot. User overrides from
    * `localStorage['helm.keymap']` replace the whole binding entry. */
   keybinding?: string | readonly string[]
@@ -74,7 +71,7 @@ export interface Action {
    * palette can render a subtle warning glyph if we want to. */
   destructive?: boolean
   /** Bias for the fuzzy ranker. Positive boosts the row; defaults to 0.
-   * Pinned windows in the quick switcher get +5, recents get +10, etc. */
+   * Recents can receive a small ranking boost. */
   weight?: number
   /** When provided, drilling in (→ / Cmd+Enter) on this row opens an
    * inline list of these actions instead of running the primary. */

@@ -24,7 +24,6 @@
   --color-accent-hover:            var(--accent-hover);
   --color-accent-muted:            var(--accent-muted);
   --color-accent-muted-host:       var(--accent-muted-host);
-  --color-accent-muted-workspace:  var(--accent-muted-workspace);
   --color-accent-border:           var(--accent-border);
   --color-accent-text:             var(--accent-text);
 
@@ -56,7 +55,7 @@ button:not(:disabled),
 }
 
 /*
- * Hide xterm's native scrollbar. The live tail sits inside the pane's
+ * Hide xterm's native scrollbar. The live tail sits inside the session's
  * block-list scroll container, which owns the visible scrollbar; xterm
  * keeps its internal viewport (width 0) for its own scrollback.
  */
@@ -69,7 +68,7 @@ button:not(:disabled),
 }
 
 /*
- * Block-native pane. Finished commands render as DOM; the live tail is
+ * Block-native session. Finished commands render as DOM; the live tail is
  * one xterm at the bottom of the same scroll container.
  */
 .helm-scroll::-webkit-scrollbar {

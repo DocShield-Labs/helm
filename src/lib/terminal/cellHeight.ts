@@ -2,7 +2,7 @@
  * Making xterm's rows exactly as tall as the DOM rows.
  *
  * The live band (xterm) sits in the same column as finished blocks
- * (DOM rows, `--helm-line-px` tall), and BlockPane relies on the two
+ * (DOM rows, `--helm-line-px` tall), and SessionView relies on the two
  * agreeing: a command that finishes turns its band into block rows
  * without anything moving. xterm's `lineHeight` option can't be set
  * to hit that directly — it multiplies the font's *measured* natural
@@ -23,7 +23,7 @@
  * The `lineHeight` that makes xterm's cell `targetPx` tall, given the
  * cell it currently renders (`measuredPx`) under `lineHeight`. `null`
  * when it already does, or when the inputs can't be trusted (nothing
- * rendered yet, hidden pane).
+ * rendered yet, hidden session).
  */
 export function correctedLineHeight(
   measuredPx: number,

@@ -22,8 +22,8 @@ use tauri_specta::{collect_commands, Builder};
 /// Both `run()` and `export_bindings()` start from this so the bindings can't
 /// drift out of sync with what the runtime actually exposes.
 fn specta_builder() -> Builder<tauri::Wry> {
-    use std::collections::BTreeMap;
     use helm_proto::{attrs, modes};
+    use std::collections::BTreeMap;
     Builder::<tauri::Wry>::new()
         // Wire bit layouts the frontend must agree on, generated into
         // bindings.ts so they can't drift from helm-proto.
@@ -60,43 +60,40 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .constant("TRUECOLOR_FLAG", connection::TRUECOLOR_FLAG)
         .constant("MAX_HISTORY_PAGE", helm_proto::MAX_HISTORY_PAGE)
         .commands(collect_commands![
-        commands::host::ping,
-        commands::host::host_list,
-        commands::host::host_local_id,
-        commands::host::host_save,
-        commands::host::host_delete,
-        commands::host::host_save_password,
-        commands::host::ssh_config_aliases,
-        commands::host::host_subscribe,
-        commands::host::host_connect,
-        commands::host::host_disconnect,
-        commands::host::host_key_prompt_response,
-        commands::session::session_tree,
-        commands::session::session_input,
-        commands::session::session_resize,
-        commands::session::session_screen,
-        commands::session::session_history,
-        commands::session::workspace_new,
-        commands::session::workspace_kill,
-        commands::session::workspace_rename,
-        commands::session::window_new,
-        commands::session::window_kill,
-        commands::session::window_rename,
-        commands::session::session_search,
-        commands::session::session_blocks,
-        commands::session::session_path_complete,
-        commands::session::session_ping,
-        commands::notifications::notifications_list,
-        commands::notifications::notification_dismiss,
-        commands::notifications::notification_dismiss_for_window,
-        commands::notifications::set_focus,
-        commands::tools::tool_integrations_list,
-        commands::tools::tool_integration_install,
-        commands::tools::tool_integration_uninstall,
-        commands::tools::tool_integration_dismiss,
-        commands::system::reveal_in_finder,
-        commands::system::open_url,
-    ])
+            commands::host::ping,
+            commands::host::host_list,
+            commands::host::host_local_id,
+            commands::host::host_save,
+            commands::host::host_delete,
+            commands::host::host_save_password,
+            commands::host::ssh_config_aliases,
+            commands::host::host_subscribe,
+            commands::host::host_connect,
+            commands::host::host_disconnect,
+            commands::host::host_key_prompt_response,
+            commands::session::session_tree,
+            commands::session::session_input,
+            commands::session::session_resize,
+            commands::session::session_screen,
+            commands::session::session_history,
+            commands::session::session_new,
+            commands::session::session_kill,
+            commands::session::session_rename,
+            commands::session::session_search,
+            commands::session::session_blocks,
+            commands::session::session_path_complete,
+            commands::session::session_ping,
+            commands::notifications::notifications_list,
+            commands::notifications::notification_dismiss,
+            commands::notifications::notification_dismiss_for_session,
+            commands::notifications::set_focus,
+            commands::tools::tool_integrations_list,
+            commands::tools::tool_integration_install,
+            commands::tools::tool_integration_uninstall,
+            commands::tools::tool_integration_dismiss,
+            commands::system::reveal_in_finder,
+            commands::system::open_url,
+        ])
 }
 
 /// Regenerate `src/types/bindings.ts`. Run via `cargo run --bin export-bindings`.

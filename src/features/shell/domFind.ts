@@ -1,5 +1,5 @@
 /**
- * Find-in-blocks: text search over the rendered DOM blocks of a pane,
+ * Find-in-blocks: text search over the rendered DOM blocks of a session,
  * highlighted with the CSS Custom Highlight API (no DOM mutation, so
  * selections and React reconciliation are untouched).
  */

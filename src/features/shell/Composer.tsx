@@ -5,7 +5,7 @@
  * cwd and branch chips — over a growing mono editor.
  *
  *   Terminal  → the shell (`cmd⏎`; multi-line as a bracketed paste)
- *   Agent     → the agent running in this pane, or — from a shell —
+ *   Agent     → the agent running in this session, or — from a shell —
  *               launches one with the text as its prompt
  *
  * The editor is a textarea (native selection, paste, undo, IME). An
@@ -35,7 +35,7 @@ import { createPortal } from 'react-dom'
 import type { PathCompletion, PathCompletionResult } from '@bindings'
 import { homeRelative } from '@lib/path'
 import type { ComposerMode } from '@lib/session/composer'
-import type { PaneKind } from '@lib/session/paneState'
+import type { SessionKind } from '@lib/session/sessionState'
 import { initialHistoryCursor, navigateHistory } from '@lib/session/historyNavigation'
 import {
   applyPathCompletion,
@@ -50,7 +50,7 @@ import { textareaCaretRect } from '@lib/textareaCaret'
 
 export interface ComposerProps {
   mode: ComposerMode
-  kind: PaneKind
+  kind: SessionKind
   cwd: string | null | undefined
   branch: string | null | undefined
   /** Previous command lines, oldest first (Terminal mode ↑/↓). */
@@ -59,10 +59,10 @@ export interface ComposerProps {
   agentName: string
   onModeChange: (mode: ComposerMode) => void
   onSend: (text: string) => void
-  /** Raw bytes for the pane (control keys on an empty editor). */
+  /** Raw bytes for the session (control keys on an empty editor). */
   onRaw: (bytes: string) => void
   onPathComplete: (path: string, directoriesOnly: boolean) => Promise<PathCompletionResult>
-  /** Bumps to pull focus (pane became visible, mode re-opened). */
+  /** Bumps to pull focus (session became visible, mode re-opened). */
   focusKey: number
 }
 
@@ -174,7 +174,7 @@ export function Composer({
 
   // Grow with content up to MAX_ROWS, then scroll. Measuring means
   // collapsing the textarea to read its scrollHeight; the box is held
-  // at its current height meanwhile, or the pane above would grow for
+  // at its current height meanwhile, or the session above would grow for
   // a layout pass and WebKit would clamp a bottom-pinned scroll
   // position off the bottom.
   useLayoutEffect(() => {

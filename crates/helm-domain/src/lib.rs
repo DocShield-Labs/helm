@@ -29,14 +29,11 @@ macro_rules! newtype_id {
 }
 
 newtype_id!(HostId);
-newtype_id!(WorkspaceId);
-newtype_id!(WindowId);
-newtype_id!(PaneId);
 newtype_id!(NotificationId);
 
 impl HostId {
     /// The localhost host id is stable across app launches so any
-    /// frontend state keyed on it (pinned windows, last-active host,
+    /// frontend state keyed on it (future session pins, last-active host,
     /// activity dots, …) survives a restart. The previous behavior —
     /// minting a fresh Uuid::new_v4() every boot — left those features
     /// silently broken since the on-disk pin's hostId no longer
@@ -60,31 +57,18 @@ impl HostId {
 // Ids are the daemon's u64s stringified ("1", "2", …) — string-keyed
 // maps are what the frontend store wants, and the ids stay opaque.
 
-/// The workspace → window → pane tree for one host, as reported by its
+/// The long-running sessions for one host, as reported by its
 /// daemon. Sent whole on every change — small, and keeps the frontend
 /// trivially convergent (no delta bookkeeping).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct SessionTree {
-    pub workspaces: Vec<WorkspaceInfo>,
+    pub sessions: Vec<SessionInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-pub struct WorkspaceInfo {
+pub struct SessionInfo {
     pub id: String,
     pub name: String,
-    pub windows: Vec<WindowInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-pub struct WindowInfo {
-    pub id: String,
-    pub name: String,
-    pub panes: Vec<PaneInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-pub struct PaneInfo {
-    pub id: String,
     pub cols: u16,
     pub rows: u16,
     pub alt_screen: bool,
@@ -189,7 +173,7 @@ pub struct HistoryPage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct BlockInfo {
     pub id: String,
-    /// Absolute lines in the pane's line space (prompt start / command
+    /// Absolute lines in the session's line space (prompt start / command
     /// accepted / output begins / finished).
     pub start_line: u64,
     pub cmd_line: Option<u64>,
@@ -208,7 +192,7 @@ pub struct BlockInfo {
 /// One scrollback-search hit with an exact jump anchor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct SearchHit {
-    pub pane_id: String,
+    pub session_id: String,
     pub block_id: Option<String>,
     /// Absolute line of the matched row.
     pub line: u64,
@@ -222,14 +206,17 @@ pub struct SearchHit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
-    /// The pane's whole grid — on request, resize, alt-screen swap, or
+    /// The session's whole grid — on request, resize, alt-screen swap, or
     /// any change the model reports as full damage. Paint it all.
-    Screen { pane_id: String, screen: ScreenInfo },
+    Screen {
+        session_id: String,
+        screen: ScreenInfo,
+    },
     /// Rows that changed since the last screen message, plus cursor
     /// and modes as of now. The grid first scrolled up by `scroll` rows
     /// (delivered as `HistoryAppend`); row indices are post-scroll.
     ScreenDiff {
-        pane_id: String,
+        session_id: String,
         top_line: u64,
         scroll: u16,
         rows: Vec<RowAt>,
@@ -239,24 +226,33 @@ pub enum SessionEvent {
     /// Rows that scrolled out of the grid: `first_line` is the absolute
     /// line of `rows[0]`; the grid's top is now `first_line + rows.len()`.
     HistoryAppend {
-        pane_id: String,
+        session_id: String,
         first_line: u64,
         rows: Vec<RowInfo>,
     },
     /// A block started / gained its command / finished.
-    Block { pane_id: String, block: BlockInfo },
-    /// The pane entered or left the alternate screen (TUI mode). The
+    Block {
+        session_id: String,
+        block: BlockInfo,
+    },
+    /// The session entered or left the alternate screen (TUI mode). The
     /// frontend swaps block-list ⇄ grid rendering on this.
-    ModeChange { pane_id: String, alt_screen: bool },
+    ModeChange {
+        session_id: String,
+        alt_screen: bool,
+    },
     /// Full tree snapshot after any lifecycle change.
     Tree { tree: SessionTree },
-    PaneExited { pane_id: String, status: Option<i32> },
-    /// The pane rang its bell. Emitted for every bell — including ones
-    /// the inbox suppresses because the window is focused — so the pane
+    SessionExited {
+        session_id: String,
+        status: Option<i32>,
+    },
+    /// The session rang its bell. Emitted for every bell — including ones
+    /// the inbox suppresses because the session is focused — so the session
     /// view can react (an agent waiting on a choice) without depending
     /// on the notification queue. helmd strips BEL from the byte stream,
-    /// so this is the only way the pane hears it.
-    Bell { pane_id: String },
+    /// so this is the only way the session hears it.
+    Bell { session_id: String },
 }
 
 // ---------- Host ----------
@@ -268,7 +264,7 @@ pub enum HostStatus {
     Connecting,
     /// Transport dropped or the daemon bounced; the supervisor is
     /// running its backoff ladder. Distinct from `Connecting` so the UI
-    /// can render a different overlay (the user's panes stay mounted
+    /// can render a different overlay (the user's sessions stay mounted
     /// with their last frozen frame instead of being torn down).
     Reconnecting,
     Disconnected,
@@ -293,13 +289,9 @@ pub enum HostEvent {
     },
     /// A new host was registered (via `host_add` or persistence load).
     /// Frontend store should insert it into the hosts Map.
-    HostAdded {
-        host: Host,
-    },
+    HostAdded { host: Host },
     /// A host was removed from the registry. Frontend store drops it.
-    HostRemoved {
-        host_id: HostId,
-    },
+    HostRemoved { host_id: HostId },
     /// Mid-connect prompt: the SSH server presented a host key that's
     /// either unknown to `~/.ssh/known_hosts` or has changed since the
     /// last connection. The connect future is parked until the frontend
@@ -314,24 +306,24 @@ pub enum HostEvent {
         fingerprint: String,
         prompt: HostKeyPromptKind,
     },
-    /// A pane wants the user's attention. Sent when a new notification is
+    /// A session wants the user's attention. Sent when a new notification is
     /// created AND when an existing one coalesces (count/updated_at bump,
     /// possibly upgraded kind — e.g., a Bell entry replaced by a newer
-    /// CommandDone for the same window). Frontend treats receipt as
+    /// CommandDone for the same session). Frontend treats receipt as
     /// upsert keyed by `notification.id`.
     Notification {
         host_id: HostId,
         notification: Notification,
     },
     /// A previously-emitted notification was dismissed — by the user
-    /// (× button), by typing into the pane (auto-dismiss-on-keystroke),
-    /// or by the host (window killed, host disconnected). Frontend
+    /// (× button), by typing into the session (auto-dismiss-on-keystroke),
+    /// or by the host (session killed, host disconnected). Frontend
     /// drops it from the inbox.
     NotificationDismissed {
         host_id: HostId,
         notification_id: NotificationId,
     },
-    /// Helm detected a tool running in a pane that has a known
+    /// Helm detected a tool running in a session that has a known
     /// integration available (e.g. Claude Code). Frontend surfaces a
     /// sticky toast offering to install the integration. Coalesced
     /// per (host, integration_id) for the lifetime of the app — once
@@ -348,23 +340,16 @@ pub enum HostEvent {
 
 // ---------- notifications ----------
 
-/// One row in the user's inbox. Coalesced per (host, window, kind-class):
-/// repeated bells in the same window bump `count` and `updated_at` rather
+/// One row in the user's inbox. Coalesced per (host, session, kind-class):
+/// repeated bells in the same session bump `count` and `updated_at` rather
 /// than stacking, and a fresh CommandDone replaces an older Bell for the
-/// same window (commands finishing is more informative than a raw bell).
+/// same session (commands finishing is more informative than a raw bell).
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Notification {
     pub id: NotificationId,
     pub host_id: HostId,
-    /// Workspace id (daemon id, stringified). Optional because the event
-    /// may arrive before the tree is known; the frontend can fill in the
-    /// breadcrumb from the window id alone.
-    pub workspace_id: Option<String>,
-    /// Window id (daemon id, stringified).
-    pub window_id: String,
-    /// Pane id (daemon id, stringified) — the pane the event came from,
-    /// so the inbox row can route the user to the exact one.
-    pub pane_id: String,
+    /// Daemon session id, stringified.
+    pub session_id: String,
     pub kind: NotificationKind,
     /// Unix ms when this notification was first created.
     pub created_at: u64,
@@ -374,9 +359,9 @@ pub struct Notification {
     /// How many times this notification has coalesced (1 for fresh).
     pub count: u32,
     /// Short human-readable preview — up to ~120 chars of the most recent
-    /// pane output, ANSI-stripped. Drives the secondary line in the inbox
+    /// session output, ANSI-stripped. Drives the secondary line in the inbox
     /// row so the user can decide "still spinning" vs "really done"
-    /// without switching to the pane.
+    /// without switching to the session.
     pub preview: String,
 }
 
@@ -385,7 +370,7 @@ pub struct Notification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NotificationKind {
-    /// BEL emitted by something running in the pane. The single most
+    /// BEL emitted by something running in the session. The single most
     /// reliable "pay attention" signal — Claude Code, finished builds,
     /// IRC pings, etc.
     Bell,
@@ -452,7 +437,6 @@ pub struct Host {
     pub user: String,
     pub auth: AuthMethod,
     pub jump_host: Option<HostId>,
-    pub default_workspace: String,
     pub startup_commands: Vec<String>,
 }
 
@@ -467,7 +451,6 @@ impl Host {
             user: whoami_or_unknown(),
             auth: AuthMethod::Agent,
             jump_host: None,
-            default_workspace: "default".into(),
             startup_commands: vec![],
         }
     }
@@ -475,54 +458,4 @@ impl Host {
 
 fn whoami_or_unknown() -> String {
     std::env::var("USER").unwrap_or_else(|_| "user".into())
-}
-
-// ---------- Activity ----------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
-pub enum Activity {
-    Running,
-    Attention,
-    Failed,
-    Idle,
-    None,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct PaneActivity {
-    pub last_output_at: Option<u64>, // unix ms
-    pub current_command: String,
-    pub is_idle: bool,
-    pub bell_count: u32,
-    pub last_exit_code: Option<i32>,
-    pub started_at: u64,
-}
-
-// ---------- Tree ----------
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct Workspace {
-    pub id: WorkspaceId,
-    pub host_id: HostId,
-    pub name: String,
-    pub windows: Vec<WindowId>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct Window {
-    pub id: WindowId,
-    pub workspace_id: WorkspaceId,
-    pub name: String,
-    pub panes: Vec<PaneId>,
-    pub focused_pane: Option<PaneId>,
-    pub activity: Activity,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct Pane {
-    pub id: PaneId,
-    pub window_id: WindowId,
-    pub cwd: String,
-    pub command: String,
-    pub activity: PaneActivity,
 }

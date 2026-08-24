@@ -4,7 +4,7 @@ import {
   applyDiff,
   applyHistoryAppend,
   applyScreen,
-  getPaneScreen,
+  getSessionScreen,
   rowAt,
   rowsBetween,
   subscribePaint,
@@ -32,15 +32,15 @@ function screenOf(topLine: number, lines: string[]) {
 
 const cursor = { row: 2, col: 1, visible: true, shape: 'block' as const, blink: false }
 
-function texts(s: ReturnType<typeof getPaneScreen>, from: number, to: number) {
+function texts(s: ReturnType<typeof getSessionScreen>, from: number, to: number) {
   return rowsBetween(s, from, to).map(([l, row]) => [l, row.spans[0]?.text ?? ''])
 }
 
-describe('pane screen mirror', () => {
+describe('session screen mirror', () => {
   test('a scrolling diff shifts the grid; appends fill history', () => {
     const p = 'p1'
     applyScreen(H, p, screenOf(0, ['a', 'b', '']))
-    let s = getPaneScreen(H, p)
+    let s = getSessionScreen(H, p)
     expect(s.loaded).toBe(true)
     expect(rowAt(s, 1)?.spans[0].text).toBe('b')
 
@@ -48,7 +48,7 @@ describe('pane screen mirror', () => {
     // and only the rows that differ from the shifted frame arrive.
     applyHistoryAppend(H, p, 0, [r('a'), r('b')])
     applyDiff(H, p, 2, 2, [{ index: 1, row: r('c') }, { index: 2, row: r('d') }], cursor, 0)
-    s = getPaneScreen(H, p)
+    s = getSessionScreen(H, p)
     expect(s.topLine).toBe(2)
     expect([s.loadedFrom, s.loadedTo]).toEqual([0, 2])
     expect(texts(s, 0, 5)).toEqual([
@@ -62,7 +62,7 @@ describe('pane screen mirror', () => {
 
     // An unscrolled diff patches in place.
     applyDiff(H, p, 2, 0, [{ index: 0, row: r('x') }], cursor, 0)
-    expect(texts(getPaneScreen(H, p), 2, 3)).toEqual([[2, 'x']])
+    expect(texts(getSessionScreen(H, p), 2, 3)).toEqual([[2, 'x']])
   })
 
   test('an append with a gap does not extend the loaded range, nor move the grid', () => {
@@ -70,7 +70,7 @@ describe('pane screen mirror', () => {
     applyScreen(H, p, screenOf(5, ['', '']))
     applyHistoryAppend(H, p, 3, [r('x'), r('y')])
     applyHistoryAppend(H, p, 20, [r('z')])
-    const s = getPaneScreen(H, p)
+    const s = getSessionScreen(H, p)
     expect([s.loadedFrom, s.loadedTo]).toEqual([3, 5])
     expect(s.topLine).toBe(5)
     expect(rowAt(s, 20)).toBeUndefined()
@@ -79,7 +79,7 @@ describe('pane screen mirror', () => {
   test('diffs before any screen are ignored; a painter gets the screen at once', () => {
     const p = 'p3'
     applyDiff(H, p, 0, 0, [{ index: 0, row: r('q') }], cursor, 0)
-    expect(getPaneScreen(H, p).loaded).toBe(false)
+    expect(getSessionScreen(H, p).loaded).toBe(false)
     const seen: string[] = []
     const off = subscribePaint(H, p, (ev) => seen.push(ev.kind))
     expect(seen).toEqual([])
@@ -118,7 +118,7 @@ describe('RowsView', () => {
     // A memo component's render function; called directly to keep the
     // test free of a DOM renderer.
     const render = (RowsView as unknown as { type: (p: unknown) => unknown }).type
-    expect(render({ hostId: H, paneId: 'p', from: 3, to: Infinity })).toBeNull()
-    expect(render({ hostId: H, paneId: 'p', from: 5, to: 5 })).toBeNull()
+    expect(render({ hostId: H, sessionId: 'p', from: 3, to: Infinity })).toBeNull()
+    expect(render({ hostId: H, sessionId: 'p', from: 5, to: 5 })).toBeNull()
   })
 })

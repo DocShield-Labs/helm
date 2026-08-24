@@ -1,4 +1,4 @@
-//! Stateful streaming parser for the pane byte stream.
+//! Stateful streaming parser for the session byte stream.
 //!
 //! Consumes raw PTY output and produces (a) the bytes to store/forward
 //! and (b) semantic events: OSC 133 block markers, standalone bells, and
@@ -324,11 +324,14 @@ fn parse_osc133(body: &[u8]) -> Option<Osc133> {
             .collect()
     };
     let b64_field = |raw: &[u8], key: &str| -> Option<String> {
-        fields(raw).into_iter().find(|(k, _)| k == key).and_then(|(_, v)| {
-            let bytes = B64.decode(v.as_bytes()).ok()?;
-            let s = String::from_utf8_lossy(&bytes).into_owned();
-            (!s.is_empty()).then_some(s)
-        })
+        fields(raw)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| {
+                let bytes = B64.decode(v.as_bytes()).ok()?;
+                let s = String::from_utf8_lossy(&bytes).into_owned();
+                (!s.is_empty()).then_some(s)
+            })
     };
     match kind {
         b'A' => Some(Osc133::PromptStart {
@@ -427,7 +430,13 @@ mod tests {
     fn standalone_bell_is_event_not_osc_terminator() {
         let (out, events) = run_whole(b"ding\x07dong");
         assert_eq!(out, b"dingdong");
-        assert_eq!(events, vec![EventAt { offset: 4, event: IngestEvent::Bell }]);
+        assert_eq!(
+            events,
+            vec![EventAt {
+                offset: 4,
+                event: IngestEvent::Bell
+            }]
+        );
     }
 
     #[test]
@@ -437,8 +446,14 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                EventAt { offset: 1, event: IngestEvent::Notify("Claude finished".into()) },
-                EventAt { offset: 2, event: IngestEvent::Notify("st".into()) },
+                EventAt {
+                    offset: 1,
+                    event: IngestEvent::Notify("Claude finished".into())
+                },
+                EventAt {
+                    offset: 2,
+                    event: IngestEvent::Notify("st".into())
+                },
             ]
         );
     }

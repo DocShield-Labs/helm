@@ -1,10 +1,10 @@
 /**
  * Terminal themes — colour sets ported from Warp's bundled themes
  * (`app/src/themes/default_themes.rs` in warpdotdev/warp). Each theme
- * supplies the pane background, foreground, accent (cursor / selection),
+ * supplies the session background, foreground, accent (cursor / selection),
  * and the 16 ANSI slots xterm reads to colour shell output.
  *
- * The pane chrome (block dividers, status chips, action card) reads from
+ * The session chrome (block dividers, status chips, action card) reads from
  * the `--terminal-*` CSS variables set in `tokens.css`. `applyTheme()`
  * pushes the active theme's values into those variables so the chrome
  * stays in sync with whatever xterm is rendering.

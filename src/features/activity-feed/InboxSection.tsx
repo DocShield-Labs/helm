@@ -2,25 +2,25 @@
  * INBOX — sidebar section above HOSTS.
  *
  * One row per live notification (oldest first). Click a row to jump to
- * the originating window; click × to dismiss. Hidden when empty so the
+ * the originating session; click × to dismiss. Hidden when empty so the
  * sidebar stays clean for users who haven't accumulated anything yet.
  *
  * Cross-host by design: the inbox surfaces "stuff piling up" across
  * every connected host, not just the active one. Click on a row in
  * another host auto-switches the active host before selecting the
- * window.
+ * session.
  *
  * Notifications are NOT dismissed on click — that's the "peek doesn't
  * dismiss" invariant. Dismissal happens via the × button or by typing
- * in the originating pane (4D, dismiss-on-keystroke). This way the
+ * in the originating session (4D, dismiss-on-keystroke). This way the
  * user can investigate without losing their list.
  */
 
 import { useMemo, useRef } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import { commands } from '@lib/ipc'
-import { useStore, workspaceForWindow, type HostSessions } from '@lib/store'
-import { selectWindow } from '@lib/host'
+import { useStore, type HostSessions } from '@lib/store'
+import { selectSession } from '@lib/host'
 import { prettyCwd } from '@lib/path'
 import type { Host, Notification, NotificationId, NotificationKind } from '@bindings'
 
@@ -53,21 +53,12 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
     }, 120)
   }
 
-  /** True when this notification's window is the user's currently-
-   * active pane — used to highlight the matching inbox row so the
-   * user can tell which entry corresponds to the pane they're viewing.
-   * Especially valuable in Pinned mode where the source might not be
-   * in the pinned list. */
+  /** True when this notification's session is currently active. */
   const isSelected = (n: Notification): boolean => {
     if (activeHostId !== n.host_id) return false
     const hs = sessions.get(n.host_id)
     if (!hs) return false
-    const ws = hs.activeWorkspaceId ? hs.workspaces.get(hs.activeWorkspaceId) : undefined
-    if (!ws) return false
-    for (const w of ws.windows.values()) {
-      if (w.active && w.id === n.window_id) return true
-    }
-    return false
+    return hs.activeSessionId === n.session_id
   }
 
   // Newest first. New events drop onto the top of the stack from
@@ -91,38 +82,15 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
   const onJump = (n: Notification) => {
     // If the peek is currently showing this notification, hand off
     // to the merge animation: keep the panel visible while the new
-    // pane mounts behind it, then dissolve. NotificationPeek owns
+    // session mounts behind it, then dissolve. NotificationPeek owns
     // the timer that clears both ids when the animation finishes.
     const state = useStore.getState()
     if (state.peekedInboxId === n.id) {
       state.setMergingInboxId(n.id)
     }
     setActiveHost(n.host_id)
-    const hs = sessions.get(n.host_id)
-    // Resolve workspace_id + window_id from whatever the notification
-    // carries, falling back to the live tree via pane_id when the
-    // backend's pane index didn't have the breadcrumbs (race during
-    // initial connect or after a refresh skip).
-    let workspaceId = n.workspace_id ?? null
-    let windowId = n.window_id
-    if (!workspaceId || !windowId) {
-      if (hs) {
-        for (const ws of hs.workspaces.values()) {
-          const pane = ws.panes.get(n.pane_id)
-          if (pane) {
-            workspaceId = ws.id
-            windowId = pane.windowId
-            break
-          }
-        }
-      }
-    }
-    if (!workspaceId && windowId) {
-      const ws = workspaceForWindow(hs, windowId)
-      workspaceId = ws?.id ?? null
-    }
-    if (workspaceId && windowId) {
-      selectWindow(n.host_id, workspaceId, windowId)
+    if (sessions.get(n.host_id)?.sessions.has(n.session_id)) {
+      selectSession(n.host_id, n.session_id)
     }
   }
 
@@ -178,8 +146,8 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
             <InboxRow
               notification={n}
               host={hosts.get(n.host_id)}
-              windowName={resolveWindowName(sessions.get(n.host_id), n)}
-              cwd={resolvePaneCwd(sessions.get(n.host_id), n)}
+              sessionName={resolveSessionName(sessions.get(n.host_id), n)}
+              cwd={resolveSessionCwd(sessions.get(n.host_id), n)}
               selected={isSelected(n)}
               onJump={() => onJump(n)}
               onDismiss={() => onDismiss(n)}
@@ -197,7 +165,7 @@ export function InboxSection({ hideHeader = false }: { hideHeader?: boolean } = 
 interface InboxRowProps {
   notification: Notification
   host: Host | undefined
-  windowName: string
+  sessionName: string
   cwd: string
   selected: boolean
   onJump: () => void
@@ -209,7 +177,7 @@ interface InboxRowProps {
 function InboxRow({
   notification: n,
   host,
-  windowName,
+  sessionName,
   cwd,
   selected,
   onJump,
@@ -224,7 +192,7 @@ function InboxRow({
       type="button"
       onClick={onJump}
       // Always fire — the suppression of "don't show peek when viewing
-      // the same window" lives inside NotificationPeek's render
+      // the same session" lives inside NotificationPeek's render
       // condition. Gating it here breaks the re-hover case: if the
       // mouse stays on the row while active flips back via keyboard
       // or sidebar click, mouseEnter never re-fires, so a row-level
@@ -246,7 +214,7 @@ function InboxRow({
           }}
         />
         <span className="flex-1 truncate text-[14px] text-text-primary">
-          {windowName}
+          {sessionName}
         </span>
         <span className="shrink-0 font-mono text-[11px] text-text-tertiary">
           {timeAgo(Date.now() - n.updated_at)}
@@ -338,38 +306,12 @@ function formatMs(ms: number): string {
   return `${(ms / 60_000).toFixed(1)}m`
 }
 
-/** Look up the originating pane's working directory from the live
- * session tree. Returns '' when the pane can't be located — the caller
- * suppresses the cwd segment in that case so the row falls back to
- * just the host name. */
-function resolvePaneCwd(hs: HostSessions | undefined, n: Notification): string {
-  if (!hs) return ''
-  for (const ws of hs.workspaces.values()) {
-    const pane = ws.panes.get(n.pane_id)
-    if (pane) return pane.cwd
-  }
-  return ''
+/** Look up the originating session's working directory. */
+function resolveSessionCwd(hs: HostSessions | undefined, n: Notification): string {
+  return hs?.sessions.get(n.session_id)?.cwd ?? ''
 }
 
-/** Best-effort resolution: prefer the live tree (always current names)
- * via window_id, fall back to pane_id lookup when window_id wasn't
- * populated, fall back to the raw window_id, fall back to '?'. */
-function resolveWindowName(hs: HostSessions | undefined, n: Notification): string {
-  if (!hs) return n.window_id || '?'
-  if (n.window_id) {
-    for (const ws of hs.workspaces.values()) {
-      const win = ws.windows.get(n.window_id)
-      if (win) return `${ws.name} · ${win.name}`
-    }
-  }
-  // Pane-based fallback for notifications whose backend lookup
-  // raced and never got window_id populated.
-  for (const ws of hs.workspaces.values()) {
-    const pane = ws.panes.get(n.pane_id)
-    if (pane) {
-      const win = ws.windows.get(pane.windowId)
-      return win ? `${ws.name} · ${win.name}` : `${ws.name} · ${pane.windowId}`
-    }
-  }
-  return n.window_id || n.pane_id || '?'
+/** Best-effort resolution from the live tree. */
+function resolveSessionName(hs: HostSessions | undefined, n: Notification): string {
+  return hs?.sessions.get(n.session_id)?.name ?? n.session_id ?? '?'
 }

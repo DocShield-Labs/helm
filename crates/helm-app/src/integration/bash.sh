@@ -106,7 +106,7 @@ __helm_preexec() {
 # \[ \] to hint readline about non-printing escapes — keeps cursor
 # math correct.
 if [ -z "$HELM_KEEP_PROMPT" ]; then
-    # Empty PS1 — Warp-style "single clean pane." The cwd · branch
+    # Empty PS1 — Warp-style "single clean session." The cwd · branch
     # header printed by precmd above tells you where you are; the
     # cursor itself shows where you'll type. Continuation prompt
     # stays a faint ellipsis so multi-line input is still readable.

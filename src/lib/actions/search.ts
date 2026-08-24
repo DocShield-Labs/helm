@@ -3,7 +3,7 @@
  *
  * Runs `session_search` on every connected host — the daemon greps its
  * ring buffers server-side and returns matches with exact seq anchors
- * — and turns each hit into a palette action that jumps to the window
+ * — and turns each hit into a palette action that jumps to the session
  * and scrolls to the block. Results are cached per term and fetched
  * with a short debounce; `useSearchVersion` lets the palette re-render
  * when a fetch lands.
@@ -11,8 +11,8 @@
 
 import { useSyncExternalStore } from 'react'
 import { commands } from '@lib/ipc'
-import { selectWindow } from '@lib/host'
-import { locatePane, useStore } from '@lib/store'
+import { selectSession } from '@lib/host'
+import { useStore } from '@lib/store'
 import { requestJump } from '@lib/session/blocks'
 import type { SearchHit } from '@bindings'
 import type { Action } from './types'
@@ -67,7 +67,7 @@ async function run(t: string) {
     })
     const perHost = await Promise.all(
       hostIds.map(async (hostId) => {
-        const res = await commands.sessionSearch(hostId, t, false, false, null, null, MAX_PER_HOST)
+        const res = await commands.sessionSearch(hostId, t, false, false, null, MAX_PER_HOST)
         return { hostId, hits: res.status === 'ok' ? res.data.matches : ([] as SearchHit[]) }
       }),
     )
@@ -78,20 +78,18 @@ async function run(t: string) {
       const hs = state.sessions.get(hostId)
       if (!host || !hs) continue
       for (const hit of hits) {
-        const located = locatePane(hs, hit.pane_id)
-        if (!located) continue
-        const { workspace, pane, window: win } = located
+        const session = hs.sessions.get(hit.session_id)
+        if (!session) continue
         const snippet = hit.line_text.trim().slice(0, 120)
         out.push({
-          id: `search.${hostId}.${hit.pane_id}.${hit.line}`,
-          kind: 'window',
+          id: `search.${hostId}.${hit.session_id}.${hit.line}`,
+          kind: 'session',
           label: snippet || '(blank match)',
-          sublabel: `${host.name} · ${workspace.name} · ${win?.name ?? ''}`,
+          sublabel: `${host.name} · ${session.name}`,
           icon: '⌕',
           run: () => {
-            selectWindow(hostId, workspace.id, pane.windowId)
-            // The pane consumes this once it's mounted and hydrated.
-            requestJump({ hostId, paneId: hit.pane_id, blockId: hit.block_id, line: hit.line })
+            selectSession(hostId, session.id)
+            requestJump({ hostId, sessionId: hit.session_id, blockId: hit.block_id, line: hit.line })
           },
         })
       }

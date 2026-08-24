@@ -1,7 +1,7 @@
 /**
- * SearchOverlay — in-pane find (Cmd+F).
+ * SearchOverlay — in-session find (Cmd+F).
  *
- * A compact floating bar pinned to the pane's top-right (browser-find /
+ * A compact floating bar pinned to the session's top-right (browser-find /
  * VS Code style). Searches two surfaces as one: the finished blocks
  * (DOM, via the CSS Custom Highlight API) and the live xterm tail (via
  * SearchAddon). Matches are ordered oldest→newest: DOM matches first,

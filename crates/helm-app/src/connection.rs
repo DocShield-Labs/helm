@@ -12,7 +12,7 @@
 //!     flows over it.
 //!
 //! The pump task translates `DaemonMsg` → `HostEvent` for the frontend,
-//! maintains the per-pane breadcrumb index, and feeds notifications.
+//! maintains the per-session notification index, and feeds notifications.
 //! The supervisor waits for the pump to die and runs the reconnect
 //! ladder (`[1, 2, 4, 8, 30]s`, early-woken by reachability + system
 //! wake, with a post-wake SSH liveness probe).
@@ -24,9 +24,8 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use helm_domain::{
-    AuthMethod, BlockInfo, CursorInfo, CursorShape, Host, HostEvent, HostId, HostStatus,
-    PaneInfo, RowAt, RowInfo, ScreenInfo, SearchHit, SessionEvent, SessionTree, SpanInfo,
-    WindowInfo, WorkspaceInfo,
+    AuthMethod, BlockInfo, CursorInfo, CursorShape, Host, HostEvent, HostId, HostStatus, RowAt,
+    RowInfo, ScreenInfo, SearchHit, SessionEvent, SessionInfo, SessionTree, SpanInfo,
 };
 use helm_proto::client::{connect_io, connect_or_spawn_unix, ClientError, Connected};
 use helm_proto::{DaemonMsg, TreeSnapshot};
@@ -46,7 +45,6 @@ pub(crate) async fn do_connect(
     entry: SharedHostEntry,
     host_id: HostId,
     event_tx: Option<mpsc::UnboundedSender<HostEvent>>,
-    bootstrap_workspace: Option<String>,
     prompter: Arc<dyn HostKeyPrompter>,
     network_online: watch::Receiver<bool>,
     wake_signal: watch::Receiver<u64>,
@@ -60,20 +58,19 @@ pub(crate) async fn do_connect(
     };
     let _connect_guard = connect_lock.lock().await;
 
-    emit_event(&event_tx, HostEvent::Status {
-        host_id,
-        status: HostStatus::Connecting,
-        error: None,
-    });
+    emit_event(
+        &event_tx,
+        HostEvent::Status {
+            host_id,
+            status: HostStatus::Connecting,
+            error: None,
+        },
+    );
 
     let host = {
         let mut guard = entry.lock().await;
         guard.shutdown_session();
-        let mut h = guard.host.clone();
-        if let Some(ws) = bootstrap_workspace {
-            h.default_workspace = ws;
-        }
-        h
+        guard.host.clone()
     };
 
     match connect_once(&entry, host_id, &host, &event_tx, &prompter, &notif_ctx).await {
@@ -94,11 +91,14 @@ pub(crate) async fn do_connect(
         }
         Err(e) => {
             entry.lock().await.status = HostStatus::Error;
-            emit_event(&event_tx, HostEvent::Status {
-                host_id,
-                status: HostStatus::Error,
-                error: Some(e.clone()),
-            });
+            emit_event(
+                &event_tx,
+                HostEvent::Status {
+                    host_id,
+                    status: HostStatus::Error,
+                    error: Some(e.clone()),
+                },
+            );
             Err(e)
         }
     }
@@ -115,14 +115,23 @@ async fn connect_once(
     notif_ctx: &NotificationsCtx,
 ) -> Result<mpsc::UnboundedReceiver<()>, String> {
     let established = establish(host.clone(), Some(prompter.clone())).await?;
-    let pump_dead =
-        install_session(entry, host_id, host, established, event_tx.clone(), notif_ctx.clone())
-            .await?;
-    emit_event(event_tx, HostEvent::Status {
+    let pump_dead = install_session(
+        entry,
         host_id,
-        status: HostStatus::Connected,
-        error: None,
-    });
+        host,
+        established,
+        event_tx.clone(),
+        notif_ctx.clone(),
+    )
+    .await?;
+    emit_event(
+        event_tx,
+        HostEvent::Status {
+            host_id,
+            status: HostStatus::Connected,
+            error: None,
+        },
+    );
     Ok(pump_dead)
 }
 
@@ -133,8 +142,8 @@ struct Established {
 }
 
 /// Wire an established connection into the host entry: spawn the pump,
-/// stash the `SessionHandle`, sync the pane index, deliver offline
-/// notifications, and bootstrap a workspace if the daemon has none.
+/// stash the `SessionHandle`, sync notifications, deliver offline
+/// notifications, and bootstrap a session if the daemon has none.
 /// Returns the pump-death receiver for the supervisor.
 async fn install_session(
     entry: &SharedHostEntry,
@@ -145,12 +154,18 @@ async fn install_session(
     notif_ctx: NotificationsCtx,
 ) -> Result<mpsc::UnboundedReceiver<()>, String> {
     let Established { connected, ssh } = established;
-    let Connected { client, events, daemon_version, state, pending } = connected;
+    let Connected {
+        client,
+        events,
+        daemon_version,
+        state,
+        pending,
+    } = connected;
     tracing::info!("connected to helmd {daemon_version} on {host_id:?}");
 
     // Prime the breadcrumb index from the initial snapshot, then fold
     // in every notification that accumulated while we were away.
-    notifications::sync_pane_index(&notif_ctx, &event_tx, host_id, &state);
+    notifications::sync_session_index(&notif_ctx, &event_tx, host_id, &state);
     let last_note_id = pending.iter().map(|n| n.id.0).max();
     for note in pending {
         notifications::process_daemon_notification(&notif_ctx, &event_tx, host_id, &note);
@@ -180,17 +195,21 @@ async fn install_session(
 
     // We've shown the offline notifications; let the daemon drop them.
     if let Some(max) = last_note_id {
-        let _ = session.client.ack_notifications(helm_proto::NotificationId(max));
+        let _ = session
+            .client
+            .ack_notifications(helm_proto::NotificationId(max));
     }
     let _ = session.client.attach();
 
-    // A daemon with no workspaces gets one, named after the host's
-    // default. Await the reply so the first tree the frontend renders
+    // A fresh daemon gets one shell session. Await the reply so the
+    // first tree the frontend renders
     // already has it (the pump's TreeChanged updates `tree`).
-    if session.tree.lock().workspaces.is_empty() {
-        let name = Some(host.default_workspace.clone());
-        if let Err(e) = session.request(|id| session.client.new_workspace(id, name)).await {
-            tracing::warn!("bootstrap workspace on {host_id:?}: {e}");
+    if session.tree.lock().sessions.is_empty() {
+        if let Err(e) = session
+            .request(|id| session.client.new_session(id, None, None, None))
+            .await
+        {
+            tracing::warn!("bootstrap session on {host_id:?}: {e}");
         }
     }
 
@@ -202,10 +221,13 @@ async fn install_session(
         guard.ssh = ssh;
         guard.status = HostStatus::Connected;
     }
-    emit_event(&event_tx, HostEvent::Session {
-        host_id,
-        event: SessionEvent::Tree { tree: initial },
-    });
+    emit_event(
+        &event_tx,
+        HostEvent::Session {
+            host_id,
+            event: SessionEvent::Tree { tree: initial },
+        },
+    );
 
     Ok(dead_rx)
 }
@@ -232,34 +254,52 @@ async fn pump(
         match msg {
             // A full screen with a req_id answers a `session_screen`
             // call; without one it's a broadcast repaint.
-            DaemonMsg::Screen { req_id: None, pane, screen } => {
+            DaemonMsg::Screen {
+                req_id: None,
+                session,
+                screen,
+            } => {
                 emit(SessionEvent::Screen {
-                    pane_id: pane.to_string(),
+                    session_id: session.to_string(),
                     screen: to_domain_screen(screen),
                 });
             }
-            DaemonMsg::ScreenDiff { pane, top_line, scroll, rows, cursor, modes } => {
+            DaemonMsg::ScreenDiff {
+                session,
+                top_line,
+                scroll,
+                rows,
+                cursor,
+                modes,
+            } => {
                 emit(SessionEvent::ScreenDiff {
-                    pane_id: pane.to_string(),
+                    session_id: session.to_string(),
                     top_line,
                     scroll,
                     rows: rows
                         .into_iter()
-                        .map(|(index, row)| RowAt { index, row: to_domain_row(row) })
+                        .map(|(index, row)| RowAt {
+                            index,
+                            row: to_domain_row(row),
+                        })
                         .collect(),
                     cursor: to_domain_cursor(&cursor),
                     modes,
                 });
             }
-            DaemonMsg::HistoryAppend { pane, first_line, rows } => {
+            DaemonMsg::HistoryAppend {
+                session,
+                first_line,
+                rows,
+            } => {
                 emit(SessionEvent::HistoryAppend {
-                    pane_id: pane.to_string(),
+                    session_id: session.to_string(),
                     first_line,
                     rows: rows.into_iter().map(to_domain_row).collect(),
                 });
             }
-            DaemonMsg::Block { pane, block } => {
-                let pane_id = pane.to_string();
+            DaemonMsg::Block { session, block } => {
+                let session_id = session.to_string();
                 crate::tool_integrations::detect_from_block(
                     &notif_ctx.tool_integration_seen,
                     &event_tx,
@@ -268,26 +308,46 @@ async fn pump(
                     host_id,
                     &block,
                 );
-                emit(SessionEvent::Block { pane_id, block: to_domain_block(&block) });
+                emit(SessionEvent::Block {
+                    session_id,
+                    block: to_domain_block(&block),
+                });
             }
-            DaemonMsg::ModeChange { pane, alt_screen } => {
-                emit(SessionEvent::ModeChange { pane_id: pane.to_string(), alt_screen });
+            DaemonMsg::ModeChange {
+                session,
+                alt_screen,
+            } => {
+                emit(SessionEvent::ModeChange {
+                    session_id: session.to_string(),
+                    alt_screen,
+                });
             }
             DaemonMsg::TreeChanged { state } => {
                 *tree.lock() = state.clone();
-                notifications::sync_pane_index(&notif_ctx, &event_tx, host_id, &state);
-                emit(SessionEvent::Tree { tree: to_domain_tree(&state) });
+                notifications::sync_session_index(&notif_ctx, &event_tx, host_id, &state);
+                emit(SessionEvent::Tree {
+                    tree: to_domain_tree(&state),
+                });
             }
-            DaemonMsg::PaneExited { pane, status } => {
-                emit(SessionEvent::PaneExited { pane_id: pane.to_string(), status });
+            DaemonMsg::SessionExited { session, status } => {
+                emit(SessionEvent::SessionExited {
+                    session_id: session.to_string(),
+                    status,
+                });
             }
             DaemonMsg::Notification { note } => {
                 if matches!(note.kind, helm_proto::NotificationKind::Bell) {
-                    emit(SessionEvent::Bell { pane_id: note.pane.to_string() });
+                    emit(SessionEvent::Bell {
+                        session_id: note.session.to_string(),
+                    });
                 }
                 notifications::process_daemon_notification(&notif_ctx, &event_tx, host_id, &note);
             }
-            DaemonMsg::Error { req_id: None, context, message } => {
+            DaemonMsg::Error {
+                req_id: None,
+                context,
+                message,
+            } => {
                 tracing::warn!("helmd error on {host_id:?} ({context}): {message}");
             }
             DaemonMsg::HelloAck { .. } => {
@@ -374,11 +434,14 @@ async fn supervise(
             guard.shutdown_session();
             guard.status = HostStatus::Reconnecting;
         }
-        emit_event(&event_tx, HostEvent::Status {
-            host_id,
-            status: HostStatus::Reconnecting,
-            error: last_error.clone(),
-        });
+        emit_event(
+            &event_tx,
+            HostEvent::Status {
+                host_id,
+                status: HostStatus::Reconnecting,
+                error: last_error.clone(),
+            },
+        );
 
         let bucket_idx = (attempt as usize).min(BACKOFF_SECS.len() - 1);
         let delay = Duration::from_secs(BACKOFF_SECS[bucket_idx]);
@@ -440,11 +503,14 @@ async fn finish_if_voluntary(
         guard.status = HostStatus::Disconnected;
         guard.supervisor = None;
     }
-    emit_event(event_tx, HostEvent::Status {
-        host_id,
-        status: HostStatus::Disconnected,
-        error: None,
-    });
+    emit_event(
+        event_tx,
+        HostEvent::Status {
+            host_id,
+            status: HostStatus::Disconnected,
+            error: None,
+        },
+    );
     notifications::dismiss_for_host(notif_ctx, event_tx, host_id);
     true
 }
@@ -482,7 +548,10 @@ async fn establish_local() -> Result<Established, String> {
     .await
     .map_err(|e| format!("connect join: {e}"))?
     .map_err(|e| e.to_string())?;
-    Ok(Established { connected, ssh: None })
+    Ok(Established {
+        connected,
+        ssh: None,
+    })
 }
 
 /// Did a daemon from another build answer our hello? The clean case is
@@ -595,7 +664,12 @@ async fn establish_remote(
             let opened = session
                 .open_exec(r#"exec "$HOME/.helm/bin/helmd" stdio"#.to_string())
                 .map_err(|e| ClientError::Io(std::io::Error::other(e.to_string())))?;
-            connect_io(Box::new(opened.reader), Box::new(opened.writer), &name, None)
+            connect_io(
+                Box::new(opened.reader),
+                Box::new(opened.writer),
+                &name,
+                None,
+            )
         };
         let connected = match bridge(&session) {
             Err(e) if is_stale_daemon(&e) => {
@@ -605,7 +679,10 @@ async fn establish_remote(
             }
             r => r.map_err(|e| e.to_string())?,
         };
-        Ok(Established { connected, ssh: Some(session) })
+        Ok(Established {
+            connected,
+            ssh: Some(session),
+        })
     })
     .await
     .map_err(|e| format!("remote connect join: {e}"))??;
@@ -654,7 +731,10 @@ fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String
 
     let bin = helmd_bin_path()?;
     let bytes = std::fs::read(&bin).map_err(|e| format!("read {}: {e}", bin.display()))?;
-    tracing::info!("uploading helmd ({} KB) to remote (had: {installed:?})", bytes.len() / 1024);
+    tracing::info!(
+        "uploading helmd ({} KB) to remote (had: {installed:?})",
+        bytes.len() / 1024
+    );
 
     // Stream the raw binary through a no-PTY exec channel's stdin.
     // SSH is 8-bit clean, so no base64 detour; EOF on our side lets
@@ -669,7 +749,9 @@ fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String
         .map_err(|e| e.to_string())?;
     {
         let mut writer = upload.writer;
-        writer.write_all(&bytes).map_err(|e| format!("upload write: {e}"))?;
+        writer
+            .write_all(&bytes)
+            .map_err(|e| format!("upload write: {e}"))?;
         writer.flush().map_err(|e| format!("upload flush: {e}"))?;
         // Drop closes the pipe → channel EOF → remote `cat` completes.
     }
@@ -696,7 +778,10 @@ fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String
 /// daemons too old to take the frame).
 fn shutdown_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String> {
     session
-        .run_oneshot(r#""$HOME/.helm/bin/helmd" shutdown 2>/dev/null || pkill -f "helmd serve" || true"#.to_string())
+        .run_oneshot(
+            r#""$HOME/.helm/bin/helmd" shutdown 2>/dev/null || pkill -f "helmd serve" || true"#
+                .to_string(),
+        )
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -715,34 +800,19 @@ fn remote_helmd_version(session: &Arc<helm_ssh::SshSession>) -> Result<String, S
 
 pub(crate) fn to_domain_tree(t: &TreeSnapshot) -> SessionTree {
     SessionTree {
-        workspaces: t
-            .workspaces
+        sessions: t
+            .sessions
             .iter()
-            .map(|ws| WorkspaceInfo {
-                id: ws.id.to_string(),
-                name: ws.name.clone(),
-                windows: ws
-                    .windows
-                    .iter()
-                    .map(|w| WindowInfo {
-                        id: w.id.to_string(),
-                        name: w.name.clone(),
-                        panes: w
-                            .panes
-                            .iter()
-                            .map(|p| PaneInfo {
-                                id: p.id.to_string(),
-                                cols: p.cols,
-                                rows: p.rows,
-                                alt_screen: p.alt_screen,
-                                cwd: p.cwd.clone(),
-                                branch: p.branch.clone(),
-                                root: p.root.clone(),
-                                command: p.command.clone(),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
+            .map(|session| SessionInfo {
+                id: session.id.to_string(),
+                name: session.name.clone(),
+                cols: session.cols,
+                rows: session.rows,
+                alt_screen: session.alt_screen,
+                cwd: session.cwd.clone(),
+                branch: session.branch.clone(),
+                root: session.root.clone(),
+                command: session.command.clone(),
             })
             .collect(),
     }
@@ -769,7 +839,7 @@ pub(crate) fn to_domain_hits(matches: &[helm_proto::SearchMatch]) -> Vec<SearchH
     matches
         .iter()
         .map(|m| SearchHit {
-            pane_id: m.pane.to_string(),
+            session_id: m.session.to_string(),
             block_id: m.block.map(|b| b.to_string()),
             line: m.line,
             line_text: m.line_text.clone(),
@@ -844,13 +914,16 @@ mod tests {
 
     #[test]
     fn stale_daemon_is_anything_but_a_hello_ack() {
-        let mismatch = ClientError::HandshakeRejected("protocol mismatch: client 4, daemon 3".into());
+        let mismatch =
+            ClientError::HandshakeRejected("protocol mismatch: client 4, daemon 3".into());
         assert!(is_stale_daemon(&mismatch));
         // An older daemon's `Error` frame lands on a different variant of
         // our `DaemonMsg` — this is what a 0.2.3 daemon looks like to 0.2.4.
         assert!(is_stale_daemon(&ClientError::UnexpectedHello));
         // Not a version problem: leave the daemon alone.
-        assert!(!is_stale_daemon(&ClientError::HandshakeRejected("busy".into())));
+        assert!(!is_stale_daemon(&ClientError::HandshakeRejected(
+            "busy".into()
+        )));
         assert!(!is_stale_daemon(&ClientError::HandshakeClosed));
         assert!(!is_stale_daemon(&ClientError::Closed));
     }

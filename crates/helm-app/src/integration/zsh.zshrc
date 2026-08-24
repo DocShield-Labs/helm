@@ -25,7 +25,7 @@ ZDOTDIR="${HELM_USER_ZDOTDIR:-$HOME}"
 
 # macOS's /etc/zshrc ran before us, while ZDOTDIR still pointed here, and
 # set HISTFILE relative to it. Repoint history at the user's directory so
-# Helm panes share one history with every other terminal; the user's
+# Helm sessions share one history with every other terminal; the user's
 # .zshrc below can still override it.
 if [[ -n "$HISTFILE" && "$HISTFILE" == "$__helm_shim_dir"/* ]]; then
     HISTFILE="$ZDOTDIR/${HISTFILE:t}"

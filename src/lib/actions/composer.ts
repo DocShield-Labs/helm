@@ -1,19 +1,18 @@
 /**
  * Composer actions — the Terminal ⇄ Agent mode switch for the active
- * pane. The pane reports its effective mode to the composer store, so
+ * session. The session reports its effective mode to the composer store, so
  * this needs no knowledge of how the mode was derived.
  */
 
-import { selectedPane, useStore } from '@lib/store'
+import { useStore } from '@lib/store'
 import { toggleComposerMode } from '@lib/session/composer'
-import { activeWindowSnapshot } from './window'
 import type { Action } from './types'
 
-function activePaneId(): { hostId: string; paneId: string } | null {
-  const snap = activeWindowSnapshot()
-  if (!snap) return null
-  const pane = selectedPane(snap.workspace, snap.window.id)
-  return pane ? { hostId: snap.hostId, paneId: pane.id } : null
+function activeSessionId(): { hostId: string; sessionId: string } | null {
+  const state = useStore.getState()
+  if (!state.activeHostId) return null
+  const sessionId = state.sessions.get(state.activeHostId)?.activeSessionId
+  return sessionId ? { hostId: state.activeHostId, sessionId } : null
 }
 
 export const composerActions: Action[] = [
@@ -23,10 +22,10 @@ export const composerActions: Action[] = [
     label: 'Toggle composer mode (Terminal ⇄ Agent)',
     icon: '⇄',
     keybinding: 'Cmd+i',
-    canRun: () => useStore.getState().activeHostId !== null && activePaneId() !== null,
+    canRun: () => activeSessionId() !== null,
     run: () => {
-      const p = activePaneId()
-      if (p) toggleComposerMode(p.hostId, p.paneId)
+      const session = activeSessionId()
+      if (session) toggleComposerMode(session.hostId, session.sessionId)
     },
   },
 ]

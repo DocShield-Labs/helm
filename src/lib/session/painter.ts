@@ -8,14 +8,14 @@
  * application turned on are mirrored so xterm encodes keys, mouse
  * reports, paste and focus events the way the application expects.
  *
- * The sequence builders are pure; `attachPainter` wires them to a pane.
+ * The sequence builders are pure; `attachPainter` wires them to a session.
  */
 
 import type { Terminal } from '@xterm/xterm'
 import { ATTRS, MODES } from '@bindings'
 import type { CursorInfo, HostId, RowInfo, SpanInfo } from '@bindings'
 import { colorSgr } from './palette'
-import { getPaneScreen, screenInfoOf, subscribePaint, type PaintEvent } from './screen'
+import { getSessionScreen, screenInfoOf, subscribePaint, type PaintEvent } from './screen'
 
 const ESC = '\x1b'
 const CSI = `${ESC}[`
@@ -122,9 +122,9 @@ export interface Painter {
 }
 
 /**
- * Keep `term` showing the pane's grid. Paints the current screen on
+ * Keep `term` showing the session's grid. Paints the current screen on
  * attach and every screen / diff after, skipping while `visible()` is
- * false (a hidden pane catches up with one repaint when shown). Rows
+ * false (a hidden session catches up with one repaint when shown). Rows
  * past xterm's own height — a resize round-trip in flight — are
  * dropped rather than piled onto its last row; a full frame follows
  * the resize.
@@ -132,7 +132,7 @@ export interface Painter {
 export function attachPainter(
   term: Terminal,
   hostId: HostId,
-  paneId: string,
+  sessionId: string,
   visible: () => boolean,
 ): Painter {
   // What xterm's modes are right now; each paint transitions them.
@@ -153,12 +153,12 @@ export function attachPainter(
       modes = ev.modes
     }
   }
-  const unsubscribe = subscribePaint(hostId, paneId, paint)
+  const unsubscribe = subscribePaint(hostId, sessionId, paint)
   return {
     repaintIfDirty() {
       if (!dirty) return
       dirty = false
-      const s = getPaneScreen(hostId, paneId)
+      const s = getSessionScreen(hostId, sessionId)
       if (s.loaded) paint({ kind: 'screen', screen: screenInfoOf(s) })
     },
     dispose: unsubscribe,

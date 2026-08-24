@@ -2,20 +2,19 @@
  * Frontend host glue.
  *
  * Owns the single Tauri Channel that receives every `HostEvent`. Routes:
- *   - `session` events → per-pane streams / block tables / store tree
+ *   - `session` events → per-session streams / block tables / store tree
  *   - `status` events  → host status map (+ tree fetch on connect)
  *   - `host_added` / `host_removed` → registry mutations
  *   - notifications, tool suggestions → store
  *
- * Selection (which workspace/window/pane is shown) is purely frontend
- * state — the daemon has no notion of it. `selectWindow` is the one
- * entry point every "jump to window" path uses.
+ * Selection is purely frontend state. `selectSession` is the one entry
+ * point every jump path uses.
  */
 
 import { Channel } from '@tauri-apps/api/core'
 import { commands } from '@lib/ipc'
 import { useStore } from '@lib/store'
-import { treeToWorkspaces } from '@lib/session/tree'
+import { treeToSessions } from '@lib/session/tree'
 import * as screen from '@lib/session/screen'
 import * as blocks from '@lib/session/blocks'
 import type { Host, HostEvent, HostId, SessionEvent, SessionTree } from '@bindings'
@@ -59,14 +58,14 @@ export async function subscribeHostEvents(): Promise<void> {
           void refetchTree(evt.host_id)
         }
         if (evt.status === 'disconnected' && prev === 'connected') {
-          store.setWorkspaces(evt.host_id, [])
+          store.setSessions(evt.host_id, [])
           store.clearRunningForHost(evt.host_id)
           screen.dropHost(evt.host_id)
           blocks.dropHost(evt.host_id)
         }
         // Reconnecting: keep the tree. helmd persists across transport
         // drops (and auto-respawns on localhost); the next Tree event
-        // reconciles whatever changed, and each pane repaints from the
+        // reconciles whatever changed, and each session repaints from the
         // daemon's model when it's next shown.
         return
       }
@@ -126,40 +125,40 @@ function handleSessionEvent(hostId: HostId, ev: SessionEvent): void {
   const store = useStore.getState()
   switch (ev.kind) {
     case 'screen':
-      screen.applyScreen(hostId, ev.pane_id, ev.screen)
+      screen.applyScreen(hostId, ev.session_id, ev.screen)
       return
     case 'screen_diff':
-      screen.applyDiff(hostId, ev.pane_id, ev.top_line, ev.scroll, ev.rows, ev.cursor, ev.modes)
+      screen.applyDiff(hostId, ev.session_id, ev.top_line, ev.scroll, ev.rows, ev.cursor, ev.modes)
       return
     case 'history_append':
-      screen.applyHistoryAppend(hostId, ev.pane_id, ev.first_line, ev.rows)
+      screen.applyHistoryAppend(hostId, ev.session_id, ev.first_line, ev.rows)
       return
     case 'block': {
       const b = ev.block
-      blocks.upsertBlock(hostId, ev.pane_id, b)
+      blocks.upsertBlock(hostId, ev.session_id, b)
       if (blocks.isRunning(b)) {
-        store.markPaneRunning(hostId, ev.pane_id, b.cmdline)
+        store.markSessionRunning(hostId, ev.session_id, b.cmdline)
       } else if (b.end_line !== null) {
-        store.markPaneIdle(hostId, ev.pane_id)
+        store.markSessionIdle(hostId, ev.session_id)
       }
       if (b.cwd !== null) {
-        store.updatePaneCwd(hostId, ev.pane_id, b.cwd, b.branch ?? '', b.root ?? '')
+        store.updateSessionCwd(hostId, ev.session_id, b.cwd, b.branch ?? '', b.root ?? '')
       }
       return
     }
     case 'mode_change':
-      blocks.setAltScreen(hostId, ev.pane_id, ev.alt_screen)
+      blocks.setAltScreen(hostId, ev.session_id, ev.alt_screen)
       return
     case 'tree': {
       applyTree(hostId, ev.tree)
       return
     }
-    case 'pane_exited':
-      blocks.setExited(hostId, ev.pane_id)
-      store.markPaneIdle(hostId, ev.pane_id)
+    case 'session_exited':
+      blocks.setExited(hostId, ev.session_id)
+      store.markSessionIdle(hostId, ev.session_id)
       return
     case 'bell':
-      blocks.ringBell(hostId, ev.pane_id)
+      blocks.ringBell(hostId, ev.session_id)
       return
   }
 }
@@ -168,8 +167,8 @@ function handleSessionEvent(hostId: HostId, ev: SessionEvent): void {
  * Connect a host. The daemon's tree arrives via events; we also fetch
  * it here so callers can read the store right after this resolves.
  */
-export async function connectHost(hostId: HostId, bootstrapWorkspace?: string): Promise<void> {
-  const res = await commands.hostConnect(hostId, bootstrapWorkspace ?? null)
+export async function connectHost(hostId: HostId): Promise<void> {
+  const res = await commands.hostConnect(hostId)
   if (res.status !== 'ok') throw new Error(res.error)
   await refetchTree(hostId)
 }
@@ -216,17 +215,11 @@ export async function deleteHost(host: Host): Promise<void> {
   }
 }
 
-/** Make `workspaceId` the active workspace for `hostId`. Local state. */
-export async function selectWorkspace(hostId: HostId, workspaceId: string): Promise<void> {
-  useStore.getState().setActiveWorkspace(hostId, workspaceId)
-}
-
-/** Focus a window: active host + workspace + window, all local state. */
-export function selectWindow(hostId: HostId, workspaceId: string, windowId: string): void {
+/** Focus a session and its host. */
+export function selectSession(hostId: HostId, sessionId: string): void {
   const store = useStore.getState()
   store.setActiveHost(hostId)
-  store.setActiveWorkspace(hostId, workspaceId)
-  store.setActiveWindow(hostId, workspaceId, windowId)
+  store.setActiveSession(hostId, sessionId)
 }
 
 /** Pull the daemon's current tree into the store. */
@@ -237,12 +230,9 @@ export async function refetchTree(hostId: HostId): Promise<void> {
 }
 
 function applyTree(hostId: HostId, tree: SessionTree): void {
-  const workspaces = treeToWorkspaces(tree)
-  const paneIds = new Set<string>()
-  for (const workspace of workspaces) {
-    for (const paneId of workspace.panes.keys()) paneIds.add(paneId)
-  }
-  screen.retainHostPanes(hostId, paneIds)
-  blocks.retainHostPanes(hostId, paneIds)
-  useStore.getState().setWorkspaces(hostId, workspaces)
+  const sessions = treeToSessions(tree)
+  const sessionIds = new Set(sessions.map((session) => session.id))
+  screen.retainHostSessions(hostId, sessionIds)
+  blocks.retainHostSessions(hostId, sessionIds)
+  useStore.getState().setSessions(hostId, sessions)
 }

@@ -45,17 +45,12 @@
   --stroke-inverse: color-mix(in srgb, var(--terminal-bg) 40%, transparent);
 
   /* ---------- Accent (theme.accent — saturation untouched, depths via opacity) ----------
-   * The three muted variants give selected rows a clear visual hierarchy
-   * in the sidebar tree:
-   *   - hosts at 6%      (the broadest container, lightest fill)
-   *   - workspaces at 5% (one level in, even lighter)
-   *   - windows / pins at 10% (the actionable leaves — strongest)
+   * Muted variants give selected rows a clear visual hierarchy.
    */
   --accent-default:         var(--terminal-accent);
   --accent-hover:           color-mix(in srgb, var(--terminal-accent) 82%, white 18%);
   --accent-muted:           color-mix(in srgb, var(--terminal-accent) 10%, transparent);
   --accent-muted-host:      color-mix(in srgb, var(--terminal-accent) 6%,  transparent);
-  --accent-muted-workspace: color-mix(in srgb, var(--terminal-accent) 5%,  transparent);
   --accent-border:          color-mix(in srgb, var(--terminal-accent) 30%, transparent);
   --accent-text:            color-mix(in srgb, var(--terminal-accent) 75%, white 25%);
 
@@ -71,7 +66,7 @@
   --activity-failed:    var(--terminal-failed);
   --activity-idle:      color-mix(in srgb, var(--terminal-fg) 50%, transparent);
 
-  /* ---------- Terminal pane chrome (block dividers, status chips) ---------- */
+  /* ---------- Terminal session chrome (block dividers, status chips) ---------- */
   --terminal-fg-30:     color-mix(in srgb, var(--terminal-fg) 30%, transparent);
   --terminal-fg-60:     color-mix(in srgb, var(--terminal-fg) 60%, transparent);
   --terminal-fg-06:     color-mix(in srgb, var(--terminal-fg) 6%,  transparent);

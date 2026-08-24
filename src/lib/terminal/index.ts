@@ -24,16 +24,16 @@ export type { Theme } from './themes'
 // WebGL renderer with `onContextLoss` fallback. The atlas-cached glyphs
 // look noticeably crisper than the DOM renderer, especially at small
 // font sizes. The historical concern was browser per-page context
-// caps (Chromium ~16) blowing up under workspace churn — fixed here by
+// caps (Chromium ~16) blowing up under session churn — fixed here by
 // disposing the addon when a context is lost, which makes xterm fall
-// back to its built-in DOM renderer for the affected pane. Construction
+// back to its built-in DOM renderer for the affected session. Construction
 // is wrapped in try/catch so headless or no-GPU environments degrade
 // silently instead of throwing.
 
 export interface HelmTerminal {
   term: Terminal
   fit: FitAddon
-  /** In-pane find (Cmd+F). The SearchOverlay drives findNext/findPrevious
+  /** In-session find (Cmd+F). The SearchOverlay drives findNext/findPrevious
    * and reads match counts via `onDidChangeResults`. Decorations are
    * passed per-call by the overlay so highlight colours track the theme. */
   search: SearchAddon
@@ -65,10 +65,10 @@ export interface AttachOptions {
 }
 
 /** Registry of every currently-attached terminal. The theme picker
- * fans out via `setThemeForAllTerminals` so we don't need each pane
- * to maintain its own store subscription — relevant when many panes
+ * fans out via `setThemeForAllTerminals` so we don't need each session
+ * to maintain its own store subscription — relevant when many sessions
  * are mounted at once and the user is rapidly cycling preview themes
- * (one xterm atlas rebuild per pane per keypress otherwise). */
+ * (one xterm atlas rebuild per session per keypress otherwise). */
 const attached = new Set<HelmTerminal>()
 
 /** Push a theme into every live xterm. Safe to call from anywhere;
@@ -150,7 +150,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   const fit = new FitAddon()
   term.loadAddon(fit)
 
-  // In-pane find. Loaded eagerly (cheap) so Cmd+F is instant; the
+  // In-session find. Loaded eagerly (cheap) so Cmd+F is instant; the
   // overlay UI (SearchOverlay) is what's lazily mounted on demand.
   const search = new SearchAddon()
   term.loadAddon(search)
@@ -225,7 +225,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // the host's dimensions. If construction fails (no WebGL2, blocked
   // context) or the context is lost later (GPU process churn,
   // browser-cap eviction), we dispose the addon and xterm reverts to
-  // its built-in DOM renderer for this pane. No reload, no crash.
+  // its built-in DOM renderer for this session. No reload, no crash.
   let webgl: WebglAddon | null = null
   try {
     const addon = new WebglAddon()
@@ -242,11 +242,11 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
 
   // Cached cell dimensions in pixels. Measure from `.xterm-screen / rows`
   // (and cols) — that's xterm's internal layout, not CSS line-height,
-  // so we sidestep rounding drift between the two. The pane's wheel
+  // so we sidestep rounding drift between the two. The session's wheel
   // handler reads it to turn line-mode wheel deltas into pixels, and
-  // BlockPane sizes the live band from it. (The grid has no scrollback,
-  // so xterm never scrolls itself: the pane decides what a wheel over
-  // the grid means — see BlockPane.)
+  // SessionView sizes the live band from it. (The grid has no scrollback,
+  // so xterm never scrolls itself: the session decides what a wheel over
+  // the grid means — see SessionView.)
   //
   // The measurement also closes the loop on `lineHeight`: when the
   // rendered cell isn't the DOM row height, set the lineHeight that

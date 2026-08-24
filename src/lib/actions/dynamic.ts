@@ -2,9 +2,8 @@
  * Dynamic action projections for sub-mode views.
  *
  * The static registry (`actions/index.ts`) holds verbs. Sub-modes
- * project store state into per-instance Actions on demand: every
- * workspace becomes a `workspace.<id>` action whose primary verb is
- * "switch to", every host becomes `host.<id>` etc. They share the same
+ * project store state into per-instance actions on demand: every
+ * session and host becomes a selectable palette object. They share the same
  * Action shape so the palette renders + ranks them through the same
  * pipeline.
  *
@@ -15,8 +14,8 @@
  */
 
 import { commands } from '@lib/ipc'
-import { activateAndConnectHost, deleteHost, selectWindow, selectWorkspace } from '@lib/host'
-import { useStore, pinnedKey, sortById, type TmuxWindow, type TmuxWorkspace } from '@lib/store'
+import { activateAndConnectHost, deleteHost, selectSession } from '@lib/host'
+import { useStore, sortById, type Session } from '@lib/store'
 import {
   displayedHostStatus,
   STATUS_LABEL,
@@ -25,8 +24,7 @@ import {
 } from '@lib/host-status'
 import type { Host } from '@bindings'
 import type { Action } from './types'
-import { killWorkspace } from './workspace'
-import { killWindow } from './window'
+import { killSession } from './session'
 
 export interface GroupHeader {
   label: string
@@ -42,149 +40,47 @@ export interface SubModeResult {
   groups?: Map<string, GroupHeader>
 }
 
-// ---------- @workspaces ----------
+// ---------- #sessions ----------
 
-function workspaceSubActions(hostId: string, ws: TmuxWorkspace): Action[] {
+function sessionSubActions(host: Host, session: Session): Action[] {
   return [
     {
-      id: `workspace.${hostId}.${ws.id}.switch`,
+      id: `session.${host.id}.${session.id}.jump`,
       kind: 'action',
-      label: 'Switch to workspace',
+      label: 'Jump to session',
       icon: '⏵',
-      run: () => {
-        useStore.getState().setActiveHost(hostId)
-        void selectWorkspace(hostId, ws.id)
-      },
+      run: () => selectSession(host.id, session.id),
     },
     {
-      id: `workspace.${hostId}.${ws.id}.kill`,
+      id: `session.${host.id}.${session.id}.kill`,
       kind: 'action',
-      label: 'Kill workspace',
+      label: 'Kill session',
       icon: '×',
       destructive: true,
-      run: () => {
-        void killWorkspace(hostId, ws)
-      },
+      run: () => killSession(host.id, session),
     },
   ]
 }
 
-export function workspacesAsActions(): SubModeResult {
+export function sessionsAsActions(): SubModeResult {
   const state = useStore.getState()
   const actions: Action[] = []
-  const groups = new Map<string, GroupHeader>()
   for (const host of state.hosts.values()) {
-    const hs = state.sessions.get(host.id)
-    if (!hs) continue
-    const list = [...hs.workspaces.values()].sort((a, b) => a.name.localeCompare(b.name))
-    const header: GroupHeader = { label: host.name.toUpperCase(), count: list.length }
-    for (const ws of list) {
-      const isActive = host.id === state.activeHostId && hs.activeWorkspaceId === ws.id
-      const id = `workspace.${host.id}.${ws.id}`
+    const hostSessions = state.sessions.get(host.id)
+    if (!hostSessions) continue
+    for (const session of sortById(hostSessions.sessions.values())) {
       actions.push({
-        id,
-        kind: 'workspace',
-        label: ws.name,
-        sublabel: `· ${ws.windows.size} window${ws.windows.size === 1 ? '' : 's'}${isActive ? ' · active' : ''}`,
-        icon: '◫',
-        run: () => {
-          state.setActiveHost(host.id)
-          void selectWorkspace(host.id, ws.id)
-        },
-        subActions: () => workspaceSubActions(host.id, ws),
+        id: `session.${host.id}.${session.id}`,
+        kind: 'session',
+        label: session.name,
+        sublabel: `· ${host.name}`,
+        icon: '▢',
+        run: () => selectSession(host.id, session.id),
+        subActions: () => sessionSubActions(host, session),
       })
-      groups.set(id, header)
     }
   }
-  return { chip: '@workspaces', actions, groups }
-}
-
-// ---------- #windows ----------
-
-function windowSubActions(host: Host, ws: TmuxWorkspace, win: TmuxWindow): Action[] {
-  const state = useStore.getState()
-  const isPinned = state.isWindowPinned(host.id, ws.name, win.id)
-  return [
-    {
-      id: `window.${host.id}.${ws.id}.${win.id}.jump`,
-      kind: 'action',
-      label: 'Jump to window',
-      icon: '⏵',
-      run: () => {
-        selectWindow(host.id, ws.id, win.id)
-      },
-    },
-    isPinned
-      ? {
-          id: `window.${host.id}.${ws.id}.${win.id}.unpin`,
-          kind: 'action',
-          label: 'Unpin from sidebar',
-          icon: '☆',
-          run: () => {
-            state.removePinnedWindow(pinnedKey(host.id, ws.name, win.id))
-          },
-        }
-      : {
-          id: `window.${host.id}.${ws.id}.${win.id}.pin`,
-          kind: 'action',
-          label: 'Pin to sidebar',
-          icon: '★',
-          run: () => {
-            state.addPinnedWindow({
-              hostId: host.id,
-              workspaceName: ws.name,
-              windowId: win.id,
-              hostName: host.name,
-              windowName: win.name,
-            })
-          },
-        },
-    {
-      id: `window.${host.id}.${ws.id}.${win.id}.kill`,
-      kind: 'action',
-      label: 'Kill window',
-      icon: '×',
-      destructive: true,
-      run: () => {
-        killWindow(host.id, ws.id, win)
-      },
-    },
-  ]
-}
-
-export function windowsAsActions(): SubModeResult {
-  const state = useStore.getState()
-  const actions: Action[] = []
-  // Pre-resolve the pinned set so each row knows whether to bubble up
-  // and render with a star icon. This used to be a post-process step
-  // in PaletteHost that parsed action ids back into (host, ws, win) —
-  // doing it here at construction time keeps the id format private.
-  const pins = state.pinnedWindows
-  for (const host of state.hosts.values()) {
-    const hs = state.sessions.get(host.id)
-    if (!hs) continue
-    for (const ws of hs.workspaces.values()) {
-      for (const win of sortById(ws.windows.values())) {
-        const isPinned = pins.some(
-          (p) => p.hostId === host.id && p.workspaceName === ws.name && p.windowId === win.id,
-        )
-        const tail = ws.name
-        actions.push({
-          id: `window.${host.id}.${ws.id}.${win.id}`,
-          kind: 'window',
-          label: win.name,
-          sublabel: `· ${host.name} → ${tail}`,
-          icon: isPinned ? '★' : '▢',
-          weight: isPinned ? 5 : 0,
-          run: () => {
-            selectWindow(host.id, ws.id, win.id)
-          },
-          subActions: () => windowSubActions(host, ws, win),
-        })
-      }
-    }
-  }
-  return { chip: '#windows', actions }
+  return { chip: '#sessions', actions }
 }
 
 // ---------- $hosts ----------
@@ -274,15 +170,13 @@ export function hostsAsActions(): SubModeResult {
 
 // ---------- dispatcher ----------
 
-export type Sigil = '@' | '#' | '$'
+export type Sigil = '#' | '$'
 
 /** Resolve a sigil to the matching projection. */
 export function resolveSigil(sigil: Sigil): SubModeResult {
   switch (sigil) {
-    case '@':
-      return workspacesAsActions()
     case '#':
-      return windowsAsActions()
+      return sessionsAsActions()
     case '$':
       return hostsAsActions()
   }

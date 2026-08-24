@@ -1,5 +1,5 @@
 /**
- * Per-pane mirror of the daemon's terminal model.
+ * Per-session mirror of the daemon's terminal model.
  *
  * The daemon owns the grid and the line history (see PLAN.md, M8); this
  * module keeps the frontend's copy:
@@ -11,7 +11,7 @@
  *     paged in backwards with `ensureHistory` as the user scrolls up;
  *     the loaded range `[loadedFrom, loadedTo)` is one contiguous run
  *     that `ensureHistory` keeps touching the grid;
- *   - "painters": whoever renders the live grid (the pane's xterm)
+ *   - "painters": whoever renders the live grid (the session's xterm)
  *     subscribes to receive each screen / diff in arrival order.
  *
  * Rows are immutable once they've scrolled out, which is what makes the
@@ -26,7 +26,7 @@ import { MAX_HISTORY_PAGE, MODES } from '@bindings'
 import type { CursorInfo, HistoryPage, HostId, RowAt, RowInfo, ScreenInfo } from '@bindings'
 import { addListener, notifyListeners } from './listeners'
 
-export interface PaneScreen {
+export interface SessionScreen {
   /** A `Screen` has been applied at least once. */
   loaded: boolean
   cols: number
@@ -57,10 +57,10 @@ export type PaintEvent =
 const EMPTY_CURSOR: CursorInfo = { row: 0, col: 0, visible: true, shape: 'block', blink: false }
 const EMPTY_ROW: RowInfo = { spans: [], wrapped: false }
 
-/** Rows kept per pane in the frontend before the oldest are dropped. */
+/** Rows kept per session in the frontend before the oldest are dropped. */
 const MAX_CLIENT_ROWS = 60_000
 
-function empty(): PaneScreen {
+function empty(): SessionScreen {
   return {
     loaded: false,
     cols: 0,
@@ -78,17 +78,17 @@ function empty(): PaneScreen {
   }
 }
 
-const panes = new Map<string, PaneScreen>()
+const sessions = new Map<string, SessionScreen>()
 const subs = new Map<string, Set<() => void>>()
 const painters = new Map<string, Set<(ev: PaintEvent) => void>>()
 const loading = new Map<string, Promise<void>>()
 const key = (h: HostId, p: string) => `${h}::${p}`
 
-function get(k: string): PaneScreen {
-  let s = panes.get(k)
+function get(k: string): SessionScreen {
+  let s = sessions.get(k)
   if (!s) {
     s = empty()
-    panes.set(k, s)
+    sessions.set(k, s)
   }
   return s
 }
@@ -97,8 +97,8 @@ const notify = (k: string) => notifyListeners(subs, k)
 
 // ---- inbound events (host.ts) ----
 
-export function applyScreen(hostId: HostId, paneId: string, screen: ScreenInfo): void {
-  const k = key(hostId, paneId)
+export function applyScreen(hostId: HostId, sessionId: string, screen: ScreenInfo): void {
+  const k = key(hostId, sessionId)
   const s = get(k)
   s.loaded = true
   s.cols = screen.cols
@@ -115,14 +115,14 @@ export function applyScreen(hostId: HostId, paneId: string, screen: ScreenInfo):
 
 export function applyDiff(
   hostId: HostId,
-  paneId: string,
+  sessionId: string,
   topLine: number,
   scroll: number,
   rows: RowAt[],
   cursor: CursorInfo,
   modes: number,
 ): void {
-  const k = key(hostId, paneId)
+  const k = key(hostId, sessionId)
   const s = get(k)
   if (!s.loaded) return // a full screen is on its way (or will be asked for)
   if (scroll > 0) {
@@ -144,11 +144,11 @@ export function applyDiff(
  * with it (or starts one); a gap is left for `ensureHistory` to fill. */
 export function applyHistoryAppend(
   hostId: HostId,
-  paneId: string,
+  sessionId: string,
   firstLine: number,
   rows: RowInfo[],
 ): void {
-  const k = key(hostId, paneId)
+  const k = key(hostId, sessionId)
   const s = get(k)
   if (s.loadedFrom === null) {
     s.loadedFrom = firstLine
@@ -164,7 +164,7 @@ export function applyHistoryAppend(
 }
 
 /** Drop the oldest loaded rows past the client cap. */
-function trim(s: PaneScreen) {
+function trim(s: SessionScreen) {
   if (s.loadedFrom === null) return
   const excess = s.loadedTo - s.loadedFrom - MAX_CLIENT_ROWS
   if (excess <= 0) return
@@ -174,11 +174,11 @@ function trim(s: PaneScreen) {
 
 // ---- reads ----
 
-export function getPaneScreen(hostId: HostId, paneId: string): PaneScreen {
-  return get(key(hostId, paneId))
+export function getSessionScreen(hostId: HostId, sessionId: string): SessionScreen {
+  return get(key(hostId, sessionId))
 }
 
-export function screenInfoOf(s: PaneScreen): ScreenInfo {
+export function screenInfoOf(s: SessionScreen): ScreenInfo {
   return {
     cols: s.cols,
     rows: s.rows,
@@ -190,18 +190,18 @@ export function screenInfoOf(s: PaneScreen): ScreenInfo {
   }
 }
 
-export function subscribe(hostId: HostId, paneId: string, cb: () => void): () => void {
-  return addListener(subs, key(hostId, paneId), cb)
+export function subscribe(hostId: HostId, sessionId: string, cb: () => void): () => void {
+  return addListener(subs, key(hostId, sessionId), cb)
 }
 
 /** The live grid's painter. Receives the current screen at once when
  * one is known, then every screen / diff in order. */
 export function subscribePaint(
   hostId: HostId,
-  paneId: string,
+  sessionId: string,
   cb: (ev: PaintEvent) => void,
 ): () => void {
-  const k = key(hostId, paneId)
+  const k = key(hostId, sessionId)
   const off = addListener(painters, k, cb)
   const s = get(k)
   if (s.loaded) cb({ kind: 'screen', screen: screenInfoOf(s) })
@@ -209,13 +209,13 @@ export function subscribePaint(
 }
 
 /** Row at an absolute line, from history or the grid. */
-export function rowAt(s: PaneScreen, line: number): RowInfo | undefined {
+export function rowAt(s: SessionScreen, line: number): RowInfo | undefined {
   if (line >= s.topLine) return s.grid[line - s.topLine]
   return s.history.get(line)
 }
 
 /** Rows in `[from, to)` that are present; `[line, row]` pairs. */
-export function rowsBetween(s: PaneScreen, from: number, to: number): Array<[number, RowInfo]> {
+export function rowsBetween(s: SessionScreen, from: number, to: number): Array<[number, RowInfo]> {
   const out: Array<[number, RowInfo]> = []
   for (let l = Math.max(0, from); l < to; l++) {
     const r = rowAt(s, l)
@@ -226,7 +226,7 @@ export function rowsBetween(s: PaneScreen, from: number, to: number): Array<[num
 
 /** Plain text of the last `n` rows (history + grid), trailing blank
  * grid rows skipped. */
-export function tailText(s: PaneScreen, n: number): string {
+export function tailText(s: SessionScreen, n: number): string {
   const lines: string[] = []
   let l = s.topLine + s.grid.length - 1
   while (l >= s.topLine && rowText(s.grid[l - s.topLine]).trim() === '') l--
@@ -247,10 +247,10 @@ export function rowText(r: RowInfo): string {
 // ---- React hooks ----
 
 /** Grid rows in use: through the last non-blank row (the cursor's row
- * when the grid is blank). What a pane shows of the live grid; a bare
+ * when the grid is blank). What a session shows of the live grid; a bare
  * cursor on a blank row below the output is left out so the band a
  * running command occupies equals the rows its finished block gets. */
-export function usedRows(s: PaneScreen): number {
+export function usedRows(s: SessionScreen): number {
   let last = s.grid.length - 1
   while (last >= 0 && s.grid[last].spans.length === 0) last--
   return last >= 0 ? last + 1 : Math.min(s.grid.length, s.cursor.row + 1)
@@ -292,16 +292,16 @@ function metaOf(k: string): ScreenMeta {
   return next
 }
 
-export function useScreenMeta(hostId: HostId, paneId: string): ScreenMeta {
-  const k = key(hostId, paneId)
-  const sub = useCallback((cb: () => void) => subscribe(hostId, paneId, cb), [hostId, paneId])
+export function useScreenMeta(hostId: HostId, sessionId: string): ScreenMeta {
+  const k = key(hostId, sessionId)
+  const sub = useCallback((cb: () => void) => subscribe(hostId, sessionId, cb), [hostId, sessionId])
   return useSyncExternalStore(sub, () => metaOf(k))
 }
 
 /** Every change, including cursor moves — for the peek. */
-export function useScreenVersion(hostId: HostId, paneId: string): number {
-  const k = key(hostId, paneId)
-  const sub = useCallback((cb: () => void) => subscribe(hostId, paneId, cb), [hostId, paneId])
+export function useScreenVersion(hostId: HostId, sessionId: string): number {
+  const k = key(hostId, sessionId)
+  const sub = useCallback((cb: () => void) => subscribe(hostId, sessionId, cb), [hostId, sessionId])
   return useSyncExternalStore(sub, () => {
     const s = get(k)
     return s.gridVersion + s.historyVersion
@@ -327,13 +327,13 @@ const EMPTY_ROWS: Array<[number, RowInfo]> = []
  */
 export function useRows(
   hostId: HostId,
-  paneId: string,
+  sessionId: string,
   from: number,
   to: number,
 ): Array<[number, RowInfo]> {
-  const k = key(hostId, paneId)
+  const k = key(hostId, sessionId)
   const cache = useRef<RowsCache | null>(null)
-  const sub = useCallback((cb: () => void) => subscribe(hostId, paneId, cb), [hostId, paneId])
+  const sub = useCallback((cb: () => void) => subscribe(hostId, sessionId, cb), [hostId, sessionId])
   const snapshot = useCallback(() => {
     if (to <= from) return EMPTY_ROWS
     const s = get(k)
@@ -363,17 +363,17 @@ export function useRows(
 
 // ---- fetching ----
 
-/** Make sure the pane's grid is known (first paint after mount). */
-export async function ensureScreen(hostId: HostId, paneId: string): Promise<void> {
-  const k = key(hostId, paneId)
+/** Make sure the session's grid is known (first paint after mount). */
+export async function ensureScreen(hostId: HostId, sessionId: string): Promise<void> {
+  const k = key(hostId, sessionId)
   if (get(k).loaded) return
   const lk = `${k}|screen`
   const inflight = loading.get(lk)
   if (inflight) return inflight
   const p = commands
-    .sessionScreen(hostId, paneId)
+    .sessionScreen(hostId, sessionId)
     .then((res) => {
-      if (res.status === 'ok') applyScreen(hostId, paneId, res.data)
+      if (res.status === 'ok') applyScreen(hostId, sessionId, res.data)
     })
     .finally(() => loading.delete(lk))
   loading.set(lk, p)
@@ -384,20 +384,20 @@ export async function ensureScreen(hostId: HostId, paneId: string): Promise<void
  * Page history in until rows from `fromLine` up to the grid are loaded
  * (or the daemon has nothing older). The gap touching the grid is
  * filled first, then older pages, so the rows nearest the viewport
- * arrive first. One fetch chain per pane at a time; a call that finds
+ * arrive first. One fetch chain per session at a time; a call that finds
  * one running re-checks once it finishes.
  */
-export function ensureHistory(hostId: HostId, paneId: string, fromLine: number): Promise<void> {
-  const k = key(hostId, paneId)
+export function ensureHistory(hostId: HostId, sessionId: string, fromLine: number): Promise<void> {
+  const k = key(hostId, sessionId)
   const inflight = loading.get(k)
-  if (inflight) return inflight.then(() => ensureHistory(hostId, paneId, fromLine))
-  const p = fetchLoop(hostId, paneId, fromLine).finally(() => loading.delete(k))
+  if (inflight) return inflight.then(() => ensureHistory(hostId, sessionId, fromLine))
+  const p = fetchLoop(hostId, sessionId, fromLine).finally(() => loading.delete(k))
   loading.set(k, p)
   return p
 }
 
 /** The next unloaded range `[lo, hi)` to fetch, newest first. */
-function nextGap(s: PaneScreen, fromLine: number): [number, number] | null {
+function nextGap(s: SessionScreen, fromLine: number): [number, number] | null {
   if (s.loadedFrom === null) {
     const lo = Math.max(0, fromLine)
     return s.topLine > lo ? [lo, s.topLine] : null
@@ -410,7 +410,7 @@ function nextGap(s: PaneScreen, fromLine: number): [number, number] | null {
 
 /** Merge a page answering `[lo, hi)` into the loaded range. An empty
  * page still marks the asked-for range covered so paging converges. */
-function insertPage(s: PaneScreen, lo: number, hi: number, page: HistoryPage): void {
+function insertPage(s: SessionScreen, lo: number, hi: number, page: HistoryPage): void {
   s.historyStart = page.history_start
   if (page.rows.length === 0) {
     if (s.loadedFrom === null) {
@@ -437,8 +437,8 @@ function insertPage(s: PaneScreen, lo: number, hi: number, page: HistoryPage): v
   s.historyVersion++
 }
 
-async function fetchLoop(hostId: HostId, paneId: string, fromLine: number): Promise<void> {
-  const k = key(hostId, paneId)
+async function fetchLoop(hostId: HostId, sessionId: string, fromLine: number): Promise<void> {
+  const k = key(hostId, sessionId)
   for (let guard = 0; guard < 64; guard++) {
     const s = get(k)
     const gap = nextGap(s, fromLine)
@@ -454,7 +454,7 @@ async function fetchLoop(hostId: HostId, paneId: string, fromLine: number): Prom
       return
     }
     const [lo, hi] = gap
-    const res = await commands.sessionHistory(hostId, paneId, lo, hi)
+    const res = await commands.sessionHistory(hostId, sessionId, lo, hi)
     if (res.status !== 'ok') return
     insertPage(get(k), lo, hi, res.data)
     notify(k)
@@ -465,32 +465,32 @@ async function fetchLoop(hostId: HostId, paneId: string, fromLine: number): Prom
 
 export function dropHost(hostId: HostId): void {
   const prefix = `${hostId}::`
-  for (const k of [...panes.keys()]) {
+  for (const k of [...sessions.keys()]) {
     if (!k.startsWith(prefix)) continue
-    panes.delete(k)
+    sessions.delete(k)
     metaCache.delete(k)
     notify(k)
   }
 }
 
-/** Drop cached screens for panes no longer present in a host tree. */
-export function retainHostPanes(hostId: HostId, paneIds: ReadonlySet<string>): void {
+/** Drop cached screens for sessions no longer present in a host tree. */
+export function retainHostSessions(hostId: HostId, sessionIds: ReadonlySet<string>): void {
   const prefix = `${hostId}::`
-  for (const k of [...panes.keys()]) {
+  for (const k of [...sessions.keys()]) {
     if (!k.startsWith(prefix)) continue
-    const paneId = k.slice(prefix.length)
-    if (paneIds.has(paneId)) continue
-    panes.delete(k)
+    const sessionId = k.slice(prefix.length)
+    if (sessionIds.has(sessionId)) continue
+    sessions.delete(k)
     metaCache.delete(k)
     notify(k)
   }
 }
 
-/** Keystrokes / pasted text for a pane. One place owns the wire
+/** Keystrokes / pasted text for a session. One place owns the wire
  * encoding (base64) for the outbound half. */
-export function sendInput(hostId: HostId, paneId: string, input: string | Uint8Array): Promise<void> {
+export function sendInput(hostId: HostId, sessionId: string, input: string | Uint8Array): Promise<void> {
   const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input
-  return commands.sessionInput(hostId, paneId, bytesToBase64(bytes)).then((res) => {
+  return commands.sessionInput(hostId, sessionId, bytesToBase64(bytes)).then((res) => {
     if (res.status !== 'ok') console.warn('session_input failed:', res.error)
   })
 }

@@ -1,5 +1,5 @@
 /**
- * Sidebar — the session list. One row per window across every host,
+ * Sidebar — the session list. One row per session across every host,
  * grouped by host and, within a host, by project (the git toplevel,
  * or the directory outside a repo — see sidebarGroups.ts); the inbox
  * as a single row above. Nothing else.
@@ -11,21 +11,19 @@
 import { useMemo, useState } from 'react'
 import { commands } from '@lib/ipc'
 import {
-  notificationWindowIds,
-  selectedPane,
+  notificationSessionIds,
   sortById,
   useStore,
   type HostSessions,
-  type TmuxWindow,
-  type TmuxWorkspace,
+  type Session,
 } from '@lib/store'
-import { activateAndConnectHost, selectWindow } from '@lib/host'
+import { activateAndConnectHost, selectSession } from '@lib/host'
 import { displayedHostStatus } from '@lib/host-status'
 import { homeRelative } from '@lib/path'
 import { groupRows } from '@lib/session/sidebarGroups'
-import { getPaneBlocks, lastFinished, useHostBlockLoadRevision } from '@lib/session/blocks'
-import { agentPromptOf, commandName, isAgentCommand, type PaneKind } from '@lib/session/paneState'
-import { killWindow, openSession } from '@lib/actions/window'
+import { getSessionBlocks, lastFinished, useHostBlockLoadRevision } from '@lib/session/blocks'
+import { agentPromptOf, commandName, isAgentCommand, type SessionKind } from '@lib/session/sessionState'
+import { killSession, openSession } from '@lib/actions/session'
 import { ContextMenu, type ContextMenuItem } from '@ui'
 import { InboxSection } from '@features/activity-feed/InboxSection'
 import type { Host, HostId } from '@bindings'
@@ -153,7 +151,7 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
   const status = useStore((s) => s.statuses.get(host.id) ?? 'disconnected')
   const activeHostId = useStore((s) => s.activeHostId)
   const notifications = useStore((s) => s.notifications)
-  const runningPanes = useStore((s) => s.runningPanes)
+  const runningSessions = useStore((s) => s.runningSessions)
   const blockLoadRevision = useHostBlockLoadRevision(host.id)
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
 
@@ -161,16 +159,15 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
   const connected = displayed === 'connected'
   const isActiveHost = activeHostId === host.id
 
-  const isSelectedRow = (r: Row) =>
-    isActiveHost && hs?.activeWorkspaceId === r.workspace.id && r.window.active
+  const isSelectedRow = (r: Row) => isActiveHost && hs?.activeSessionId === r.session.id
 
   const rows = useMemo(
-    () => buildRows(host.id, hs, runningPanes),
-    [host.id, hs, runningPanes, blockLoadRevision],
+    () => buildRows(host.id, hs, runningSessions),
+    [host.id, hs, runningSessions, blockLoadRevision],
   )
-  const unreadWindowIds = useMemo(
-    () => notificationWindowIds(notifications, hs, host.id),
-    [notifications, hs, host.id],
+  const unreadSessionIds = useMemo(
+    () => notificationSessionIds(notifications, host.id),
+    [notifications, host.id],
   )
   const groups = useMemo(() => {
     const all = groupRows(rows)
@@ -315,11 +312,11 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
               detail={r.detail}
               dir={r.dir}
               branch={r.branch}
-              unread={unreadWindowIds.has(r.window.id)}
+              unread={unreadSessionIds.has(r.session.id)}
               selected={isSelectedRow(r)}
-              onClick={() => selectWindow(host.id, r.workspace.id, r.window.id)}
-              onRename={(name) => void commands.windowRename(host.id, r.window.id, name)}
-              onKill={() => killWindow(host.id, r.workspace.id, r.window)}
+              onClick={() => selectSession(host.id, r.session.id)}
+              onRename={(name) => void commands.sessionRename(host.id, r.session.id, name)}
+              onKill={() => killSession(host.id, r.session)}
             />
           ))}
         </div>
@@ -334,9 +331,8 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
 
 interface Row {
   key: string
-  workspace: TmuxWorkspace
-  window: TmuxWindow
-  kind: PaneKind
+  session: Session
+  kind: SessionKind
   running: boolean
   /** Line one: the command (running or last), agent prompt, or name. */
   title: string
@@ -351,58 +347,52 @@ interface Row {
   cwd: string
 }
 
-/** The default, un-renamed window name (a shell program or a number). */
-const DEFAULT_NAME = /^(zsh|bash|fish|sh|-?\w*sh|\d+|window \d+)$/i
+/** The default, un-renamed session name (a shell program or a number). */
+const DEFAULT_NAME = /^(zsh|bash|fish|sh|-?\w*sh|\d+|session \d+)$/i
 
-/** Every window on the host in a stable order: workspaces by name,
- * then windows by id (creation order) — grouping by project happens
- * on top of this and never reorders it. Labels come from what the
- * pane is doing — the running command, the agent's prompt — and where
+/** Every session on the host in creation order. Grouping by project
+ * happens on top of this and never reorders it. Labels come from what
+ * the session is doing — the running command, the agent's prompt — and where
  * it is *within its project*, since the group header already says
  * which project. */
 function buildRows(
   hostId: HostId,
   hs: HostSessions | undefined,
-  runningPanes: Map<string, { hostId: HostId; startedAt: number; command: string | null }>,
+  runningSessions: Map<string, { hostId: HostId; startedAt: number; command: string | null }>,
 ): Row[] {
   if (!hs) return []
   const out: Row[] = []
-  const workspaces = [...hs.workspaces.values()].sort((a, b) => a.name.localeCompare(b.name))
-  for (const ws of workspaces) {
-    for (const win of sortById(ws.windows.values())) {
-      const pane = selectedPane(ws, win.id)
-      const run = pane ? runningPanes.get(`${hostId}::${pane.id}`) : undefined
-      const program = run ? commandName(run.command) : pane?.command || null
-      const kind: PaneKind = isAgentCommand(program) ? 'agent' : 'shell'
-      const root = pane?.root ?? ''
-      const cwd = pane?.cwd ?? ''
+  for (const session of sortById(hs.sessions.values())) {
+      const run = runningSessions.get(`${hostId}::${session.id}`)
+      const program = run ? commandName(run.command) : session.command || null
+      const kind: SessionKind = isAgentCommand(program) ? 'agent' : 'shell'
+      const root = session.root
+      const cwd = session.cwd
       // The working directory isn't on the card — it's the hover tooltip.
       const dir = homeRelative(cwd)
-      const renamed = !DEFAULT_NAME.test(win.name)
+      const renamed = !DEFAULT_NAME.test(session.name)
 
-      const last = !run && pane ? lastFinished(getPaneBlocks(hostId, pane.id).blocks)?.cmdline : null
+      const last = !run ? lastFinished(getSessionBlocks(hostId, session.id).blocks)?.cmdline : null
       const detail =
         kind === 'agent'
           ? agentPromptOf(run?.command) || program || 'agent'
-          : run?.command?.trim() || last?.trim() || program || win.name
-      const title = renamed ? win.name : detail
+          : run?.command?.trim() || last?.trim() || program || session.name
+      const title = renamed ? session.name : detail
 
       out.push({
-        key: `${ws.id}:${win.id}`,
-        workspace: ws,
-        window: win,
+        key: session.id,
+        session,
         kind,
-        // An agent pane is always live; a shell is running when a command
+        // An agent session is always live; a shell is running when a command
         // is in flight. The command's brightness follows this.
         running: kind === 'agent' || !!run,
         title,
         detail,
         dir,
-        branch: pane?.branch ?? '',
+        branch: session.branch,
         root,
         cwd,
       })
-    }
   }
   return out
 }

@@ -1,7 +1,7 @@
 /**
  * Theme picker — one parent action ("Theme") that drills into a list of
  * the bundled palettes. Selecting a row swaps the active theme via the
- * store; xterm and the pane chrome both subscribe to `themeName` and
+ * store; xterm and the session chrome both subscribe to `themeName` and
  * live-update without a remount.
  */
 

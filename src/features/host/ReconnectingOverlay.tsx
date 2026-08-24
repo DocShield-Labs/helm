@@ -1,18 +1,14 @@
 /**
  * Reconnecting overlay.
  *
- * Renders a frosted card centered over the pane area while the Rust
- * supervisor is running its backoff ladder. The TmuxPane underneath
+ * Renders a frosted card centered over the session area while the Rust
+ * supervisor is running its backoff ladder. The selected session underneath
  * stays mounted with its last frozen frame, so when reconnect succeeds
  * the user picks up exactly where they left off — minus any output the
  * remote produced while the link was down (a `refetchTree` runs on the
  * `connected` transition, but xterm scrollback during the gap is gone).
  *
- * Surfaces for both remote (SSH transport drop) and localhost (tmux
- * server died and is being respawned). For local, the "transport" is
- * the local PTY hosting the `tmux -CC` client; the supervisor re-runs
- * `spawn_local` each attempt, which `exec`s `tmux -CC new-session -A`
- * and brings up a fresh server.
+ * Surfaces for remote SSH transport drops and local daemon restarts.
  */
 
 import type { Host } from '@bindings'
@@ -27,7 +23,7 @@ interface Props {
 export function ReconnectingOverlay({ host }: Props) {
   // The supervisor stamps each Reconnecting emit with its last connect
   // error so we can show *why* — most useful for the stuck-forever case
-  // (tmux not installed, binary missing) where the spinner alone is
+  // (daemon missing, binary unavailable) where the spinner alone is
   // misleading.
   const lastError = useStore((s) => s.hostErrors.get(host.id))
   return (
@@ -45,7 +41,7 @@ export function ReconnectingOverlay({ host }: Props) {
         </div>
         <p className="text-center text-[11px] text-text-tertiary">
           {host.port === 0
-            ? 'Local tmux is being respawned.'
+            ? 'The local session service is restarting.'
             : 'The transport dropped. Retrying with backoff.'}
         </p>
         {lastError && (
@@ -56,7 +52,7 @@ export function ReconnectingOverlay({ host }: Props) {
         <Button
           kind="secondary"
           onClick={() => {
-            void commands.hostConnect(host.id, null)
+            void commands.hostConnect(host.id)
           }}
         >
           Retry now

@@ -1,18 +1,18 @@
 /**
- * What a pane is doing right now, derived from its block table.
+ * What a session is doing right now, derived from its block table.
  *
  * The composer-as-input model hangs off this: the shell's own prompt
  * is never typed into — at a prompt the xterm is hidden and the
  * composer is the input; while a command runs the xterm shows its
  * output; TUIs take the grid. The markers come from the shell
  * integration (OSC 133 A = prompt, B = command accepted, D = done), so
- * a pane without integration degrades to a plain terminal (`raw`).
+ * a session without integration degrades to a plain terminal (`raw`).
  */
 
 import type { BlockInfo } from '@bindings'
-import type { PaneBlocks } from './blocks'
+import type { SessionBlocks } from './blocks'
 
-export type PanePhase =
+export type SessionPhase =
   /** Shell is at its prompt; the composer is the input. */
   | 'prompt'
   /** A command is running; the xterm shows it. */
@@ -22,11 +22,11 @@ export type PanePhase =
   /** No integration markers (yet) or the process exited: plain terminal. */
   | 'raw'
 
-export type PaneKind = 'shell' | 'agent'
+export type SessionKind = 'shell' | 'agent'
 
-export interface PaneState {
-  phase: PanePhase
-  kind: PaneKind
+export interface SessionState {
+  phase: SessionPhase
+  kind: SessionKind
   /** The in-flight block while `running`. */
   current: BlockInfo | null
 }
@@ -68,11 +68,11 @@ export function agentPromptOf(cmdline: string | null | undefined): string | null
   return text.startsWith('-') ? null : text || null
 }
 
-export function derivePaneState(pb: PaneBlocks, spawnedCommand: string | null): PaneState {
+export function deriveSessionState(pb: SessionBlocks, spawnedCommand: string | null): SessionState {
   const last = pb.blocks.length > 0 ? pb.blocks[pb.blocks.length - 1] : undefined
   const running = last && last.cmd_line !== null && last.end_line === null ? last : null
   const program = running ? commandName(running.cmdline) : spawnedCommand
-  const kind: PaneKind = isAgentCommand(program) ? 'agent' : 'shell'
+  const kind: SessionKind = isAgentCommand(program) ? 'agent' : 'shell'
   if (pb.altScreen) return { phase: 'alt', kind, current: running }
   if (!pb.loaded || pb.exited || !last) return { phase: 'raw', kind, current: null }
   if (last.end_line === null && last.cmd_line === null) {

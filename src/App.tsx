@@ -1,28 +1,9 @@
-/**
- * Phase 2 / multi-workspace landing.
- *
- * Boots the global event channel, lists hosts, picks localhost as the
- * active host, connects, and renders each host's workspaces in the
- * sidebar. Each host can have many workspaces; each workspace owns its
- * windows; one window in the active workspace renders its active pane
- * as a block list + live tail (BlockPane).
- *
- * Selection model (all in store.ts, purely frontend):
- *   - activeHostId            — which host's tree drives the sidebar
- *   - per-host activeWorkspaceId — within a host, which workspace's windows show
- *   - per-window / per-pane active flags
- */
+/** Boots hosts and renders the selected long-running session. */
 
 import { useEffect, useMemo, useState } from 'react'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { commands } from '@lib/ipc'
-import {
-  selectedPane,
-  sortById,
-  useStore,
-  type HostSessions,
-  type TmuxWorkspace,
-} from '@lib/store'
+import { useStore, type HostSessions } from '@lib/store'
 import { connectHost, deleteHost, subscribeHostEvents } from '@lib/host'
 import { useAppUpdate } from '@lib/updater'
 import { useGlobalKeymap } from '@lib/keymap-engine'
@@ -31,13 +12,13 @@ import {
   getTheme,
   setThemeForAllTerminals,
 } from '@lib/terminal'
-import { BlockPane } from '@features/shell/BlockPane'
+import { SessionView } from '@features/shell/SessionView'
 import { sendInput } from '@lib/session/screen'
 import { HostEditorModal } from '@features/host-editor/HostEditorModal'
 import { HostKeyPromptModal } from '@features/host-key/HostKeyPromptModal'
 import { IntegrationSuggestionHost } from '@features/activity-feed/IntegrationSuggestionHost'
 import { NotificationPeek } from '@features/activity-feed/NotificationPeek'
-import { ReconnectingOverlay } from '@features/workspace/ReconnectingOverlay'
+import { ReconnectingOverlay } from '@features/host/ReconnectingOverlay'
 import { PaletteHost } from '@features/palette/PaletteHost'
 import { ToastHost, ConfirmHost, TopBar } from '@ui'
 import { Sidebar } from '@features/sessions/Sidebar'
@@ -66,12 +47,8 @@ export function App() {
   // (or null for "add new").
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<Host | null>(null)
-  // Panes the user has activated at least once. Mounted BlockPane instances
-  // for these are kept alive across workspace/window switches — switching
-  // back to a previously-visited pane is instant because its xterm buffer
-  // still has all the prior content (and the subscription kept consuming
-  // live output while the pane was hidden).
-  const [mountedPaneKeys, setMountedPaneKeys] = useState<Set<string>>(new Set())
+  // Keep visited sessions mounted so switching preserves warm terminal buffers.
+  const [mountedSessionKeys, setMountedSessionKeys] = useState<Set<string>>(new Set())
   useEffect(() => {
     if (bootStarted) return
     bootStarted = true
@@ -91,19 +68,6 @@ export function App() {
 
         await connectHost(localId)
 
-        // Pre-connect every remote host that has a pin so the user's
-        // working set comes alive immediately on launch — no need to
-        // click each pin to wake it up. Fired in parallel; errors are
-        // silenced because a stuck remote shouldn't block boot, and
-        // the row will just resolve to "offline · click to connect"
-        // if the auto-connect fails.
-        const seen = new Set<string>([localId])
-        for (const pin of useStore.getState().pinnedWindows) {
-          if (seen.has(pin.hostId)) continue
-          seen.add(pin.hostId)
-          if (!useStore.getState().hosts.has(pin.hostId)) continue
-          void connectHost(pin.hostId).catch(() => {})
-        }
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e)
         setBootError(msg)
@@ -118,66 +82,34 @@ export function App() {
     ? sessions.get(activeHostId)
     : undefined
 
-  const activeWorkspace: TmuxWorkspace | undefined = useMemo(() => {
-    if (!activeHostSessions) return undefined
-    const id = activeHostSessions.activeWorkspaceId
-    if (!id) return undefined
-    return activeHostSessions.workspaces.get(id)
+  const activeSession = useMemo(() => {
+    if (!activeHostSessions?.activeSessionId) return undefined
+    return activeHostSessions.sessions.get(activeHostSessions.activeSessionId)
   }, [activeHostSessions])
 
-  // Stable order by id within a workspace.
-  const windowList = useMemo(
-    () => (activeWorkspace ? sortById(activeWorkspace.windows.values()) : []),
-    [activeWorkspace],
-  )
+  const activeSessionKey =
+    activeHostId && activeSession ? `${activeHostId}::${activeSession.id}` : null
 
-  const activeWindow = useMemo(
-    () => windowList.find((w) => w.active) ?? windowList[0],
-    [windowList],
-  )
-
-  const activePane = useMemo(() => {
-    if (!activeWorkspace || !activeWindow) return undefined
-    return selectedPane(activeWorkspace, activeWindow.id)
-  }, [activeWorkspace, activeWindow])
-
-  const activePaneKey =
-    activeHostId && activePane ? `${activeHostId}::${activePane.id}` : null
-
-  // Add the active pane's key to the mounted set the first time it
-  // appears. We never explicitly drop keys that fall out of "active";
-  // the GC effect below removes only keys whose underlying pane no
-  // longer exists in any workspace.
   useEffect(() => {
-    if (!activePaneKey) return
-    setMountedPaneKeys((prev) => {
-      if (prev.has(activePaneKey)) return prev
+    if (!activeSessionKey) return
+    setMountedSessionKeys((prev) => {
+      if (prev.has(activeSessionKey)) return prev
       const next = new Set(prev)
-      next.add(activePaneKey)
+      next.add(activeSessionKey)
       return next
     })
-  }, [activePaneKey])
+  }, [activeSessionKey])
 
-  // Garbage-collect mounted panes whose pane id no longer exists
-  // (workspace killed, window closed, host removed, etc.). Without this
-  // we'd leak xterm instances every time the user kills something.
+  // Drop terminal instances after their underlying session disappears.
   useEffect(() => {
-    setMountedPaneKeys((prev) => {
+    setMountedSessionKeys((prev) => {
       const next = new Set<string>()
       for (const key of prev) {
         const sep = key.indexOf('::')
         const hostId = key.slice(0, sep)
-        const paneId = key.slice(sep + 2)
+        const sessionId = key.slice(sep + 2)
         const hs = sessions.get(hostId)
-        if (!hs) continue
-        let stillThere = false
-        for (const ws of hs.workspaces.values()) {
-          if (ws.panes.has(paneId)) {
-            stillThere = true
-            break
-          }
-        }
-        if (stillThere) next.add(key)
+        if (hs?.sessions.has(sessionId)) next.add(key)
       }
       return next.size === prev.size ? prev : next
     })
@@ -202,23 +134,22 @@ export function App() {
     setThemeForAllTerminals(theme)
   }, [themeName, previewThemeName])
 
-  // ---------- active-window focus reporting ----------
-  // Tell the backend which (host, window) the user is looking at, so
+  // ---------- active-session focus reporting ----------
+  // Tell the backend which session the user is looking at, so
   // its notifications post-processor can suppress inbox rows for that
-  // window. Updates whenever the active host or active window changes,
-  // and clears when the helm window itself loses OS focus or is
-  // minimized — backgrounded windows then start collecting inbox rows
+  // session. Updates whenever the active host or session changes, and
+  // clears when the Helm window itself loses OS focus or is minimized.
   // normally.
   useEffect(() => {
     const push = () => {
       // Treat a hidden helm as "no focus" so notifications resume for
-      // every window while the user is in another app. visibilitychange
+      // every session while the user is in another app. visibilitychange
       // covers the macOS Cmd+H / minimize / different-desktop cases.
-      if (document.hidden || !activeHostId || !activeWindow) {
+      if (document.hidden || !activeHostId || !activeSession) {
         void commands.setFocus(null, null)
         return
       }
-      void commands.setFocus(activeHostId, activeWindow.id)
+      void commands.setFocus(activeHostId, activeSession.id)
     }
     push()
     const onVis = () => push()
@@ -230,12 +161,12 @@ export function App() {
       window.removeEventListener('blur', onVis)
       window.removeEventListener('focus', onVis)
     }
-  }, [activeHostId, activeWindow])
+  }, [activeHostId, activeSession])
 
-  // ---------- file drag-and-drop → active pane ----------
+  // ---------- file drag-and-drop → active session ----------
   // Tauri's WebView swallows native HTML5 drop events and re-emits them
   // as `tauri://drag-drop` carrying real filesystem paths. Type each
-  // dropped path into the active pane via the same `session_input`
+  // dropped path into the active session via the same `session_input`
   // path as a keystroke, with iTerm2-style backslash escaping so a
   // shell or a TUI like Claude Code both receive it as if typed.
   //
@@ -243,9 +174,9 @@ export function App() {
   // (xterm's hidden helper textarea is the active element then). Other
   // text inputs (host editor, palette) suppress the drop.
   useEffect(() => {
-    if (!activeHostId || !activePane) return
+    if (!activeHostId || !activeSession) return
     const hostId = activeHostId
-    const paneId = activePane.id
+    const sessionId = activeSession.id
 
     let unlisten: (() => void) | undefined
     let cancelled = false
@@ -258,7 +189,7 @@ export function App() {
         const active = document.activeElement as HTMLElement | null
         // The composer is the input at a prompt: insert there (as a
         // native edit, so React sees it). Other text fields swallow
-        // the drop rather than typing into a hidden pane.
+        // the drop rather than typing into a hidden session.
         if (active?.classList.contains('helm-composer-editor')) {
           document.execCommand('insertText', false, text)
           return
@@ -272,7 +203,7 @@ export function App() {
         ) {
           return
         }
-        void sendInput(hostId, paneId, text)
+        void sendInput(hostId, sessionId, text)
       })
       if (cancelled) {
         fn()
@@ -285,15 +216,15 @@ export function App() {
       cancelled = true
       unlisten?.()
     }
-  }, [activeHostId, activePane])
+  }, [activeHostId, activeSession])
 
   // Self-update: non-null when a newer signed release is available.
   const appUpdate = useAppUpdate()
 
-  const title = [activeHost?.name, activeWindow?.name].filter(Boolean).join(' — ')
+  const title = [activeHost?.name, activeSession?.name].filter(Boolean).join(' — ')
 
   return (
-    // Column: the top bar spans the full window; the sidebar and pane
+    // Column: the top bar spans the full window; the sidebar and session
     // area share the row beneath it.
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-text-primary">
       <TopBar title={title} update={appUpdate} />
@@ -311,31 +242,31 @@ export function App() {
         />
 
         <main className="relative flex min-w-0 flex-1 overflow-hidden">
-          {/* Keep-alive pane stack: one BlockPane per pane the user has
-              ever visited; only the active one is visible. Hidden panes
+          {/* Keep-alive session stack: one terminal per session the user has
+              ever visited; only the active one is visible. Hidden sessions
               continue to receive live output and keep their xterm
               buffer warm, so switching back is instant. */}
-          {[...mountedPaneKeys].map((key) => {
+          {[...mountedSessionKeys].map((key) => {
             const sep = key.indexOf('::')
             const hostId = key.slice(0, sep)
-            const paneId = key.slice(sep + 2)
-            const isVisible = key === activePaneKey
+            const sessionId = key.slice(sep + 2)
+            const isVisible = key === activeSessionKey
             return (
               <div
                 key={key}
                 className="absolute inset-0 flex"
-                // `display: none` on hidden panes stops the browser from
+                // `display: none` on hidden sessions stops the browser from
                 // laying them out (and stops their ResizeObserver from
                 // firing spurious resizes); the xterm + subscription
                 // keep working in memory.
                 style={{ display: isVisible ? 'flex' : 'none' }}
               >
-                <BlockPane hostId={hostId} paneId={paneId} isVisible={isVisible} />
+                <SessionView hostId={hostId} sessionId={sessionId} isVisible={isVisible} />
               </div>
             )
           })}
-          {!activePaneKey && (
-            <PaneEmptyState
+          {!activeSessionKey && (
+            <SessionEmptyState
               bootError={bootError}
               hostError={activeHostId ? hostErrors.get(activeHostId) ?? null : null}
               status={activeStatus}
@@ -376,21 +307,21 @@ function escapeShellPath(p: string): string {
   return p.replace(/([ '"\\$`!*?(){}[\]<>;&|#~])/g, '\\$1')
 }
 
-/** Message for a reachable host without an active pane. */
+/** Message for a reachable host without an active session. */
 function emptyStateText(hs: HostSessions | undefined): string {
   if (!hs) return 'Opening session…'
-  if (hs.workspaces.size === 0) return 'No sessions yet.'
-  if (!hs.activeWorkspaceId) return 'Select a session from the sidebar.'
+  if (hs.sessions.size === 0) return 'No sessions yet.'
+  if (!hs.activeSessionId) return 'Select a session from the sidebar.'
   return 'Opening session…'
 }
 
-/** Centered empty state for the pane area when no pane is active.
+/** Centered empty state for the session area when no session is active.
  * Surfaces boot/host errors prominently (red, no hints) so a stuck
  * localhost reads "error · tmux not found" instead of an upbeat prompt
  * that hides the real failure. For benign "nothing here yet" states it
  * adds a quiet row of keyboard hints so a first-run user knows where to
  * start. */
-function PaneEmptyState({
+function SessionEmptyState({
   bootError,
   hostError,
   status,

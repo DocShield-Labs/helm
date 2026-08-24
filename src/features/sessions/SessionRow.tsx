@@ -4,10 +4,10 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ContextMenu, type ContextMenuItem } from '@ui'
 import { BranchIcon, FolderIcon, SparkIcon, TerminalIcon, XIcon } from './icons'
-import type { PaneKind } from '@lib/session/paneState'
+import type { SessionKind } from '@lib/session/sessionState'
 
 export interface SessionRowProps {
-  kind: PaneKind
+  kind: SessionKind
   running: boolean
   /** The command (running or last), agent prompt, or name. */
   title: string
