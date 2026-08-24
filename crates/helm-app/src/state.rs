@@ -40,6 +40,7 @@ pub struct SessionHandle {
     /// `Created` / `SearchResults` here instead of the event channel
     /// when a waiter is registered.
     pub pending: Arc<DashMap<u64, oneshot::Sender<helm_proto::DaemonMsg>>>,
+    pub capabilities: Arc<parking_lot::RwLock<DaemonCapabilities>>,
     next_req: AtomicU64,
 }
 
@@ -49,12 +50,14 @@ impl SessionHandle {
         pump: AbortHandle,
         tree: Arc<parking_lot::Mutex<helm_proto::TreeSnapshot>>,
         pending: Arc<DashMap<u64, oneshot::Sender<helm_proto::DaemonMsg>>>,
+        capabilities: Arc<parking_lot::RwLock<DaemonCapabilities>>,
     ) -> Self {
         Self {
             client,
             pump,
             tree,
             pending,
+            capabilities,
             next_req: AtomicU64::new(1),
         }
     }
@@ -88,6 +91,12 @@ impl SessionHandle {
             }
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct DaemonCapabilities {
+    pub compatibility_baseline: Option<u32>,
+    pub extensions: std::collections::HashSet<String>,
 }
 
 /// How long request/reply commands wait on the daemon.

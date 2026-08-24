@@ -54,6 +54,21 @@ async fn typed_client_lifecycle() {
     assert!(conn.state.sessions.is_empty());
     assert!(conn.pending.is_empty());
 
+    recv_until(&mut conn.events, 5, |message| match message {
+        DaemonMsg::Capabilities {
+            compatibility_baseline,
+            extensions,
+        } => {
+            assert_eq!(*compatibility_baseline, helm_proto::COMPATIBILITY_BASELINE);
+            assert!(extensions
+                .iter()
+                .any(|name| name == helm_proto::extensions::DRAIN));
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
     let client = &conn.client;
     client.attach().unwrap();
     client
@@ -129,6 +144,30 @@ async fn typed_client_lifecycle() {
             session: id,
             ..
         } if *id == session => Some(()),
+        _ => None,
+    })
+    .await;
+
+    client
+        .extension(Some(5), helm_proto::extensions::DRAIN.into(), Vec::new())
+        .unwrap();
+    recv_until(&mut conn.events, 5, |message| match message {
+        DaemonMsg::Extension {
+            req_id: Some(5),
+            name,
+            ..
+        } if name == helm_proto::extensions::DRAIN => Some(()),
+        _ => None,
+    })
+    .await;
+
+    client.new_session(6, None, None, None).unwrap();
+    recv_until(&mut conn.events, 5, |message| match message {
+        DaemonMsg::Error {
+            req_id: Some(6),
+            context,
+            message,
+        } if context == "new_session" && message.contains("draining") => Some(()),
         _ => None,
     })
     .await;

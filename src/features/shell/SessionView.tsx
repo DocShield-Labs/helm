@@ -85,6 +85,7 @@ interface ScrollAnchor {
 }
 
 export function SessionView({ hostId, sessionId, isVisible = true }: SessionViewProps) {
+  const rootRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const sentinelRef = useRef<HTMLDivElement>(null)
@@ -100,6 +101,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   const [helmTerm, setHelmTerm] = useState<HelmTerminal | null>(null)
   const [ready, setReady] = useState(false)
   const [slotHeight, setSlotHeight] = useState(0)
+  const [paneHeight, setPaneHeight] = useState(0)
   const [searchOpen, setSearchOpen] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
   const [focusKey, setFocusKey] = useState(0)
@@ -143,11 +145,15 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       fitRafRef.current = 0
       const t = termRef.current
       if (!t || !visibleRef.current || !shownRef.current) return
-      try {
-        t.fit.fit()
-      } catch {
-        /* not laid out yet */
-      }
+      const dimensions = t.fit.proposeDimensions()
+      if (!dimensions || (dimensions.cols === t.term.cols && dimensions.rows === t.term.rows)) return
+      painterRef.current?.resizeAndRepaint(() => {
+        try {
+          t.fit.fit()
+        } catch {
+          /* not laid out yet */
+        }
+      })
     })
   }, [])
   useEffect(() => () => cancelAnimationFrame(fitRafRef.current), [])
@@ -186,8 +192,12 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   const liveEndRow = meta.alt ? meta.rows : Math.max(usedRows, liveStartRow + 1)
   /** First absolute line the grid shows; DOM renders lines below it. */
   const gridFrom = xtermShown ? meta.topLine + liveStartRow : Infinity
-  /** The xterm is always viewport-sized: that is the grid. */
-  const hostHeight = Math.max(0, slotHeight - BODY_PAD_TOP)
+  // Helm's agent composer is an overlay on the terminal model, not part
+  // of its PTY geometry. Keep the grid at the full pane height while the
+  // composer grows; the scroll viewport clips more of it instead of
+  // delivering SIGWINCH and making the TUI redraw on every newline.
+  const agentGridHeight = ps.kind === 'agent' && mode === 'agent' ? paneHeight : slotHeight
+  const hostHeight = Math.max(0, agentGridHeight - BODY_PAD_TOP)
   const liveHeight = Math.min(hostHeight, (liveEndRow - liveStartRow) * cellH)
   const copyRunning = () =>
     void navigator.clipboard.writeText(
@@ -276,15 +286,15 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   }, [])
 
   // ---- sizing, and following the bottom ----
-  // The xterm is sized to the scroll viewport. Whenever the viewport
-  // or its content changes size — a block lands, the band grows, the
-  // composer shows or hides, fonts settle — stay pinned to the bottom
-  // unless the user has scrolled up. Observing sizes (not React state)
-  // means no growth can slip past without a re-pin.
+  // Terminal mode follows the scroll viewport; Agent mode uses the full
+  // pane so composer growth clips rather than resizes the PTY. Whenever
+  // either geometry or the content changes, stay pinned to the bottom
+  // unless the user has scrolled up.
   useEffect(() => {
     const sc = scrollRef.current
     const content = contentRef.current
-    if (!sc || !content) return
+    const root = rootRef.current
+    if (!sc || !content || !root) return
     const pin = () => {
       if (atBottomRef.current && visibleRef.current) scrollToBottom(sc)
     }
@@ -296,12 +306,19 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       pin()
     })
     const body = new ResizeObserver(pin)
+    const pane = new ResizeObserver((entries) => {
+      setPaneHeight(Math.floor(entries[0]?.contentRect.height ?? 0))
+      scheduleFit()
+    })
     viewport.observe(sc)
     body.observe(content)
+    pane.observe(root)
     setSlotHeight(Math.floor(sc.getBoundingClientRect().height))
+    setPaneHeight(Math.floor(root.getBoundingClientRect().height))
     return () => {
       viewport.disconnect()
       body.disconnect()
+      pane.disconnect()
     }
   }, [scheduleFit])
 
@@ -310,7 +327,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   // hiding, alt-screen toggling. The live resize above covers dragging.
   useEffect(() => {
     if (ready && xtermShown && isVisible) scheduleFit()
-  }, [ready, xtermShown, meta.alt, isVisible, scheduleFit])
+  }, [ready, xtermShown, composerShown, meta.alt, hostHeight, isVisible, scheduleFit])
 
   // ---- history paging: the sentinel at the top pulls older rows ----
   useEffect(() => {
@@ -476,7 +493,10 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   }
 
   return (
-    <div className="relative flex h-full w-full flex-col overflow-hidden bg-[var(--terminal-bg)]">
+    <div
+      ref={rootRef}
+      className="relative flex h-full w-full flex-col overflow-hidden bg-[var(--terminal-bg)]"
+    >
       <div
         ref={scrollRef}
         onScroll={onScroll}
@@ -521,8 +541,8 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
               {ready && xtermShown && !meta.alt && bodyFrom < gridFrom && (
                 <RowsView hostId={hostId} sessionId={sessionId} from={bodyFrom} to={gridFrom} />
               )}
-              {/* The band: the viewport-sized xterm, clipped by sliding
-                  it up to the running command's first row. `clip`, not
+              {/* The band: xterm clipped by sliding it up to the running
+                  command's first row. `clip`, not
                   `hidden`: a clipped box can't be scrolled by anything
                   (a focus, a caret move), so the band shows exactly the
                   rows it's sized for. */}

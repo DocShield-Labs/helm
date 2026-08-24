@@ -201,13 +201,19 @@ impl Session {
     /// The model resizes with the PTY so its reflow matches what the
     /// application will redraw into.
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Hold the model lock across the ioctl. TIOCSWINSZ delivers
+        // SIGWINCH immediately; without this guard the reader thread can
+        // parse the application's redraw against the old grid dimensions
+        // before `screen.resize` runs.
+        let mut screen = self.screen.lock();
         self.master.lock().resize(PtySize {
             rows: rows.max(2),
             cols: cols.max(2),
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        self.screen.lock().resize(cols, rows);
+        screen.resize(cols, rows);
+        drop(screen);
         let mut meta = self.meta.lock();
         meta.cols = cols;
         meta.rows = rows;

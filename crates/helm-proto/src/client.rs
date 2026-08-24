@@ -53,6 +53,7 @@ pub struct Connected {
     pub pending: Vec<Notification>,
 }
 
+#[derive(Clone)]
 pub struct HelmdClient {
     tx: UnboundedSender<ClientMsg>,
 }
@@ -73,7 +74,7 @@ pub fn connect_io(
     // Handshake, synchronously, before any pump threads exist.
     let hello = encode_frame(&ClientMsg::Hello {
         protocol_version: PROTOCOL_VERSION,
-        client_name: client_name.to_string(),
+        client_name: format!("{client_name}{}", crate::CAPABILITIES_MARKER),
     })?;
     writer.write_all(&hello)?;
     writer.flush()?;
@@ -301,5 +302,20 @@ impl HelmdClient {
     }
     pub fn ack_notifications(&self, up_to: NotificationId) -> Result<(), ClientError> {
         self.send(ClientMsg::AckNotifications { up_to })
+    }
+    pub fn shutdown(&self) -> Result<(), ClientError> {
+        self.send(ClientMsg::Shutdown)
+    }
+    pub fn extension(
+        &self,
+        req_id: Option<u64>,
+        name: String,
+        payload: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::Extension {
+            req_id,
+            name,
+            payload,
+        })
     }
 }

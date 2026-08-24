@@ -30,12 +30,13 @@ use helm_domain::{
 use helm_proto::client::{connect_io, connect_or_spawn_unix, ClientError, Connected};
 use helm_proto::{DaemonMsg, TreeSnapshot};
 use helm_ssh::{HostKeyPrompter, SshAuth, SshTarget};
+use semver::Version;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::commands::emit_event;
 use crate::integration;
 use crate::notifications;
-use crate::state::{NotificationsCtx, SessionHandle, SharedHostEntry};
+use crate::state::{DaemonCapabilities, NotificationsCtx, SessionHandle, SharedHostEntry};
 
 /// All connect logic past the State<'_> prelude. One-shot from the
 /// user's view: if the initial connect fails, the host stays in `Error`
@@ -161,6 +162,7 @@ async fn install_session(
         state,
         pending,
     } = connected;
+    let retire_when_empty = should_retire_daemon(&daemon_version);
     tracing::info!("connected to helmd {daemon_version} on {host_id:?}");
 
     // Prime the breadcrumb index from the initial snapshot, then fold
@@ -172,6 +174,7 @@ async fn install_session(
     }
     let tree = Arc::new(parking_lot::Mutex::new(state));
     let pending_reqs: Arc<DashMap<u64, oneshot::Sender<DaemonMsg>>> = Arc::new(DashMap::new());
+    let capabilities = Arc::new(parking_lot::RwLock::new(DaemonCapabilities::default()));
 
     let (dead_tx, dead_rx) = mpsc::unbounded_channel::<()>();
     let pump = tokio::spawn(pump(
@@ -181,6 +184,8 @@ async fn install_session(
         events,
         tree.clone(),
         pending_reqs.clone(),
+        capabilities.clone(),
+        retire_when_empty.then(|| client.clone()),
         event_tx.clone(),
         notif_ctx.clone(),
         dead_tx,
@@ -191,6 +196,7 @@ async fn install_session(
         pump.abort_handle(),
         tree,
         pending_reqs,
+        capabilities,
     ));
 
     // We've shown the offline notifications; let the daemon drop them.
@@ -201,15 +207,28 @@ async fn install_session(
     }
     let _ = session.client.attach();
 
-    // A fresh daemon gets one shell session. Await the reply so the
-    // first tree the frontend renders
-    // already has it (the pump's TreeChanged updates `tree`).
+    // A fresh daemon gets one shell session before the initial tree is
+    // emitted. An older compatible daemon first gets a brief opportunity
+    // to advertise atomic drain support; if it does, retire it before
+    // bootstrapping so reconnect launches the binary already on disk.
     if session.tree.lock().sessions.is_empty() {
-        if let Err(e) = session
-            .request(|id| session.client.new_session(id, None, None, None))
-            .await
+        if retire_when_empty {
+            for _ in 0..10 {
+                if session.capabilities.read().compatibility_baseline.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        if !retire_when_empty
+            || !request_retirement_if_empty(&session.client, &session.tree, &session.capabilities)
         {
-            tracing::warn!("bootstrap session on {host_id:?}: {e}");
+            if let Err(e) = session
+                .request(|id| session.client.new_session(id, None, None, None))
+                .await
+            {
+                tracing::warn!("bootstrap session on {host_id:?}: {e}");
+            }
         }
     }
 
@@ -241,6 +260,8 @@ async fn pump(
     mut events: mpsc::UnboundedReceiver<DaemonMsg>,
     tree: Arc<parking_lot::Mutex<TreeSnapshot>>,
     pending: Arc<DashMap<u64, oneshot::Sender<DaemonMsg>>>,
+    capabilities: Arc<parking_lot::RwLock<DaemonCapabilities>>,
+    retiring_client: Option<helm_proto::client::HelmdClient>,
     event_tx: Option<mpsc::UnboundedSender<HostEvent>>,
     notif_ctx: NotificationsCtx,
     dead_tx: mpsc::UnboundedSender<()>,
@@ -328,6 +349,9 @@ async fn pump(
                 emit(SessionEvent::Tree {
                     tree: to_domain_tree(&state),
                 });
+                if let Some(client) = &retiring_client {
+                    request_retirement_if_empty(client, &tree, &capabilities);
+                }
             }
             DaemonMsg::SessionExited { session, status } => {
                 emit(SessionEvent::SessionExited {
@@ -352,6 +376,23 @@ async fn pump(
             }
             DaemonMsg::HelloAck { .. } => {
                 tracing::debug!("unexpected HelloAck mid-stream on {host_id:?}");
+            }
+            DaemonMsg::Capabilities {
+                compatibility_baseline,
+                extensions,
+            } => {
+                let mut negotiated = capabilities.write();
+                negotiated.compatibility_baseline = Some(compatibility_baseline);
+                negotiated.extensions = extensions.iter().cloned().collect();
+                tracing::debug!(
+                    compatibility_baseline,
+                    ?extensions,
+                    "helmd capabilities on {host_id:?}"
+                );
+                drop(negotiated);
+                if let Some(client) = &retiring_client {
+                    request_retirement_if_empty(client, &tree, &capabilities);
+                }
             }
             // Correlated replies go to whoever is waiting; an unclaimed reply means
             // the waiter already timed out.
@@ -682,8 +723,9 @@ async fn establish_remote(
 }
 
 /// Make sure the remote has our helmd at `~/.helm/bin/helmd` — right
-/// version and protocol. Uploads only when missing: replacing a binary
-/// behind a running daemon can destroy sessions owned by another build.
+/// version and protocol. The upload uses an atomic rename: a running daemon
+/// keeps its mapped executable and live sessions, while the next spawn gets
+/// the current binary.
 fn ensure_remote_helmd(session: &Arc<helm_ssh::SshSession>) -> Result<(), String> {
     let expected = format!(
         "helmd {} (proto {})",
@@ -767,11 +809,53 @@ fn should_upload_remote_helmd(
         return Ok(true);
     }
     if installed.contains(&format!("(proto {protocol_version})")) {
-        return Ok(false);
+        return match (helmd_version(installed), helmd_version(expected)) {
+            (Some(installed), Some(expected)) => Ok(installed < expected),
+            _ => Ok(false),
+        };
     }
     Err(format!(
         "remote has {installed}; this build requires {expected}. Existing sessions were left running — reconnect with the matching Helm build, or stop and remove the old helmd explicitly before retrying"
     ))
+}
+
+fn should_retire_daemon(daemon_version: &str) -> bool {
+    match (
+        Version::parse(daemon_version),
+        Version::parse(env!("CARGO_PKG_VERSION")),
+    ) {
+        (Ok(daemon), Ok(current)) => daemon < current,
+        _ => {
+            tracing::warn!(%daemon_version, "leaving daemon with unparseable version running");
+            false
+        }
+    }
+}
+
+fn helmd_version(version: &str) -> Option<Version> {
+    Version::parse(version.split_whitespace().nth(1)?).ok()
+}
+
+fn request_retirement_if_empty(
+    client: &helm_proto::client::HelmdClient,
+    tree: &parking_lot::Mutex<TreeSnapshot>,
+    capabilities: &parking_lot::RwLock<DaemonCapabilities>,
+) -> bool {
+    if !tree.lock().sessions.is_empty()
+        || !capabilities
+            .read()
+            .extensions
+            .contains(helm_proto::extensions::DRAIN)
+    {
+        return false;
+    }
+    match client.extension(None, helm_proto::extensions::DRAIN.into(), Vec::new()) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "failed to request empty daemon retirement");
+            false
+        }
+    }
 }
 
 /// `helmd --version` on the remote (empty string when not installed).
@@ -917,17 +1001,33 @@ mod tests {
     }
 
     #[test]
-    fn remote_binary_mismatches_are_never_replaced_automatically() {
+    fn remote_binary_updates_are_atomic_only_within_the_wire_baseline() {
         assert_eq!(
-            should_upload_remote_helmd("", "helmd 2 (proto 7)", 7),
+            should_upload_remote_helmd("", "helmd 0.2.7 (proto 7)", 7),
             Ok(true)
         );
         assert_eq!(
-            should_upload_remote_helmd("helmd 1 (proto 7)", "helmd 2 (proto 7)", 7),
+            should_upload_remote_helmd("helmd 0.2.6 (proto 7)", "helmd 0.2.7 (proto 7)", 7),
+            Ok(true)
+        );
+        assert_eq!(
+            should_upload_remote_helmd("helmd 0.2.7 (proto 7)", "helmd 0.2.7 (proto 7)", 7),
             Ok(false)
         );
-        let error =
-            should_upload_remote_helmd("helmd 1 (proto 6)", "helmd 2 (proto 7)", 7).unwrap_err();
+        assert_eq!(
+            should_upload_remote_helmd("helmd 0.2.8 (proto 7)", "helmd 0.2.7 (proto 7)", 7),
+            Ok(false)
+        );
+        let error = should_upload_remote_helmd("helmd 0.2.6 (proto 6)", "helmd 0.2.7 (proto 7)", 7)
+            .unwrap_err();
         assert!(error.contains("Existing sessions were left running"));
+    }
+
+    #[test]
+    fn daemon_retirement_is_monotonic() {
+        assert!(should_retire_daemon("0.0.1"));
+        assert!(!should_retire_daemon(env!("CARGO_PKG_VERSION")));
+        assert!(!should_retire_daemon("999.0.0"));
+        assert!(!should_retire_daemon("development"));
     }
 }

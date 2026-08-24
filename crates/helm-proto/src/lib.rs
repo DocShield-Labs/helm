@@ -19,16 +19,31 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[cfg(feature = "client")]
 pub mod client;
 
-/// Bump on any breaking change to the message types. The daemon refuses
-/// mismatched clients in `HelloAck` and the app responds by re-installing
-/// the daemon binary it shipped with.
+/// Evergreen wire baseline. Protocol 7 is never repurposed or removed:
+/// released variants stay at their existing indices and released fields
+/// keep their order and encoding. New operations may only be appended and
+/// must be capability-gated so a newer app can continue using an older
+/// daemon until its sessions drain.
 ///
-/// Frames are bincode, which tags enum variants by index, so after a
-/// bump the old daemon's `Error` rejection may decode on the new client
-/// as a different variant entirely. The app treats any non-`HelloAck`
-/// first message as a stale daemon for that reason — don't rely on the
-/// rejection text surviving a version gap.
+/// A genuinely incompatible redesign gets a parallel protocol module and
+/// socket; it does not mutate this contract. Clients retain the protocol-7
+/// adapter permanently, which lets an app skip any number of releases
+/// without abandoning sessions owned by a protocol-7 daemon.
 pub const PROTOCOL_VERSION: u32 = 7;
+
+/// Oldest daemon protocol every future Helm app must continue to support.
+pub const COMPATIBILITY_BASELINE: u32 = 7;
+
+/// Appended to `Hello.client_name` by clients that can decode the
+/// post-handshake capability frame. Kept in the protocol crate so the
+/// producer and daemon parser cannot drift independently.
+pub const CAPABILITIES_MARKER: &str = "; helm-capabilities=1";
+
+pub mod extensions {
+    /// Stop accepting new sessions and exit after the final existing
+    /// session ends. The empty payload is reserved for future options.
+    pub const DRAIN: &str = "helm.daemon.drain.v1";
+}
 
 /// Upper bound on a single frame. History pages are capped well below
 /// this; the cap exists so a corrupt length prefix fails fast instead
@@ -290,8 +305,16 @@ pub enum ClientMsg {
     AckNotifications {
         up_to: NotificationId,
     },
-    /// Orderly daemon shutdown (dev tooling; the app never sends this).
+    /// Orderly daemon shutdown for explicit dev tooling only.
     Shutdown,
+    /// Extensible request envelope. Only send names advertised by
+    /// `DaemonMsg::Capabilities`; protocol-7 daemons released before the
+    /// capability handshake do not know this variant.
+    Extension {
+        req_id: Option<u64>,
+        name: String,
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -412,6 +435,20 @@ pub enum DaemonMsg {
         context: String,
         message: String,
     },
+    /// Sent immediately after `HelloAck` only when the client's hello name
+    /// contains the capability marker. Old clients never receive a variant
+    /// they cannot decode; new clients learn which extensions are safe to use.
+    Capabilities {
+        compatibility_baseline: u32,
+        extensions: Vec<String>,
+    },
+    /// Extensible response or event envelope. Daemons only emit extension
+    /// names negotiated through `Capabilities`.
+    Extension {
+        req_id: Option<u64>,
+        name: String,
+        payload: Vec<u8>,
+    },
 }
 
 impl DaemonMsg {
@@ -426,7 +463,9 @@ impl DaemonMsg {
             | DaemonMsg::PathCompletions { req_id, .. }
             | DaemonMsg::History { req_id, .. }
             | DaemonMsg::Pong { req_id } => Some(*req_id),
-            DaemonMsg::Screen { req_id, .. } | DaemonMsg::Error { req_id, .. } => *req_id,
+            DaemonMsg::Screen { req_id, .. }
+            | DaemonMsg::Error { req_id, .. }
+            | DaemonMsg::Extension { req_id, .. } => *req_id,
             _ => None,
         }
     }
