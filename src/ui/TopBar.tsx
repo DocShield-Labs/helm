@@ -3,6 +3,7 @@
 import { useStore } from '@lib/store'
 import type { AvailableUpdate } from '@lib/updater'
 import { PanelLeftIcon, SearchIcon } from '@features/sessions/icons'
+import { TITLE_BAR_HEIGHT, TITLE_BAR_CONTENT_INSET } from '@bindings'
 
 export function TopBar({ title, update }: { title: string; update: AvailableUpdate | null }) {
   const collapsed = useStore((s) => s.sidebarCollapsed)
@@ -11,7 +12,11 @@ export function TopBar({ title, update }: { title: string; update: AvailableUpda
   return (
     <div
       data-tauri-drag-region
-      className="relative flex h-[35px] shrink-0 items-center gap-2 border-b border-[var(--stroke-default)] pl-[80px] pr-2"
+      // Both numbers are owned by the Rust side (titlebar.rs): it centres
+      // macOS's traffic lights on this bar's midline and reserves the room
+      // they need on the left. Changing them there moves both sides together.
+      style={{ height: TITLE_BAR_HEIGHT, paddingLeft: TITLE_BAR_CONTENT_INSET }}
+      className="relative flex shrink-0 items-center gap-2 border-b border-[var(--stroke-default)] pr-2"
     >
       <button
         type="button"

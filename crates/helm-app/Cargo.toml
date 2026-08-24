@@ -51,5 +51,11 @@ tauri-plugin-process = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
+# Pinned to the versions tao/wry already pull in, so we position the traffic
+# lights through the same objc2 bindings rather than forking the dep tree.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSOperation", "NSString", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSButton", "NSControl", "NSView", "NSResponder", "NSGraphics"] }
 security-framework.workspace = true
 system-configuration = "0.7.0"

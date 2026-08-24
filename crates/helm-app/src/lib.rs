@@ -12,6 +12,7 @@ mod persistence;
 mod power;
 mod reachability;
 mod state;
+mod titlebar;
 mod tool_integrations;
 
 use specta_typescript::{BigIntExportBehavior, Typescript};
@@ -58,6 +59,13 @@ fn specta_builder() -> Builder<tauri::Wry> {
             ]),
         )
         .constant("TRUECOLOR_FLAG", connection::TRUECOLOR_FLAG)
+        // The top bar's height is also where macOS's traffic lights get
+        // centred, so both sides read it from here.
+        .constant("TITLE_BAR_HEIGHT", titlebar::TITLE_BAR_HEIGHT)
+        .constant(
+            "TITLE_BAR_CONTENT_INSET",
+            titlebar::TITLE_BAR_CONTENT_INSET,
+        )
         .constant("MAX_HISTORY_PAGE", helm_proto::MAX_HISTORY_PAGE)
         .commands(collect_commands![
             commands::host::ping,
@@ -154,6 +162,13 @@ pub fn run() {
         .invoke_handler(specta.invoke_handler())
         .setup(move |app| {
             specta.mount_events(app);
+            // macOS only: take over the traffic lights from tauri.conf.json,
+            // which cannot hold their alignment across a screen change.
+            if let Some(window) = app.get_webview_window("main") {
+                titlebar::install(&window);
+            } else {
+                tracing::warn!("no `main` window at setup; traffic lights left to macOS");
+            }
             Ok(())
         })
         .manage(state::AppState::default())
