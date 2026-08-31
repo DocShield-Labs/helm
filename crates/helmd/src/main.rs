@@ -10,6 +10,10 @@
 
 use std::path::PathBuf;
 
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1))
+}
+
 fn socket_arg(args: &[String]) -> PathBuf {
     args.iter()
         .position(|a| a == "--socket")
@@ -38,10 +42,12 @@ fn main() -> anyhow::Result<()> {
                 .with_writer(std::io::stderr)
                 .init();
             let socket = socket_arg(&args);
+            let listener_fd = flag_value(&args, "--listener-fd").and_then(|v| v.parse().ok());
+            let resurrect = flag_value(&args, "--resurrect").map(PathBuf::from);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(helmd::server::serve(&socket))
+                .block_on(helmd::server::serve_with(&socket, listener_fd, resurrect))
         }
         Some("shutdown") => {
             let socket = socket_arg(&args);

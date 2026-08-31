@@ -68,6 +68,27 @@ pub struct Daemon {
     next_notification: AtomicU64,
     completion_slots: Arc<Semaphore>,
     shutdown: Notify,
+    /// Set by `serve`: the listener's raw fd and socket path, so a
+    /// self-exec upgrade can hand both to the next binary.
+    serve_context: Mutex<Option<(std::os::unix::io::RawFd, std::path::PathBuf)>>,
+}
+
+/// `~/x` → `$HOME/x` — remote clients name the uploaded binary by a
+/// path only this host can resolve.
+fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
+fn semver_triple(v: &str) -> (u32, u32, u32) {
+    let mut parts = v.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -91,6 +112,7 @@ impl Daemon {
             next_notification: AtomicU64::new(1),
             completion_slots: Arc::new(Semaphore::new(4)),
             shutdown: Notify::new(),
+            serve_context: Mutex::new(None),
         });
         (daemon, events_rx)
     }
@@ -289,6 +311,144 @@ impl Daemon {
             query,
             max_results.min(100) as usize,
         ))
+    }
+
+    pub fn set_serve_context(&self, fd: std::os::unix::io::RawFd, socket: std::path::PathBuf) {
+        *self.serve_context.lock() = Some((fd, socket));
+    }
+
+    /// Stage a self-exec upgrade: verify the new binary, write the
+    /// transactional snapshot, and return what the exec step needs.
+    /// Nothing destructive happens here — if any check fails the daemon
+    /// is untouched. `finish_upgrade` does the kill + exec.
+    pub fn prepare_upgrade(&self, bin_path: &str) -> Result<crate::resurrect::Snapshot, String> {
+        let bin_path = &expand_home(bin_path);
+        let out = std::process::Command::new(bin_path)
+            .arg("--version")
+            .output()
+            .map_err(|e| format!("cannot run {bin_path}: {e}"))?;
+        let banner = String::from_utf8_lossy(&out.stdout);
+        let new_version = banner
+            .strip_prefix("helmd ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .ok_or_else(|| format!("unrecognized --version output: {banner:?}"))?
+            .to_string();
+        let ours = env!("CARGO_PKG_VERSION");
+        if semver_triple(&new_version) < semver_triple(ours) {
+            return Err(format!("refusing downgrade: {new_version} < {ours}"));
+        }
+
+        let core = self.core.lock();
+        let mut ids: Vec<SessionId> = core.sessions.keys().copied().collect();
+        ids.sort();
+        let mut sessions = Vec::with_capacity(ids.len());
+        for id in ids {
+            let session = &core.sessions[&id];
+            let (start, mut rows) = session.screen.lock().snapshot_rows();
+            let meta = session.meta.lock();
+            let mut blocks = meta.blocks.clone();
+            let mut next_block_id = meta.next_block_id;
+            let cwd = meta.cwd.clone();
+            drop(meta);
+            // The seam: one dim row in its own block, so the restart is
+            // visible exactly where it happened.
+            let seam_line = start + rows.len() as u64;
+            rows.push(crate::resurrect::seam_row(&new_version));
+            blocks.push(helm_proto::BlockMeta {
+                id: helm_proto::BlockId(next_block_id),
+                start_line: seam_line,
+                cmd_line: None,
+                output_line: Some(seam_line),
+                end_line: Some(seam_line + 1),
+                cmdline: None,
+                cwd: cwd.clone(),
+                branch: None,
+                root: None,
+                exit_code: None,
+                started_at_ms: Some(now_ms()),
+                finished_at_ms: Some(now_ms()),
+            });
+            next_block_id += 1;
+            let (start, rows) = crate::resurrect::trim(start, rows);
+            sessions.push(crate::resurrect::SessionSnapshot {
+                name: session.name.lock().clone(),
+                cwd,
+                history_start: start,
+                rows,
+                blocks,
+                next_block_id,
+            });
+        }
+        Ok(crate::resurrect::Snapshot {
+            target_version: new_version,
+            sessions,
+        })
+    }
+
+    /// Kill every session and replace this process with the new binary.
+    /// Only returns on failure. The listener fd survives the exec, so
+    /// the socket never closes and no other spawner can race in.
+    pub fn finish_upgrade(&self, bin_path: &str, snapshot_path: &std::path::Path) -> String {
+        let bin_path = &expand_home(bin_path);
+        let Some((fd, socket)) = self.serve_context.lock().clone() else {
+            return "daemon has no serve context (not serving?)".into();
+        };
+        // NOT `core.draining`: drain's contract is exit-when-empty, and
+        // killing every session below would trigger that shutdown before
+        // the exec ran (the drain machinery would win the race). The
+        // brief window where a new session could be created is harmless:
+        // it dies with the exec like the rest, just without a snapshot.
+        let sessions: Vec<Arc<Session>> = {
+            let mut core = self.core.lock();
+            core.sessions.drain().map(|(_, s)| s).collect()
+        };
+        for session in &sessions {
+            session.kill();
+        }
+        // Grace for the wait threads to reap the children.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // The listener must survive the exec.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+        }
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(bin_path)
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--listener-fd")
+            .arg(fd.to_string())
+            .arg("--resurrect")
+            .arg(snapshot_path)
+            .exec();
+        format!("exec {bin_path}: {err}")
+    }
+
+    /// Recreate snapshotted sessions on a fresh daemon: a login shell in
+    /// each session's cwd, with the old scrollback seeded so absolute
+    /// line numbers (and the block table) continue where they left off.
+    pub fn resurrect(&self, snapshot: crate::resurrect::Snapshot) {
+        for snap in snapshot.sessions {
+            let id = match self.new_session(Some(snap.name.clone()), snap.cwd.clone(), None) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!("resurrect {:?}: {e}", snap.name);
+                    continue;
+                }
+            };
+            let core = self.core.lock();
+            if let Some(session) = core.sessions.get(&id) {
+                session.screen.lock().seed_history(snap.history_start, snap.rows);
+                let mut meta = session.meta.lock();
+                meta.blocks = snap.blocks;
+                meta.next_block_id = snap.next_block_id;
+            }
+        }
+        tracing::info!("resurrected sessions from snapshot (v{})", snapshot.target_version);
     }
 
     pub fn completion_permit(&self) -> Result<OwnedSemaphorePermit, String> {

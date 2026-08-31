@@ -24,22 +24,54 @@ pub fn default_socket_path() -> PathBuf {
 
 /// Run the daemon on `socket_path` until `Shutdown` (or forever).
 pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Stale socket handling: if something answers, another daemon owns
-    // it — refuse to double-run. If nothing answers, it's a leftover
-    // file from a crash; remove and rebind.
-    if socket_path.exists() {
-        match std::os::unix::net::UnixStream::connect(socket_path) {
-            Ok(_) => anyhow::bail!("another helmd already serves {}", socket_path.display()),
-            Err(_) => std::fs::remove_file(socket_path)?,
+    serve_with(socket_path, None, None).await
+}
+
+/// `serve`, optionally adopting a listener fd inherited across a
+/// self-exec upgrade (the socket never closed) and a resurrect
+/// snapshot to restore sessions from.
+pub async fn serve_with(
+    socket_path: &Path,
+    inherited_fd: Option<std::os::unix::io::RawFd>,
+    resurrect_path: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let listener = match inherited_fd {
+        Some(fd) => {
+            // Handed to us by the previous binary across exec.
+            let std_listener = unsafe {
+                <std::os::unix::net::UnixListener as std::os::unix::io::FromRawFd>::from_raw_fd(fd)
+            };
+            std_listener.set_nonblocking(true)?;
+            UnixListener::from_std(std_listener)?
         }
-    }
-    let listener = UnixListener::bind(socket_path)?;
+        None => {
+            if let Some(parent) = socket_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Stale socket handling: if something answers, another daemon owns
+            // it — refuse to double-run. If nothing answers, it's a leftover
+            // file from a crash; remove and rebind.
+            if socket_path.exists() {
+                match std::os::unix::net::UnixStream::connect(socket_path) {
+                    Ok(_) => anyhow::bail!("another helmd already serves {}", socket_path.display()),
+                    Err(_) => std::fs::remove_file(socket_path)?,
+                }
+            }
+            UnixListener::bind(socket_path)?
+        }
+    };
     tracing::info!(socket = %socket_path.display(), version = DAEMON_VERSION, "helmd listening");
 
     let (daemon, events_rx) = Daemon::new();
+    {
+        use std::os::unix::io::AsRawFd;
+        daemon.set_serve_context(listener.as_raw_fd(), socket_path.to_path_buf());
+    }
+    if let Some(path) = resurrect_path {
+        if let Some(snapshot) = crate::resurrect::take(&path) {
+            daemon.resurrect(snapshot);
+        }
+    }
     tokio::spawn(daemon.clone().run(events_rx));
 
     loop {
@@ -150,6 +182,7 @@ fn dispatch(
                         helm_proto::extensions::DRAIN.into(),
                         helm_proto::extensions::AGENT_COMMANDS.into(),
                         helm_proto::extensions::FILE_SEARCH.into(),
+                        helm_proto::extensions::UPGRADE.into(),
                     ],
                 });
             }
@@ -338,6 +371,42 @@ fn dispatch(
                             message,
                         }),
                     };
+                });
+            } else if name == helm_proto::extensions::UPGRADE {
+                use helm_proto::extensions::UpgradeRequest;
+                let req = match serde_json::from_slice::<UpgradeRequest>(&payload) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        err(req_id, "upgrade", format!("bad payload: {e}"));
+                        return;
+                    }
+                };
+                // Stage everything reversible first; only reply success
+                // once the snapshot is on disk, then kill + exec on a
+                // plain thread (exec never returns on success).
+                let snapshot = match daemon.prepare_upgrade(&req.bin_path) {
+                    Ok(snapshot) => snapshot,
+                    Err(message) => {
+                        err(req_id, "upgrade", message);
+                        return;
+                    }
+                };
+                let snapshot_path = crate::resurrect::default_path();
+                if let Err(message) = crate::resurrect::write(&snapshot_path, &snapshot) {
+                    err(req_id, "upgrade", message);
+                    return;
+                }
+                let _ = tx.send(DaemonMsg::Extension {
+                    req_id,
+                    name,
+                    payload: Vec::new(),
+                });
+                let daemon = daemon.clone();
+                std::thread::spawn(move || {
+                    // Let the ack frame flush before connections die.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let failure = daemon.finish_upgrade(&req.bin_path, &snapshot_path);
+                    tracing::error!("upgrade exec failed: {failure}");
                 });
             } else {
                 err(

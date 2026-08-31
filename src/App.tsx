@@ -221,6 +221,12 @@ export function App() {
 
   // Self-update: non-null when a newer signed release is available.
   const appUpdate = useAppUpdate()
+  // Daemon-upgrade consent lives in the frontend store; the Rust side
+  // acts on it at connect time. Push it once per launch and on change.
+  const daemonAutoUpgrade = useStore((s) => s.daemonAutoUpgrade)
+  useEffect(() => {
+    void commands.setDaemonAutoUpgrade(daemonAutoUpgrade === true)
+  }, [daemonAutoUpgrade])
 
   const title = [activeHost?.name, activeSession?.name].filter(Boolean).join(' — ')
 

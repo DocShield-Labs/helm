@@ -72,6 +72,22 @@ pub mod extensions {
         pub query: String,
         pub max_results: u32,
     }
+
+    /// Self-exec upgrade: the daemon snapshots every session, kills
+    /// their processes, and execs `bin_path` in place — the listener fd
+    /// survives the exec, so the socket never closes and no stale
+    /// spawner can race in. The new binary resurrects the sessions
+    /// (name, cwd, scrollback, blocks) with a visible seam row.
+    /// Downgrades are refused. Request payload: [`UpgradeRequest`]; a
+    /// success reply means the snapshot is written and the exec is
+    /// imminent — expect the connection to drop and reconnect.
+    pub const UPGRADE: &str = "helm.daemon.upgrade.v1";
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct UpgradeRequest {
+        /// Absolute path of the new binary on the daemon's host.
+        pub bin_path: String,
+    }
 }
 
 /// Upper bound on a single frame. History pages are capped well below

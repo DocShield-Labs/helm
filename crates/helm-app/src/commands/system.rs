@@ -52,3 +52,12 @@ pub fn perf_report(report: String) -> Result<(), String> {
     tracing::info!(target: "helm_perf", "{report}");
     Ok(())
 }
+
+/// Consent from the update dialog: restart daemons (with session
+/// resurrection) on hosts whose daemon is older than this app.
+#[tauri::command]
+#[specta::specta]
+pub fn set_daemon_auto_upgrade(enabled: bool) -> Result<(), String> {
+    crate::connection::set_daemon_auto_upgrade(enabled);
+    Ok(())
+}

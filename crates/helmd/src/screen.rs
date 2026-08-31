@@ -245,6 +245,35 @@ impl SessionScreen {
         }
     }
 
+    /// Everything retained, for an upgrade snapshot: the history rows
+    /// followed by the grid's used rows (the visible tail joins the
+    /// transcript), with the absolute line of the first row returned.
+    pub fn snapshot_rows(&self) -> (u64, Vec<Row>) {
+        let mut rows: Vec<Row> = self.history.iter().cloned().collect();
+        let mut last_used = 0usize;
+        for l in 0..self.term.screen_lines() {
+            let row = self.grid_row(l as i32);
+            rows.push(row);
+            if !rows.last().expect("just pushed").spans.is_empty() {
+                last_used = rows.len();
+            }
+        }
+        rows.truncate(last_used.max(self.history.len()));
+        (self.history_start, rows)
+    }
+
+    /// Seed a fresh screen with resurrected history: the rows a previous
+    /// daemon snapshotted before an upgrade. Absolute numbering continues
+    /// (`top_line` starts past the seeded rows), so the snapshotted block
+    /// table stays valid. Call before the PTY produces meaningful output.
+    pub fn seed_history(&mut self, history_start: u64, rows: Vec<helm_proto::Row>) {
+        self.history_start = history_start;
+        self.top_line = history_start + rows.len() as u64;
+        self.pending_first = self.top_line;
+        self.sent_top_line = self.top_line;
+        self.history = rows.into();
+    }
+
     pub fn top_line(&self) -> u64 {
         self.top_line
     }

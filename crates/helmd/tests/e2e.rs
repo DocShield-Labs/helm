@@ -499,3 +499,130 @@ fn session_env_is_pristine_not_inherited() {
 
     let _ = std::fs::remove_file(&socket);
 }
+
+/// Self-exec upgrade: a REAL daemon process on a real socket snapshots
+/// its sessions, execs the new binary (here: itself — equal versions
+/// are allowed for idempotence), and the successor serves the same
+/// socket with the sessions resurrected: name, cwd, scrollback, and
+/// the seam row, with absolute line numbering carried over.
+#[test]
+fn upgrade_resurrects_sessions_over_the_same_socket() {
+    let bin = env!("CARGO_BIN_EXE_helmd");
+    let socket =
+        std::env::temp_dir().join(format!("helmd-e2e-upgrade-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let stderr_path =
+        std::env::temp_dir().join(format!("helmd-e2e-upgrade-{}.stderr", std::process::id()));
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
+    let mut child = std::process::Command::new(bin)
+        .arg("serve")
+        .arg("--socket")
+        .arg(&socket)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+
+    let hello = |c: &mut TestClient, seen: &mut Vec<DaemonMsg>| {
+        c.send(&ClientMsg::Hello {
+            protocol_version: helm_proto::PROTOCOL_VERSION,
+            client_name: "e2e-upgrade".into(),
+        });
+        c.recv_until(5, seen, |m| match m {
+            DaemonMsg::HelloAck { state, .. } => Some(state.clone()),
+            _ => None,
+        })
+    };
+
+    let mut c = TestClient::connect(&socket);
+    let mut seen = Vec::new();
+    hello(&mut c, &mut seen);
+    c.send(&ClientMsg::Attach);
+    c.send(&ClientMsg::NewSession {
+        req_id: 1,
+        name: Some("phoenix".into()),
+        cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        command: Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'marker-before-upgrade\\n'; sleep 30".into(),
+        ]),
+    });
+    let session_id = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Created { req_id: 1, session } => Some(*session),
+        _ => None,
+    });
+    // Wait for the marker to reach the grid.
+    c.recv_until(10, &mut seen, |m| match m {
+        DaemonMsg::Screen { session, screen, .. } if *session == session_id => screen
+            .lines
+            .iter()
+            .any(|r| r.text().contains("marker-before-upgrade"))
+            .then_some(()),
+        DaemonMsg::ScreenDiff { session, rows, .. } if *session == session_id => rows
+            .iter()
+            .any(|(_, r)| r.text().contains("marker-before-upgrade"))
+            .then_some(()),
+        _ => None,
+    });
+
+    // Upgrade to "the new binary" — the same one; the exec + resurrect
+    // path is identical, the version check simply passes as equal.
+    let payload = serde_json::to_vec(&helm_proto::extensions::UpgradeRequest {
+        bin_path: bin.into(),
+    })
+    .unwrap();
+    c.send(&ClientMsg::Extension {
+        req_id: Some(9),
+        name: helm_proto::extensions::UPGRADE.into(),
+        payload,
+    });
+    c.recv_until(10, &mut seen, |m| match m {
+        DaemonMsg::Extension { req_id: Some(9), .. } => Some(()),
+        DaemonMsg::Error { req_id: Some(9), message, .. } => panic!("upgrade refused: {message}"),
+        _ => None,
+    });
+
+    // The old process kills sessions, sleeps its grace, and execs. The
+    // listener fd survives, so the socket never closes — wait past the
+    // handover, then talk to the successor on the SAME socket.
+    std::thread::sleep(Duration::from_secs(2));
+    let mut c2 = TestClient::connect(&socket);
+    let mut seen2 = Vec::new();
+    let tree = hello(&mut c2, &mut seen2);
+    let resurrected = tree
+        .sessions
+        .iter()
+        .find(|s| s.name == "phoenix")
+        .expect("resurrected session in tree");
+    let new_id = resurrected.id;
+
+    // The transcript survived: the pre-upgrade marker AND the seam row,
+    // served through the ordinary history path.
+    c2.send(&ClientMsg::Attach);
+    c2.send(&ClientMsg::History {
+        req_id: 2,
+        session: new_id,
+        from_line: 0,
+        to_line: u64::MAX,
+    });
+    let texts: Vec<String> = c2.recv_until(10, &mut seen2, |m| match m {
+        DaemonMsg::History { req_id: 2, session, rows, .. } if *session == new_id => {
+            Some(rows.iter().map(|r| r.text()).collect())
+        }
+        _ => None,
+    });
+    assert!(
+        texts.iter().any(|t| t.contains("marker-before-upgrade")),
+        "pre-upgrade scrollback missing: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("daemon restarted for")),
+        "seam row missing: {texts:?}"
+    );
+
+    c2.send(&ClientMsg::Shutdown);
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&socket);
+}

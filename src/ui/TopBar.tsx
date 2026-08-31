@@ -1,11 +1,34 @@
 /** Full-width draggable title bar with navigation and search controls. */
 
 import { useStore } from '@lib/store'
+import { useState } from 'react'
 import type { AvailableUpdate } from '@lib/updater'
+import { Modal } from './Modal'
+import { Button } from './Button'
 import { PanelLeftIcon, SearchIcon } from '@features/sessions/icons'
 import { TITLE_BAR_HEIGHT, TITLE_BAR_CONTENT_INSET } from '@bindings'
 
 export function TopBar({ title, update }: { title: string; update: AvailableUpdate | null }) {
+  const daemonAutoUpgrade = useStore((s) => s.daemonAutoUpgrade)
+  const setDaemonAutoUpgrade = useStore((s) => s.setDaemonAutoUpgrade)
+  const [upgradeDialog, setUpgradeDialog] = useState(false)
+  // One decision, made at the one moment the user is already saying
+  // yes: the first update install asks whether daemons restart too
+  // (sessions preserved via snapshot/resurrect). After that, installs
+  // are one click forever.
+  const startInstall = () => {
+    if (!update || update.installing) return
+    if (daemonAutoUpgrade === null) {
+      setUpgradeDialog(true)
+      return
+    }
+    update.install()
+  }
+  const decide = (restartDaemons: boolean) => {
+    setDaemonAutoUpgrade(restartDaemons)
+    setUpgradeDialog(false)
+    update?.install()
+  }
   const collapsed = useStore((s) => s.sidebarCollapsed)
   const toggleSidebar = useStore((s) => s.toggleSidebar)
   const openPalette = useStore((s) => s.openPalette)
@@ -48,13 +71,34 @@ export function TopBar({ title, update }: { title: string; update: AvailableUpda
       {update && (
         <button
           type="button"
-          onClick={update.installing ? undefined : update.install}
+          onClick={update.installing ? undefined : startInstall}
           title={`Install Helm ${update.version} and relaunch — your sessions survive`}
           className="mr-1 rounded-md bg-accent-muted px-2 py-0.5 text-[11px] text-accent-text hover:bg-[var(--accent-border)]"
         >
           {update.installing ? `installing ${update.version}…` : `${update.version} available`}
         </button>
       )}
+      <Modal
+        open={upgradeDialog}
+        title="Restart terminal daemons with updates?"
+        onClose={() => setUpgradeDialog(false)}
+        width={480}
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button onClick={() => decide(false)}>Update App Only</Button>
+            <Button kind="primary" onClick={() => decide(true)}>
+              Update & Restart Daemons
+            </Button>
+          </div>
+        }
+      >
+        <p className="text-[13px] leading-relaxed text-text-secondary">
+          Updating restarts the terminal daemon on this Mac and on hosts as you
+          connect. Sessions, names, and scrollback are preserved; running
+          programs including agents will exit. You can change this later in
+          settings.
+        </p>
+      </Modal>
     </div>
   )
 }

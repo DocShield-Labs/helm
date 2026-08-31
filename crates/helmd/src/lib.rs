@@ -15,6 +15,7 @@
 pub mod agent_commands;
 pub mod completion;
 pub mod file_search;
+pub mod resurrect;
 pub mod daemon;
 pub mod env;
 pub mod markers;

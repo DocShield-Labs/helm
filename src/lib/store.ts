@@ -153,6 +153,9 @@ interface HelmState {
   setPreviewThemeName: (name: string | null) => void
 
   defaultAgentId: AgentId
+  /** null = never asked; the update dialog sets it. */
+  daemonAutoUpgrade: boolean | null
+  setDaemonAutoUpgrade: (v: boolean) => void
   setDefaultAgentId: (id: AgentId) => void
   customAgentTemplate: string
   setCustomAgentTemplate: (template: string) => void
@@ -431,6 +434,15 @@ export const useStore = create<HelmState>((set) => ({
   previewThemeName: null,
   setPreviewThemeName: (v) => set({ previewThemeName: v }),
 
+  daemonAutoUpgrade: readJson<boolean | null>('helm.daemonAutoUpgrade', null),
+  setDaemonAutoUpgrade: (v) => {
+    try {
+      localStorage.setItem('helm.daemonAutoUpgrade', JSON.stringify(v))
+    } catch {
+      /* private mode */
+    }
+    set({ daemonAutoUpgrade: v })
+  },
   defaultAgentId: readStringPref(DEFAULT_AGENT_KEY, DEFAULT_AGENT_ID, isAgentId),
   setDefaultAgentId: (id) => {
     writeStringPref(DEFAULT_AGENT_KEY, id)

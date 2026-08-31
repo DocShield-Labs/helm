@@ -199,6 +199,53 @@ async fn install_session(
         capabilities,
     ));
 
+    // Consent-gated daemon self-upgrade: when the user chose "Update &
+    // Restart Daemons", any older daemon we connect to is told to
+    // snapshot its sessions and exec the new binary. The connection
+    // drops and the ordinary reconnect finds the successor on the same
+    // socket (the listener fd survives the exec) with every session
+    // resurrected. Failure is non-fatal: an old daemon without the
+    // extension just keeps running.
+    if daemon_auto_upgrade_enabled() && is_older_daemon(&daemon_version) {
+        let session = session.clone();
+        let bin_path = if ssh.is_some() {
+            Some("~/.helm/bin/helmd".to_string())
+        } else {
+            helmd_bin_path().ok().map(|p| p.to_string_lossy().into_owned())
+        };
+        if let Some(bin_path) = bin_path {
+            tokio::spawn(async move {
+                // Give the capability handshake a beat, like retirement does.
+                for _ in 0..20 {
+                    if session.capabilities.read().compatibility_baseline.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if !session
+                    .capabilities
+                    .read()
+                    .extensions
+                    .contains(helm_proto::extensions::UPGRADE)
+                {
+                    return;
+                }
+                let payload = match serde_json::to_vec(&helm_proto::extensions::UpgradeRequest {
+                    bin_path,
+                }) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                tracing::info!("requesting daemon self-upgrade on {host_id:?}");
+                let _ = session.client.extension(
+                    None,
+                    helm_proto::extensions::UPGRADE.into(),
+                    payload,
+                );
+            });
+        }
+    }
+
     // We've shown the offline notifications; let the daemon drop them.
     if let Some(max) = last_note_id {
         let _ = session
@@ -628,6 +675,27 @@ fn helmd_socket_path() -> PathBuf {
 ///   2. `helmd` next to the app executable (bundled sidecar / cargo
 ///      target dir — both put the two binaries side by side)
 ///   3. `helmd` on PATH
+/// Process-global consent from the update dialog ("Update & Restart
+/// Daemons"), pushed by the frontend on boot and on change.
+static DAEMON_AUTO_UPGRADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_daemon_auto_upgrade(enabled: bool) {
+    DAEMON_AUTO_UPGRADE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn daemon_auto_upgrade_enabled() -> bool {
+    DAEMON_AUTO_UPGRADE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn is_older_daemon(daemon_version: &str) -> bool {
+    fn triple(v: &str) -> (u32, u32, u32) {
+        let mut it = v.split('.').map(|p| p.parse().unwrap_or(0));
+        (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+    }
+    triple(daemon_version) < triple(env!("CARGO_PKG_VERSION"))
+}
+
 fn helmd_bin_path() -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("HELMD_BIN") {
         let p = PathBuf::from(p);
