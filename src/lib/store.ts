@@ -36,6 +36,11 @@ export interface Session {
   id: string
   name: string
   command: string
+  /** The daemon's authoritative PTY size, sampled at the last tree
+   * event. SessionView reconciles against it: if it disagrees with the
+   * fitted xterm size, a resize command was lost and gets re-sent. */
+  cols: number
+  rows: number
   /** The session's current working directory, sampled at the last
    * tree refetch. Stale until the next refetch — fine for the
    * footer, not authoritative for command execution. */

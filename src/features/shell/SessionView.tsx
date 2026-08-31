@@ -349,6 +349,30 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     if (ready && isVisible) scheduleFit()
   }, [ready, nativeBar, isVisible, scheduleFit])
 
+  // Reconcile against the daemon's authoritative PTY size, which flows
+  // back on every tree event. fitNow's guard compares proposed dims
+  // against xterm's own belief — so a single lost `sessionResize`
+  // (fire-and-forget, and easy to drop across a reconnect or a daemon
+  // swap) leaves the daemon at one size and xterm at another forever,
+  // with the TUI drawing into the wrong geometry. The delay + re-check
+  // keeps this quiet while a drag streams tree updates; at rest it
+  // fires once, the next tree event confirms, and it goes silent.
+  const daemonCols = session?.cols
+  const daemonRows = session?.rows
+  useEffect(() => {
+    if (!ready || !isVisible || daemonCols === undefined || daemonRows === undefined) return
+    const t = termRef.current
+    if (!t || (daemonCols === t.term.cols && daemonRows === t.term.rows)) return
+    const timer = window.setTimeout(() => {
+      const now = termRef.current
+      const s = useStore.getState().sessions.get(hostId)?.sessions.get(sessionId)
+      if (!now || !s) return
+      if (s.cols === now.term.cols && s.rows === now.term.rows) return
+      void commands.sessionResize(hostId, sessionId, now.term.cols, now.term.rows)
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [ready, isVisible, daemonCols, daemonRows, hostId, sessionId])
+
   // ---- paging: the sentinel widens the render window over rows the
   // client already holds (cheap, synchronous), and only once the window
   // reaches the loaded floor does it page older rows from the daemon.
