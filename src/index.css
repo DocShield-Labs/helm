@@ -133,6 +133,18 @@ button:not(:disabled),
 .helm-sentinel {
   height: 1px;
 }
+/* Clickable links in output — OSC 8 hyperlinks and detected plain-text
+   URLs. xterm's affordance: quiet at rest, dashed underline + pointer
+   on hover. Colors stay whatever the terminal styled the text. */
+.helm-link {
+  color: inherit;
+  text-decoration: inherit;
+  cursor: pointer;
+}
+.helm-link:hover {
+  text-decoration-line: underline;
+  text-decoration-style: dashed;
+}
 /* The terminal cursor, drawn inline in the DOM rows — shape and blink
    follow what the application set via DECSCUSR (data attributes from
    Rows.tsx), like the alt-screen xterm. The bar is 2px with zero net

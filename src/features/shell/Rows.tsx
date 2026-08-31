@@ -19,6 +19,7 @@ import type { DomCursor } from '@lib/session/screen'
 import { ATTRS } from '@bindings'
 import type { HostId, RowInfo, SpanInfo } from '@bindings'
 import { commands } from '@lib/ipc'
+import { linkifySpans } from '@lib/session/links'
 import { colorCss } from '@lib/session/palette'
 import { useRows } from '@lib/session/screen'
 
@@ -136,23 +137,26 @@ interface CaretProps {
 }
 
 const Line = memo(function Line({ line: l, caret }: { line: LogicalLine; caret: CaretProps | null }) {
+  // Plain-text URL detection runs on the joined logical line, so a
+  // link that soft-wraps across physical rows is still one target.
+  const spans = useMemo(() => linkifySpans(l.spans), [l.spans])
   return (
     <div className="helm-line" data-line={l.line}>
-      {lineContent(l, caret)}
+      {lineContent(spans, caret)}
     </div>
   )
 })
 
-function lineContent(l: LogicalLine, caret: CaretProps | null) {
+function lineContent(spans: SpanInfo[], caret: CaretProps | null) {
   if (!caret) {
-    return l.spans.length === 0 ? ' ' : l.spans.map((s, j) => <SpanView key={j} span={s} />)
+    return spans.length === 0 ? ' ' : spans.map((s, j) => <SpanView key={j} span={s} />)
   }
   const { offset } = caret
   const out: React.ReactNode[] = []
   let seen = 0
   let placed = false
-  for (let j = 0; j < l.spans.length; j++) {
-    const s = l.spans[j]
+  for (let j = 0; j < spans.length; j++) {
+    const s = spans[j]
     const end = seen + s.text.length
     if (!placed && offset >= seen && offset < end) {
       const cut = offset - seen
@@ -186,9 +190,16 @@ function SpanView({ span }: { span: SpanInfo }) {
     return (
       <a
         href={href}
-        style={{ ...css, textDecoration: 'underline' }}
+        className="helm-link"
+        // OSC 8 links can label the URL with arbitrary text — surface
+        // the real target on hover. A plain detected URL is its own label.
+        title={span.text === href ? undefined : href}
+        style={css}
         onClick={(e) => {
           e.preventDefault()
+          // A drag-selection that ends on the link is a selection, not
+          // a click.
+          if (window.getSelection()?.isCollapsed === false) return
           void commands.openUrl(href)
         }}
       >
