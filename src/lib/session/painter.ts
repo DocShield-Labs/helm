@@ -165,6 +165,21 @@ export function attachPainter(
 
   const paint = (ev: PaintEvent) => {
     if (disposed) return
+    const nextModes = ev.kind === 'screen' ? ev.screen.modes : ev.modes
+    if ((nextModes & MODES.ALT_SCREEN) === 0) {
+      // Normal screen renders as DOM; xterm is a hidden input encoder
+      // here. Feeding it rows would push every frame of a flood through
+      // the escape parser and the WebGL renderer for pixels nobody can
+      // see — enough sustained main-thread work to starve clicks. Only
+      // the DEC modes are mirrored (they drive key/paste encoding); the
+      // grid catches up from the mirror when the alt screen engages.
+      if (nextModes !== modes) {
+        term.write(modesSequence(modes, nextModes))
+        modes = nextModes
+      }
+      dirty = true
+      return
+    }
     if (!visible() || resizing || !modelFitsTerminal()) {
       dirty = true
       return

@@ -90,6 +90,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::session::session_search,
             commands::session::session_blocks,
             commands::session::session_path_complete,
+            commands::session::session_agent_commands,
+            commands::session::session_file_search,
             commands::session::session_ping,
             commands::notifications::notifications_list,
             commands::notifications::notification_dismiss,
@@ -101,6 +103,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::tools::tool_integration_dismiss,
             commands::system::reveal_in_finder,
             commands::system::open_url,
+            commands::system::perf_report,
         ])
 }
 

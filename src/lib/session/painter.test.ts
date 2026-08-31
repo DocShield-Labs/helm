@@ -102,6 +102,7 @@ describe('painter', () => {
       },
     } as unknown as Terminal
     let visible = false
+    // Alt screen: the one surface xterm still renders.
     applyScreen('paint-host', 'paint-session', {
       cols: 4,
       rows: 2,
@@ -109,7 +110,7 @@ describe('painter', () => {
       history_start: 0,
       lines: [row([{ text: 'old', fg: -1, bg: -1, attrs: 0, link: null }]), row([])],
       cursor: { row: 1, col: 0, visible: true, shape: 'block', blink: false },
-      modes: 0,
+      modes: MODES.ALT_SCREEN,
     })
     const painter = attachPainter(term, 'paint-host', 'paint-session', () => visible)
     visible = true
@@ -120,11 +121,58 @@ describe('painter', () => {
       0,
       [{ index: 1, row: row([{ text: 'new', fg: -1, bg: -1, attrs: 0, link: null }]) }],
       { row: 1, col: 3, visible: true, shape: 'block', blink: false },
-      0,
+      MODES.ALT_SCREEN,
     )
     expect(writes).toHaveLength(1)
     expect(writes[0]).toContain('old')
     expect(writes[0]).toContain('new')
+    painter.dispose()
+  })
+
+  test('normal-screen rows never reach xterm; modes still mirror', () => {
+    const writes: string[] = []
+    const term = {
+      cols: 4,
+      rows: 2,
+      write(data: string, callback?: () => void) {
+        writes.push(data)
+        callback?.()
+      },
+    } as unknown as Terminal
+    applyScreen('skip-host', 'skip-session', {
+      cols: 4,
+      rows: 2,
+      top_line: 0,
+      history_start: 0,
+      lines: [row([{ text: 'dom', fg: -1, bg: -1, attrs: 0, link: null }]), row([])],
+      cursor: { row: 0, col: 3, visible: true, shape: 'block', blink: false },
+      modes: 0,
+    })
+    const painter = attachPainter(term, 'skip-host', 'skip-session', () => true)
+    // Content diff on the normal screen: the DOM renders it; xterm gets nothing.
+    applyDiff(
+      'skip-host',
+      'skip-session',
+      0,
+      0,
+      [{ index: 0, row: row([{ text: 'more', fg: -1, bg: -1, attrs: 0, link: null }]) }],
+      { row: 0, col: 4, visible: true, shape: 'block', blink: false },
+      0,
+    )
+    expect(writes).toHaveLength(0)
+    // A mode change (bracketed paste) still mirrors — key encoding needs it.
+    applyDiff(
+      'skip-host',
+      'skip-session',
+      0,
+      0,
+      [],
+      { row: 0, col: 4, visible: true, shape: 'block', blink: false },
+      MODES.BRACKETED_PASTE,
+    )
+    expect(writes).toHaveLength(1)
+    expect(writes[0]).toContain('2004h')
+    expect(writes[0]).not.toContain('more')
     painter.dispose()
   })
 

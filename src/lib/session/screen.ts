@@ -24,6 +24,7 @@ import { useCallback, useRef, useSyncExternalStore } from 'react'
 import { commands } from '@lib/ipc'
 import { MAX_HISTORY_PAGE, MODES } from '@bindings'
 import type { CursorInfo, HistoryPage, HostId, RowAt, RowInfo, ScreenInfo } from '@bindings'
+import { timed } from '@lib/perf'
 import { addListener, notifyListeners } from './listeners'
 
 export interface SessionScreen {
@@ -93,7 +94,64 @@ function get(k: string): SessionScreen {
   return s
 }
 
-const notify = (k: string) => notifyListeners(subs, k)
+// Notifications coalesce per session: heavy output delivers many diffs
+// per frame, and re-rendering React row chunks for each one stalls
+// input. The foreground session flushes at most every VISIBLE_MS
+// (~30fps — plenty for streaming text, half the render/layout work of
+// 60fps); everything else flushes every HIDDEN_MS — enough to keep
+// previews honest without background sessions competing for the main
+// thread. Which session is foreground is TOLD to this module
+// (`setForeground`, called by the view that owns visibility) — the
+// mirror layer deliberately knows nothing about the UI store.
+// Subscribers read fresh state when they run, and a session becoming
+// visible re-reads its snapshots on that very render, so batching
+// delays paint, never data. (Synchronous where rAF doesn't exist:
+// tests.)
+const VISIBLE_MS = 33
+const HIDDEN_MS = 250
+const pendingNotify = new Set<string>()
+let foregroundKey: string | null = null
+let flushArmed = false
+let lastVisibleFlush = 0
+let lastAllFlush = 0
+
+/** The session whose updates flush at full rate. */
+export function setForeground(hostId: HostId, sessionId: string): void {
+  foregroundKey = key(hostId, sessionId)
+}
+
+function armFlush(): void {
+  if (flushArmed) return
+  flushArmed = true
+  requestAnimationFrame(() => {
+    flushArmed = false
+    const now = performance.now()
+    const all = now - lastAllFlush >= HIDDEN_MS
+    const visible = all || now - lastVisibleFlush >= VISIBLE_MS
+    if (all) lastAllFlush = now
+    if (visible) lastVisibleFlush = now
+    for (const k of pendingNotify) {
+      if (all || (visible && k === foregroundKey)) {
+        pendingNotify.delete(k)
+        timed(k === foregroundKey ? 'react-flush:visible' : 'react-flush:hidden', () =>
+          notifyListeners(subs, k),
+        )
+      }
+    }
+    // Re-arm until drained; rAF suspends while the app is hidden, which
+    // is fine — nobody is looking, and resume flushes immediately.
+    if (pendingNotify.size > 0) armFlush()
+  })
+}
+
+const notify = (k: string) => {
+  if (typeof requestAnimationFrame !== 'function') {
+    notifyListeners(subs, k)
+    return
+  }
+  pendingNotify.add(k)
+  armFlush()
+}
 
 // ---- inbound events (host.ts) ----
 
@@ -141,7 +199,11 @@ export function applyDiff(
 }
 
 /** Rows that left the grid. Extends the loaded range when contiguous
- * with it (or starts one); a gap is left for `ensureHistory` to fill. */
+ * with (or overlapping) it, or starts one; a gap is left for
+ * `ensureHistory` to fill. Overlap is real: a rows-grow pulls exported
+ * rows back onto the grid, and when they scroll out again the daemon
+ * re-exports them — possibly modified — starting below `loadedTo`.
+ * Those rows upsert by line; `loadedTo` never moves backwards. */
 export function applyHistoryAppend(
   hostId: HostId,
   sessionId: string,
@@ -154,9 +216,9 @@ export function applyHistoryAppend(
     s.loadedFrom = firstLine
     s.loadedTo = firstLine
   }
-  if (firstLine === s.loadedTo) {
+  if (firstLine <= s.loadedTo && firstLine >= s.loadedFrom) {
     rows.forEach((r, i) => s.history.set(firstLine + i, r))
-    s.loadedTo = firstLine + rows.length
+    s.loadedTo = Math.max(s.loadedTo, firstLine + rows.length)
     trim(s)
   }
   s.historyVersion++
@@ -264,6 +326,15 @@ export function agentUsedRows(s: SessionScreen): number {
   return last >= 0 ? last + 1 : Math.min(s.grid.length, s.cursor.row + 1)
 }
 
+/** Absolute line just past the rendered document's last row: the used
+ * extent, stretched to the cursor's row (a bare prompt still shows its
+ * caret), clamped to the grid. The single definition — the live tail's
+ * end, and the `clear` threshold, must agree or blocks vanish/linger. */
+export function documentEnd(s: SessionScreen, agent: boolean): number {
+  const used = agent ? agentUsedRows(s) : usedRows(s)
+  return s.topLine + Math.max(used, Math.min(s.cursor.row + 1, s.rows))
+}
+
 /** Coarse subscription: re-renders when the grid's shape, its used
  * extent, or the history's loaded range changes — not on every cursor
  * move within the used rows. */
@@ -306,6 +377,52 @@ export function useScreenMeta(hostId: HostId, sessionId: string): ScreenMeta {
   const k = key(hostId, sessionId)
   const sub = useCallback((cb: () => void) => subscribe(hostId, sessionId, cb), [hostId, sessionId])
   return useSyncExternalStore(sub, () => metaOf(k))
+}
+
+/** The cursor as the DOM renders it: position by absolute line, plus
+ * the shape/blink the application chose (DECSCUSR) so the DOM caret
+ * honours them like the alt screen does. Cached, compared field-wise
+ * BEFORE allocating — `getSnapshot` runs on every render. */
+export interface DomCursor {
+  /** Absolute line (`topLine + row`). */
+  line: number
+  col: number
+  visible: boolean
+  shape: CursorInfo['shape']
+  blink: boolean
+}
+
+const cursorCache = new Map<string, DomCursor>()
+
+function cursorOf(k: string): DomCursor {
+  const s = get(k)
+  const line = s.topLine + s.cursor.row
+  const prev = cursorCache.get(k)
+  if (
+    prev &&
+    prev.line === line &&
+    prev.col === s.cursor.col &&
+    prev.visible === s.cursor.visible &&
+    prev.shape === s.cursor.shape &&
+    prev.blink === s.cursor.blink
+  ) {
+    return prev
+  }
+  const next: DomCursor = {
+    line,
+    col: s.cursor.col,
+    visible: s.cursor.visible,
+    shape: s.cursor.shape,
+    blink: s.cursor.blink,
+  }
+  cursorCache.set(k, next)
+  return next
+}
+
+export function useCursor(hostId: HostId, sessionId: string): DomCursor {
+  const k = key(hostId, sessionId)
+  const sub = useCallback((cb: () => void) => subscribe(hostId, sessionId, cb), [hostId, sessionId])
+  return useSyncExternalStore(sub, () => cursorOf(k))
 }
 
 /** Every change, including cursor moves — for the peek. */
@@ -473,13 +590,20 @@ async function fetchLoop(hostId: HostId, sessionId: string, fromLine: number): P
 
 // ---- lifecycle ----
 
+/** Every per-session cache, so teardown can't miss one. A new derived
+ * snapshot map must be added here or it leaks entries for dead sessions. */
+function dropSession(k: string): void {
+  sessions.delete(k)
+  metaCache.delete(k)
+  cursorCache.delete(k)
+  pendingNotify.delete(k)
+  notify(k)
+}
+
 export function dropHost(hostId: HostId): void {
   const prefix = `${hostId}::`
   for (const k of [...sessions.keys()]) {
-    if (!k.startsWith(prefix)) continue
-    sessions.delete(k)
-    metaCache.delete(k)
-    notify(k)
+    if (k.startsWith(prefix)) dropSession(k)
   }
 }
 
@@ -488,11 +612,8 @@ export function retainHostSessions(hostId: HostId, sessionIds: ReadonlySet<strin
   const prefix = `${hostId}::`
   for (const k of [...sessions.keys()]) {
     if (!k.startsWith(prefix)) continue
-    const sessionId = k.slice(prefix.length)
-    if (sessionIds.has(sessionId)) continue
-    sessions.delete(k)
-    metaCache.delete(k)
-    notify(k)
+    if (sessionIds.has(k.slice(prefix.length))) continue
+    dropSession(k)
   }
 }
 

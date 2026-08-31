@@ -41,7 +41,6 @@ export interface HelmTerminal {
    * to bypass CSS line-height rounding. Returns the latest value cached
    * by the internal ResizeObserver — single source of truth shared
    * between the wheel handler, the block overlay, and hover hit-tests. */
-  getCellSize(): { width: number; height: number }
   /** Live-swap the xterm theme. Mutates `term.options.theme`, which
    * triggers a redraw with the new palette (no reload, no remount). */
   setTheme(theme: Theme): void
@@ -49,6 +48,12 @@ export interface HelmTerminal {
 }
 
 export interface AttachOptions {
+  /** Owner-driven sizing: called whenever the terminal should re-fit
+   * its host (first render, line-height corrections). Lets the owner
+   * define "how many columns fit" once — SessionView derives cols from
+   * the DOM glyph advance, not xterm's cell width. Defaults to
+   * FitAddon.fit(). */
+  refit?: () => void
   fontSize?: number
   lineHeight?: number
   fontFamily?: string
@@ -148,6 +153,15 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   })
 
   const fit = new FitAddon()
+  const refit =
+    opts.refit ??
+    (() => {
+      try {
+        fit.fit()
+      } catch {
+        /* not laid out yet */
+      }
+    })
   term.loadAddon(fit)
 
   // In-session find. Loaded eagerly (cheap) so Cmd+F is instant; the
@@ -254,7 +268,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // which re-measures and finds nothing left to correct.
   const linePx = domLinePx()
   let cachedCellH = linePx
-  let cachedCellW = 8
   // Pure measurement: read the rendered cell into the cache. NEVER
   // mutates layout — an observer that resized what it observes would
   // loop. Returns the measured cell height, or 0 if nothing's laid out.
@@ -264,7 +277,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       const rect = screen.getBoundingClientRect()
       if (rect.height > 0) {
         cachedCellH = rect.height / term.rows
-        if (rect.width > 0) cachedCellW = rect.width / term.cols
         return cachedCellH
       }
     }
@@ -272,7 +284,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     if (row) {
       const rect = row.getBoundingClientRect()
       if (rect.height > 0) cachedCellH = rect.height
-      if (rect.width > 0 && term.cols > 0) cachedCellW = rect.width / term.cols
       return cachedCellH
     }
     return 0
@@ -298,11 +309,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     if (lh === null || corrections >= 4) return
     corrections++
     term.options.lineHeight = lh
-    try {
-      fit.fit()
-    } catch {
-      /* not laid out yet */
-    }
+    refit()
     requestAnimationFrame(correctLineHeight)
   }
 
@@ -314,13 +321,9 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // undefined until the first paint (throws otherwise), and the screen
   // element only settles a tick after `term.open` anyway.
   let firstRender: { dispose(): void } | null = term.onRender(() => {
-    // Renderer has painted now — `dimensions` is populated, so fit() is
+    // Renderer has painted now — `dimensions` is populated, so a fit is
     // safe. Size to the viewport, then correct the cell height.
-    try {
-      fit.fit()
-    } catch {
-      /* not laid out yet */
-    }
+    refit()
     correctLineHeight()
     firstRender?.dispose()
     firstRender = null
@@ -330,7 +333,6 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
     term,
     fit,
     search,
-    getCellSize: () => ({ width: cachedCellW, height: cachedCellH }),
     setTheme: (theme: Theme) => {
       term.options.theme = xtermThemeFor(theme)
     },

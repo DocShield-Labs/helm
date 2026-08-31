@@ -2,12 +2,12 @@
  * SearchOverlay — in-session find (Cmd+F).
  *
  * A compact floating bar pinned to the session's top-right (browser-find /
- * VS Code style). Searches two surfaces as one: the finished blocks
- * (DOM, via the CSS Custom Highlight API) and the live xterm tail (via
- * SearchAddon). Matches are ordered oldest→newest: DOM matches first,
- * then the tail. Enter / Shift+Enter step through them with a live n/m
- * counter; case-sensitive + regex toggles; Esc (or ×) clears and hands
- * focus back to the terminal.
+ * VS Code style). Normal screen: the whole document is DOM, searched via
+ * the CSS Custom Highlight API. Alt screen: the TUI owns the xterm, and
+ * SearchAddon searches that instead — never both, or grid rows (present
+ * in each) would match twice. Enter / Shift+Enter step through matches
+ * with a live n/m counter; case-sensitive + regex toggles; Esc (or ×)
+ * clears and hands focus back to the terminal.
  *
  * Highlight colours are read from the live theme tokens so matches read
  * well on whatever palette is active.
@@ -20,12 +20,14 @@ import { applyHighlights, clearHighlights, findInBlocks, scrollRangeIntoView } f
 
 interface SearchOverlayProps {
   helm: HelmTerminal
-  /** Scroll container holding the DOM blocks (searched alongside xterm). */
+  /** Scroll container holding the DOM rows (searched off the alt screen). */
   container?: HTMLElement | null
+  /** Alt screen: search the xterm instead of the DOM. */
+  alt: boolean
   onClose: () => void
 }
 
-export function SearchOverlay({ helm, container, onClose }: SearchOverlayProps) {
+export function SearchOverlay({ helm, container, alt, onClose }: SearchOverlayProps) {
   const [query, setQuery] = useState('')
   const [caseSensitive, setCaseSensitive] = useState(false)
   const [regex, setRegex] = useState(false)
@@ -72,15 +74,13 @@ export function SearchOverlay({ helm, container, onClose }: SearchOverlayProps) 
     })
   }, [])
 
-  // Run the search whenever the query or a toggle changes, always landing
-  // on the most recent (last) match — for a terminal the newest output is
-  // what you're usually after. clearDecorations() resets the selection so
-  // findPrevious starts from the bottom of the buffer; doing this on every
-  // change also makes toggles deterministic (the active match can't drift
-  // by one on each flip the way it would if we re-issued from the current
-  // selection). Enter / Shift+Enter step from there.
-  // Debounced: a TreeWalker over every block plus an xterm buffer scan
-  // per keystroke is too much to run synchronously in the input handler.
+  // Run the search whenever the query or a toggle changes, always
+  // landing on the most recent (last) match — for a terminal the newest
+  // output is what you're usually after. Exactly ONE surface is
+  // searchable at a time: off the alt screen the whole document is DOM;
+  // on it the TUI owns the xterm and SearchAddon searches that.
+  // Debounced: a TreeWalker over the rendered blocks (or an xterm
+  // buffer scan) per keystroke is too much for the input handler.
   useEffect(() => {
     if (query === '') {
       domRanges.current = []
@@ -92,62 +92,46 @@ export function SearchOverlay({ helm, container, onClose }: SearchOverlayProps) 
       return
     }
     const id = window.setTimeout(() => {
+      if (alt) {
+        // clearDecorations() resets the selection so findPrevious
+        // starts from the bottom of the buffer; doing it every change
+        // keeps toggles deterministic.
+        helm.search.clearDecorations()
+        helm.search.findPrevious(query, options)
+        return
+      }
       const ranges = container ? findInBlocks(container, query, { caseSensitive, regex }) : []
       domRanges.current = ranges
       setDomCount(ranges.length)
-      setDomIndex(-1)
-      // Newest match first: the tail if it has one, else the last block hit.
-      helm.search.clearDecorations()
-      const found = helm.search.findPrevious(query, options)
-      if (!found && ranges.length > 0) {
-        setDomIndex(ranges.length - 1)
-        applyHighlights(ranges, ranges.length - 1)
-        scrollRangeIntoView(ranges[ranges.length - 1])
-      } else {
-        applyHighlights(ranges, -1)
-      }
-    }, 60)
+      const active = ranges.length - 1
+      setDomIndex(active)
+      applyHighlights(ranges, active)
+      if (active >= 0) scrollRangeIntoView(ranges[active])
+    }, 120)
     return () => {
       window.clearTimeout(id)
       clearHighlights()
     }
-  }, [query, options, caseSensitive, regex, helm.search, container])
+  }, [query, options, caseSensitive, regex, helm.search, container, alt])
 
-  // Unified stepping: [dom 0..n-1] then [tail 0..m-1].
-  const total = domCount + result.count
-  const unifiedIndex =
-    domIndex >= 0 ? domIndex : result.count > 0 ? domCount + Math.max(0, result.index) : -1
+  const total = alt ? result.count : domCount
+  const activeIndex = alt ? result.index : domIndex
 
-  const goTo = (idx: number) => {
-    const ranges = domRanges.current
-    if (total === 0) return
-    const i = ((idx % total) + total) % total
-    if (i < ranges.length) {
-      helm.search.clearDecorations()
-      setDomIndex(i)
-      applyHighlights(ranges, i)
-      scrollRangeIntoView(ranges[i])
-    } else {
-      // The addon steps from its current selection; coming in from the
-      // blocks, a cleared selection makes findNext/findPrevious land on
-      // the tail's first/last match respectively.
-      const wasInTail = domIndex < 0 && result.count > 0
-      setDomIndex(-1)
-      applyHighlights(ranges, -1)
-      if (!wasInTail) helm.search.clearDecorations()
-      if (idx > unifiedIndex) helm.search.findNext(query, options)
+  const step = (dir: 1 | -1) => {
+    if (!query || total === 0) return
+    if (alt) {
+      if (dir > 0) helm.search.findNext(query, options)
       else helm.search.findPrevious(query, options)
-      helm.term.element?.scrollIntoView({ block: 'nearest' })
+      return
     }
+    const ranges = domRanges.current
+    const i = (((domIndex + dir) % total) + total) % total
+    setDomIndex(i)
+    applyHighlights(ranges, i)
+    scrollRangeIntoView(ranges[i])
   }
-  const next = () => {
-    if (!query) return
-    goTo(unifiedIndex + 1)
-  }
-  const prev = () => {
-    if (!query) return
-    goTo(unifiedIndex - 1)
-  }
+  const next = () => step(1)
+  const prev = () => step(-1)
   const close = () => {
     clearHighlights()
     helm.search.clearDecorations()
@@ -156,7 +140,7 @@ export function SearchOverlay({ helm, container, onClose }: SearchOverlayProps) 
   }
 
   const counter =
-    total === 0 ? (query ? 'no results' : '') : `${unifiedIndex + 1}/${total}`
+    total === 0 ? (query ? 'no results' : '') : `${activeIndex + 1}/${total}`
 
   return (
     <div

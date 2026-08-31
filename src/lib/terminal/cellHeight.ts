@@ -50,3 +50,39 @@ export function domLinePx(fallback = 20): number {
   const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--helm-line-px'))
   return Number.isFinite(v) && v > 0 ? v : fallback
 }
+
+/**
+ * One monospace character's advance in the DOM, measured under
+ * `.helm-block-output`'s exact styles — the horizontal sibling of the
+ * cell-height correction above. PTY columns must divide the DOM text
+ * area by THIS number, not xterm's cell width: the two disagree
+ * fractionally (WebGL rounds cells to device pixels; the DOM
+ * accumulates fractional advances), and across a wide window the drift
+ * exceeds a character, soft-wrapping every full-width line. Cached;
+ * re-measured once webfonts finish loading.
+ */
+let cachedAdvance = 0
+
+export function domAdvancePx(): number {
+  if (cachedAdvance > 0) return cachedAdvance
+  if (typeof document === 'undefined') return 8
+  const probe = document.createElement('pre')
+  probe.className = 'helm-block-output'
+  probe.style.position = 'absolute'
+  probe.style.visibility = 'hidden'
+  probe.style.whiteSpace = 'pre'
+  probe.style.padding = '0'
+  probe.style.width = 'max-content'
+  probe.textContent = 'M'.repeat(200)
+  document.body.appendChild(probe)
+  const w = probe.getBoundingClientRect().width / 200
+  probe.remove()
+  if (w > 0) cachedAdvance = w
+  return w || 8
+}
+
+if (typeof document !== 'undefined') {
+  void document.fonts?.ready.then(() => {
+    cachedAdvance = 0
+  })
+}

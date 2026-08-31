@@ -200,15 +200,31 @@ impl Session {
     /// Last-writer-wins resize (no tmux-style union across clients).
     /// The model resizes with the PTY so its reflow matches what the
     /// application will redraw into.
+    ///
+    /// Same-size calls are dropped before the ioctl: TIOCSWINSZ delivers
+    /// SIGWINCH even when nothing changed, and a full-screen application
+    /// answers every SIGWINCH with a repaint — which, for one that
+    /// redraws by re-emitting its tail (Claude Code), scrolls a duplicate
+    /// of the old frame into history.
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Clamp before comparing, so the no-op guard sees the same
+        // numbers every consumer below uses.
+        let cols = cols.max(2);
+        let rows = rows.max(2);
+        {
+            let meta = self.meta.lock();
+            if meta.cols == cols && meta.rows == rows {
+                return Ok(());
+            }
+        }
         // Hold the model lock across the ioctl. TIOCSWINSZ delivers
         // SIGWINCH immediately; without this guard the reader thread can
         // parse the application's redraw against the old grid dimensions
         // before `screen.resize` runs.
         let mut screen = self.screen.lock();
         self.master.lock().resize(PtySize {
-            rows: rows.max(2),
-            cols: cols.max(2),
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;

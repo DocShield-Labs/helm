@@ -27,6 +27,12 @@
   /* One row of terminal output rendered as DOM (Rows.tsx sizes chunks
      from it, so a change here is a change everywhere). */
   --helm-line-px: 20px;
+  /* Horizontal padding of the terminal text column — also sizes the
+     xterm overlay, so PTY columns match what the DOM can display. */
+  --helm-pad-x: 16px;
+  /* .helm-bar geometry — the alt-screen overlay stops above the bar. */
+  --helm-bar-h: 36px;
+  --helm-bar-margin: 6px;
 
   /* ---------- Text (universal — opacity tiers on the theme fg) ---------- */
   --text-primary:   var(--terminal-fg);

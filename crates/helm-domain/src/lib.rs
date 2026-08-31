@@ -100,6 +100,15 @@ pub struct PathCompletionResult {
     pub truncated: bool,
 }
 
+/// One slash command an agent accepts (composer autocomplete). The
+/// description is the menu row's hover tooltip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct AgentCommandInfo {
+    /// Name without the leading slash.
+    pub name: String,
+    pub description: String,
+}
+
 // ---------- terminal rows (the daemon's model, mirrored) ----------
 //
 // Colors are packed into one number to keep history pages small on the

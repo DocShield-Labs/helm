@@ -1,6 +1,6 @@
 /**
- * SessionView — one session: history as DOM, the live grid in one xterm, and
- * the composer.
+ * SessionView — one session: the whole normal-screen document as DOM,
+ * an xterm for alt-screen TUIs and input encoding, and the composer.
  *
  * Model (PLAN.md M8): helmd owns the terminal. Rows that scroll out of
  * the grid are history, addressed by absolute line; the grid's top row
@@ -8,22 +8,26 @@
  * renders, top to bottom:
  *
  *   sentinel   — loads an older page of history when scrolled into view
- *   blocks     — finished commands, each its rows from history (and,
- *                while the grid is hidden, from the mirror of the grid)
+ *   blocks     — finished commands, each its rows from history or the
+ *                mirror of the grid
  *   running    — the command in flight as a block with the same header:
- *                its body is the rows that already scrolled out (DOM)
- *                followed by the live band — the xterm, painted from
- *                screen diffs with no scrollback, clipped to the rows
- *                the command occupies in the grid. Cells are as tall as
- *                DOM rows, so when the command finishes the band becomes
- *                its block's rows without anything moving: Warp's
- *                active tail.
+ *                its rows — scrolled-out AND still on the grid — render
+ *                as the same DOM as everything else, with the terminal
+ *                cursor spliced in as an inline caret. One renderer for
+ *                the whole document: selection crosses freely, fonts
+ *                never shift, and there is no seam to misalign.
+ *
+ * The xterm is a hidden overlay in normal mode: it stays painted (so
+ *   its DEC modes encode keys/paste the way the application expects,
+ *   and the alt screen appears instantly) and its size drives the PTY
+ *   dimensions, but the DOM is what you see. On the alt screen the
+ *   overlay becomes visible and the TUI owns it.
  *
  * Input is the composer, not the shell's prompt (see sessionState.ts):
  *   prompt   → grid hidden, blocks pinned to the bottom, composer
- *   running  → grid shows the command; composer hidden for a shell,
+ *   running  → DOM shows the command; composer hidden for a shell,
  *              shown in Agent mode for an agent (Claude Code)
- *   alt      → the TUI owns the grid; agent composer if it's an agent
+ *   alt      → the TUI owns the xterm; agent composer if it's an agent
  *   raw      → plain terminal (no integration, or the process exited)
  * Agent bells feed notifications, but do not change the input surface:
  * terminal programs use bells for both attention and ordinary turn
@@ -39,6 +43,7 @@ import { MAX_HISTORY_PAGE } from '@bindings'
 import type { HostId } from '@bindings'
 import { commands } from '@lib/ipc'
 import { attachTerminal, getTheme, type HelmTerminal } from '@lib/terminal'
+import { domAdvancePx } from '@lib/terminal/cellHeight'
 import { useStore } from '@lib/store'
 import * as blocks from '@lib/session/blocks'
 import {
@@ -49,7 +54,7 @@ import {
   usePendingJump,
 } from '@lib/session/blocks'
 import * as screen from '@lib/session/screen'
-import { useScreenMeta } from '@lib/session/screen'
+import { useCursor, useScreenMeta } from '@lib/session/screen'
 import { attachPainter, type Painter } from '@lib/session/painter'
 import {
   forgetSession,
@@ -63,7 +68,7 @@ import { agentName, agentNameForCommand, buildAgentCommand } from '@lib/session/
 import { BlockHeader } from './Block'
 import { BlockList } from './BlockList'
 import { Composer } from './Composer'
-import { RowsView, rowsToText } from './Rows'
+import { CHUNK, RowsView, rowsToText } from './Rows'
 import { SearchOverlay } from './SearchOverlay'
 import { ChevronDownIcon } from '@features/sessions/icons'
 
@@ -73,8 +78,14 @@ interface SessionViewProps {
   isVisible?: boolean
 }
 
-/** `.helm-block-output`'s top padding: the live band sits inside one. */
-const BODY_PAD_TOP = 10
+/** Rows the DOM renders below the fold before windowing kicks in. The
+ * client may hold 60k loaded rows; mounting them all as DOM is a
+ * multi-second layout (measured via perf.ts — session switches stalled
+ * 2-5s). Only this window exists as elements; the top sentinel widens
+ * it before it falls through to daemon history paging. */
+const RENDER_WINDOW = 3_000
+/** Rows each sentinel hit adds to the window. */
+const RENDER_PAGE = 1_500
 
 /** Scroll geometry captured when an older page is requested, so the
  * content under the cursor stays put once the page lands above it. */
@@ -100,13 +111,15 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
 
   const [helmTerm, setHelmTerm] = useState<HelmTerminal | null>(null)
   const [ready, setReady] = useState(false)
-  const [slotHeight, setSlotHeight] = useState(0)
-  const [paneHeight, setPaneHeight] = useState(0)
   const [searchOpen, setSearchOpen] = useState(false)
+  /** Absolute line the DOM starts at; null = window pinned to the tail
+   * (follows output, DOM stays bounded). Scrolling up freezes it. */
+  const [renderFromState, setRenderFrom] = useState<number | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [focusKey, setFocusKey] = useState(0)
   const pb = useSessionBlocks(hostId, sessionId)
   const meta = useScreenMeta(hostId, sessionId)
+  const cursor = useCursor(hostId, sessionId)
   const jump = usePendingJump(hostId, sessionId)
 
   const session = useStore((s) => s.sessions.get(hostId)?.sessions.get(sessionId))
@@ -130,32 +143,41 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   reportEffective(hostId, sessionId, ps.kind, mode)
 
   const xtermShown = ps.phase !== 'prompt'
-  const shownRef = useRef(xtermShown)
-  shownRef.current = xtermShown
 
-  // Fit the xterm to the viewport, at most once per frame. Called live
-  // from the viewport ResizeObserver so the grid grows and shrinks with
-  // the window instead of snapping after a debounce. fit() only resizes
-  // the PTY when the row/col count actually changes, so a drag that
-  // doesn't cross a cell boundary costs nothing downstream.
+  // ONE definition of the terminal's size: rows from xterm's fit (cell
+  // height measured and corrected to the DOM line height), cols from
+  // the DOM's own glyph advance so a cols-wide line exactly fills the
+  // rendered text area (see cellHeight.ts). Reached three ways — the
+  // resize observers (via scheduleFit), the terminal lib's first render
+  // and line-height corrections (via the `refit` option), and mount —
+  // and nothing else sizes the PTY.
+  const fitNow = useCallback(() => {
+    const t = termRef.current
+    const host = xtermHostRef.current
+    if (!t || !host || !visibleRef.current) return
+    const dimensions = t.fit.proposeDimensions()
+    if (!dimensions) return
+    const cols = Math.max(2, Math.floor(host.clientWidth / domAdvancePx()))
+    const rows = dimensions.rows
+    if (cols === t.term.cols && rows === t.term.rows) return
+    painterRef.current?.resizeAndRepaint(() => {
+      try {
+        t.term.resize(cols, rows)
+      } catch {
+        /* not laid out yet */
+      }
+    })
+  }, [])
+  // At most one fit per frame, so the grid tracks a window drag live
+  // without fitting more than the display refreshes.
   const fitRafRef = useRef(0)
   const scheduleFit = useCallback(() => {
     if (fitRafRef.current) return
     fitRafRef.current = requestAnimationFrame(() => {
       fitRafRef.current = 0
-      const t = termRef.current
-      if (!t || !visibleRef.current || !shownRef.current) return
-      const dimensions = t.fit.proposeDimensions()
-      if (!dimensions || (dimensions.cols === t.term.cols && dimensions.rows === t.term.rows)) return
-      painterRef.current?.resizeAndRepaint(() => {
-        try {
-          t.fit.fit()
-        } catch {
-          /* not laid out yet */
-        }
-      })
+      fitNow()
     })
-  }, [])
+  }, [fitNow])
   useEffect(() => () => cancelAnimationFrame(fitRafRef.current), [])
   const composerShown = ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent')
   /** Agent session in Terminal mode: typing lands in the TUI; keep the
@@ -183,25 +205,30 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     meta.loadedFrom ?? meta.topLine,
     pb.clearedBefore,
   )
-  // The band of the grid the xterm shows: a TUI on the alt screen owns
-  // it all; otherwise from the body's first row through the last row in
-  // use. Lines below the band render as DOM.
-  const cellH = termRef.current?.getCellSize().height ?? 20
-  const liveStartRow = meta.alt ? 0 : Math.max(0, Math.min(meta.rows, bodyFrom - meta.topLine))
-  const usedRows = ps.kind === 'agent' ? meta.agentUsedRows : meta.usedRows
-  const liveEndRow = meta.alt ? meta.rows : Math.max(usedRows, liveStartRow + 1)
-  /** First absolute line the grid shows; DOM renders lines below it. */
-  const gridFrom = xtermShown ? meta.topLine + liveStartRow : Infinity
-  // Helm's agent composer is an overlay on the terminal model, not part
-  // of its PTY geometry. Keep the grid at the full pane height while the
-  // composer grows; the scroll viewport clips more of it instead of
-  // delivering SIGWINCH and making the TUI redraw on every newline.
-  const agentGridHeight = ps.kind === 'agent' && mode === 'agent' ? paneHeight : slotHeight
-  const hostHeight = Math.max(0, agentGridHeight - BODY_PAD_TOP)
-  const liveHeight = Math.min(hostHeight, (liveEndRow - liveStartRow) * cellH)
+  // The live tail renders as DOM through the document's end — one
+  // definition shared with the `clear` threshold (screen.documentEnd).
+  const liveTo = screen.documentEnd(screen.getSessionScreen(hostId, sessionId), ps.kind === 'agent')
+  /** The whole normal-screen document is DOM while the tail is live. */
+  const showLive = ready && xtermShown && !meta.alt
+  // First line the DOM renders. Following the tail, it slides with the
+  // output; frozen (user scrolled up and the sentinel widened it), it
+  // holds until the user re-pins to the bottom. Quantized to the chunk
+  // grid so it moves once per CHUNK lines, not every frame — the
+  // boundary chunk's range stays cache-stable while output streams.
+  const loadedFloor = Math.max(meta.loadedFrom ?? meta.topLine, pb.clearedBefore)
+  const rawFloor = renderFromState !== null ? Math.min(renderFromState, liveTo) : liveTo - RENDER_WINDOW
+  const windowFloor = Math.max(loadedFloor, Math.floor(Math.max(0, rawFloor) / CHUNK) * CHUNK)
+  const windowRestricted = windowFloor > loadedFloor
+  // Effects observe the floors through refs: their values move with
+  // every flush while streaming, and effects keyed on them would tear
+  // down and rebuild observers ~30x/s.
+  const windowFloorRef = useRef(windowFloor)
+  windowFloorRef.current = windowFloor
+  const loadedFloorRef = useRef(loadedFloor)
+  loadedFloorRef.current = loadedFloor
   const copyRunning = () =>
     void navigator.clipboard.writeText(
-      rowsToText(screen.rowsBetween(screen.getSessionScreen(hostId, sessionId), bodyFrom, meta.topLine + liveEndRow)),
+      rowsToText(screen.rowsBetween(screen.getSessionScreen(hostId, sessionId), bodyFrom, liveTo)),
     )
 
   // ---- xterm lifecycle + first paint ----
@@ -210,7 +237,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     if (!host) return
     const ac = new AbortController()
     const { previewThemeName, themeName } = useStore.getState()
-    const attached = attachTerminal(host, { theme: getTheme(previewThemeName ?? themeName) })
+    const attached = attachTerminal(host, { theme: getTheme(previewThemeName ?? themeName), refit: fitNow })
     const { term, dispose } = attached
     termRef.current = attached
     setHelmTerm(attached)
@@ -223,6 +250,14 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       setReady(true)
       const top = screen.getSessionScreen(hostId, sessionId).topLine
       void screen.ensureHistory(hostId, sessionId, top - MAX_HISTORY_PAGE)
+      // Fit BEFORE the first resize call: xterm still has its 80×24
+      // construction defaults here, and pushing those at the daemon
+      // just to correct them one fit later delivers two SIGWINCHes —
+      // each one a full repaint (and, for Claude Code, a duplicated
+      // frame in history). Fitted first, the explicit call reconciles
+      // the daemon to the real dimensions once; helmd drops it as a
+      // no-op when nothing changed.
+      fitNow()
       void commands.sessionResize(hostId, sessionId, term.cols, term.rows)
     })()
 
@@ -233,13 +268,24 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       }
       void screen.sendInput(hostId, sessionId, data)
     })
+    // PTY resize is trailing-debounced: a window drag crosses dozens of
+    // cell boundaries, and every SIGWINCH makes a streaming Claude Code
+    // re-emit its tail block — measured ~60 duplicate re-emissions for
+    // a 60-step drag (scratchpad cc-capture/raw4). One SIGWINCH at the
+    // end of the gesture keeps the transcript clean; the visual fit
+    // (xterm dims, DOM) still tracks the drag live.
+    let resizeTimer = 0
     const resizeDisp = term.onResize(({ cols, rows }) => {
       if (ac.signal.aborted) return
-      void commands.sessionResize(hostId, sessionId, cols, rows)
+      window.clearTimeout(resizeTimer)
+      resizeTimer = window.setTimeout(() => {
+        if (!ac.signal.aborted) void commands.sessionResize(hostId, sessionId, cols, rows)
+      }, 200)
     })
 
     return () => {
       ac.abort()
+      window.clearTimeout(resizeTimer)
       painter.dispose()
       inputDisp.dispose()
       resizeDisp.dispose()
@@ -251,39 +297,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       setReady(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, sessionId])
-
-  // ---- the wheel over the grid scrolls the session, not the terminal ----
-  // The grid has no scrollback, so there is nothing for xterm to
-  // scroll; left to itself it would hand the wheel to an application
-  // that asked for mouse reports (Claude Code turns those on and
-  // treats wheel-up as "previous input"). Capture it on the host,
-  // scroll the session's document, and keep it from xterm. Alt-screen
-  // TUIs (vim, less, htop) own the wheel as before, and Option+wheel
-  // passes through to any application that wants it.
-  useEffect(() => {
-    const host = xtermHostRef.current
-    const sc = scrollRef.current
-    if (!host || !sc) return
-    const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || e.metaKey || e.altKey) return
-      const t = termRef.current
-      if (!t || t.term.buffer.active.type === 'alternate') return
-      e.preventDefault()
-      e.stopPropagation()
-      const px =
-        e.deltaMode === 1
-          ? e.deltaY * t.getCellSize().height
-          : e.deltaMode === 2
-            ? e.deltaY * sc.clientHeight
-            : e.deltaY
-      sc.scrollTop += px
-    }
-    // Capture phase + passive:false: xterm's own listener sits on a
-    // child element and must never see the event.
-    host.addEventListener('wheel', onWheel, { capture: true, passive: false })
-    return () => host.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions)
-  }, [])
+  }, [hostId, sessionId, fitNow])
 
   // ---- sizing, and following the bottom ----
   // Terminal mode follows the scroll viewport; Agent mode uses the full
@@ -298,23 +312,17 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     const pin = () => {
       if (atBottomRef.current && visibleRef.current) scrollToBottom(sc)
     }
-    const viewport = new ResizeObserver((entries) => {
-      setSlotHeight(Math.floor(entries[0]?.contentRect.height ?? 0))
+    const viewport = new ResizeObserver(() => {
       // Fit live so the grid tracks the window during a drag, not 30ms
       // after it stops.
       scheduleFit()
       pin()
     })
     const body = new ResizeObserver(pin)
-    const pane = new ResizeObserver((entries) => {
-      setPaneHeight(Math.floor(entries[0]?.contentRect.height ?? 0))
-      scheduleFit()
-    })
+    const pane = new ResizeObserver(scheduleFit)
     viewport.observe(sc)
     body.observe(content)
     pane.observe(root)
-    setSlotHeight(Math.floor(sc.getBoundingClientRect().height))
-    setPaneHeight(Math.floor(root.getBoundingClientRect().height))
     return () => {
       viewport.disconnect()
       body.disconnect()
@@ -322,34 +330,40 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     }
   }, [scheduleFit])
 
-  // Refit on the state transitions that change the grid's slot without a
-  // viewport resize: the session becoming visible, the composer showing or
-  // hiding, alt-screen toggling. The live resize above covers dragging.
+  // Refit on the state transitions that change the overlay's size without
+  // a viewport resize: the session becoming visible, the native bar
+  // showing or hiding. The live resize above covers dragging.
   useEffect(() => {
-    if (ready && xtermShown && isVisible) scheduleFit()
-  }, [ready, xtermShown, composerShown, meta.alt, hostHeight, isVisible, scheduleFit])
+    if (ready && isVisible) scheduleFit()
+  }, [ready, nativeBar, isVisible, scheduleFit])
 
-  // ---- history paging: the sentinel at the top pulls older rows ----
+  // ---- paging: the sentinel widens the render window over rows the
+  // client already holds (cheap, synchronous), and only once the window
+  // reaches the loaded floor does it page older rows from the daemon.
   useEffect(() => {
     const el = sentinelRef.current
     const root = scrollRef.current
-    if (!el || !root || !ready || !isVisible || !moreAbove) return
+    if (!el || !root || !ready || !isVisible || !(moreAbove || windowRestricted)) return
     const io = new IntersectionObserver(
       (entries) => {
         if (!entries.some((e) => e.isIntersecting)) return
-        const s = screen.getSessionScreen(hostId, sessionId)
         anchorRef.current = {
-          loadedFrom: s.loadedFrom,
+          loadedFrom: screen.getSessionScreen(hostId, sessionId).loadedFrom,
           scrollHeight: root.scrollHeight,
           scrollTop: root.scrollTop,
         }
+        if (windowFloorRef.current > loadedFloorRef.current) {
+          setRenderFrom(Math.max(loadedFloorRef.current, windowFloorRef.current - RENDER_PAGE))
+          return
+        }
+        const s = screen.getSessionScreen(hostId, sessionId)
         void screen.ensureHistory(hostId, sessionId, (s.loadedFrom ?? s.topLine) - MAX_HISTORY_PAGE)
       },
       { root, rootMargin: '400px 0px 0px 0px' },
     )
     io.observe(el)
     return () => io.disconnect()
-  }, [hostId, sessionId, ready, isVisible, moreAbove, meta.loadedFrom])
+  }, [hostId, sessionId, ready, isVisible, moreAbove, meta.loadedFrom, windowRestricted])
 
   // ---- pin after every commit ----
   // Runs synchronously after each DOM update, before the browser can
@@ -362,28 +376,32 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     if (sc && isVisible && atBottomRef.current) scrollToBottom(sc)
   })
 
-  // ---- keep the viewport steady when an older page lands above it ----
+  // ---- keep the viewport steady when content lands above it — an
+  // older daemon page, or the render window widening over loaded rows.
   useLayoutEffect(() => {
     const sc = scrollRef.current
     if (!sc || !isVisible || atBottomRef.current) return
     const anchor = anchorRef.current
-    if (anchor && meta.loadedFrom !== null && meta.loadedFrom < (anchor.loadedFrom ?? Infinity)) {
+    if (!anchor) return
+    const paged = meta.loadedFrom !== null && meta.loadedFrom < (anchor.loadedFrom ?? Infinity)
+    if (paged || sc.scrollHeight !== anchor.scrollHeight) {
       sc.scrollTop = anchor.scrollTop + (sc.scrollHeight - anchor.scrollHeight)
       anchorRef.current = null
     }
-  }, [meta.loadedFrom, meta.historyVersion, isVisible, ready])
+  }, [meta.loadedFrom, meta.historyVersion, renderFromState, isVisible, ready])
 
   // ---- focus follows the input surface; a shown session repaints ----
   useEffect(() => {
     visibleRef.current = isVisible
     if (!isVisible) return
+    screen.setForeground(hostId, sessionId)
     painterRef.current?.repaintIfDirty()
     if (composerShown) {
       setFocusKey((k) => k + 1)
     } else {
       termRef.current?.term.focus()
     }
-  }, [isVisible, composerShown, ready])
+  }, [isVisible, composerShown, ready, hostId, sessionId])
 
   // ---- Cmd+F: find across rows + the live grid (visible session only) ----
   useEffect(() => {
@@ -409,6 +427,10 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       void screen.ensureHistory(hostId, sessionId, jump.line - 40)
       return // re-runs when the page lands (meta.loadedFrom changes)
     }
+    if (jump.line < windowFloorRef.current) {
+      setRenderFrom(Math.max(loadedFloorRef.current, jump.line - 40))
+      return // re-runs when the window widens (renderFromState changes)
+    }
     consumeJump(jump)
     const el =
       sc.querySelector<HTMLElement>(`[data-line="${jump.line}"]`) ??
@@ -422,7 +444,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     } else {
       scrollToBottom(sc)
     }
-  }, [jump, ready, isVisible, hostId, sessionId, meta.loadedFrom])
+  }, [jump, ready, isVisible, hostId, sessionId, meta.loadedFrom, renderFromState])
 
   // Following stops only when the position actually moves up — a
   // wheel, a scrollbar drag. Content growing underneath (the position
@@ -436,6 +458,11 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     const movedUp = sc.scrollTop < lastScrollTopRef.current - 1
     lastScrollTopRef.current = sc.scrollTop
     const pinned = at ? true : movedUp ? false : atBottomRef.current
+    // Window policy rides the pin state: pinned, the window follows the
+    // tail (and the DOM shrinks back to it); unpinned, the floor
+    // freezes so streaming can't slide rows out from under the reader.
+    if (pinned && renderFromState !== null) setRenderFrom(null)
+    else if (!pinned && renderFromState === null) setRenderFrom(windowFloorRef.current)
     atBottomRef.current = pinned
     setAtBottom(pinned)
   }
@@ -480,9 +507,12 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       return
     }
     // `clear` clears the block list too (Warp does the same); the
-    // shell still runs it so its own state agrees.
+    // shell still runs it so its own state agrees. The threshold is
+    // where the NEXT prompt will land — the document's end, the same
+    // definition the live tail renders to. (`topLine + rows` would
+    // overshoot: alacritty's clear scrolls out only the rows in use.)
     if (mode === 'terminal' && /^(clear|reset)$/.test(text.trim())) {
-      blocks.clearBefore(hostId, sessionId, meta.topLine + meta.rows)
+      blocks.clearBefore(hostId, sessionId, liveTo)
     }
     sendText(text)
   }
@@ -513,8 +543,8 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
         <div ref={contentRef} className="mt-auto">
           {ready && !meta.alt && (
             <>
-              {moreAbove && <div ref={sentinelRef} className="helm-sentinel" />}
-              {!moreAbove && meta.historyStart > 0 && (
+              {(moreAbove || windowRestricted) && <div ref={sentinelRef} className="helm-sentinel" />}
+              {!moreAbove && !windowRestricted && meta.historyStart > 0 && (
                 <div className="px-4 pt-3 font-mono text-[11px] text-text-disabled">
                   older output no longer retained
                 </div>
@@ -524,39 +554,53 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
                 sessionId={sessionId}
                 blocks={pb.blocks}
                 clearedBefore={pb.clearedBefore}
-                meta={meta}
-                gridFrom={gridFrom}
+                renderFrom={windowFloor}
               />
             </>
           )}
-          {/* The running block. Its xterm host keeps this exact spot in
-              the tree whatever the session's phase, so the terminal is
-              attached once; the pre around it hides at a prompt. */}
-          <div
-            className={running ? 'helm-block group relative' : undefined}
-            data-block-id={running?.id}
-          >
-            {ready && running && <BlockHeader block={running} copyOutput={copyRunning} />}
-            <pre className="helm-block-output" style={xtermShown ? undefined : { display: 'none' }}>
-              {ready && xtermShown && !meta.alt && bodyFrom < gridFrom && (
-                <RowsView hostId={hostId} sessionId={sessionId} from={bodyFrom} to={gridFrom} />
-              )}
-              {/* The band: xterm clipped by sliding it up to the running
-                  command's first row. `clip`, not
-                  `hidden`: a clipped box can't be scrolled by anything
-                  (a focus, a caret move), so the band shows exactly the
-                  rows it's sized for. */}
-              <div className="relative" style={{ height: liveHeight, overflow: 'clip' }}>
-                <div
-                  ref={xtermHostRef}
-                  className="absolute inset-x-0"
-                  style={{ top: -liveStartRow * cellH, height: hostHeight, overflow: 'clip' }}
+          {/* The running block: the live tail as the same DOM rows as
+              everything above it, terminal cursor spliced in as an
+              inline caret. */}
+          {showLive && (
+            <div
+              className={running ? 'helm-block group relative' : undefined}
+              data-block-id={running?.id}
+            >
+              {running && <BlockHeader block={running} copyOutput={copyRunning} />}
+              <pre className="helm-block-output">
+                <RowsView
+                  hostId={hostId}
+                  sessionId={sessionId}
+                  from={Math.max(bodyFrom, windowFloor)}
+                  to={liveTo}
+                  cursor={cursor}
                 />
-              </div>
-            </pre>
-          </div>
+              </pre>
+            </div>
+          )}
         </div>
       </div>
+
+      {/* The xterm: hidden input encoder in normal mode, the TUI's
+          surface on the alt screen. Always mounted and painted — its
+          size drives the PTY dimensions and its DEC modes drive key
+          encoding — sized to the pane (minus the native bar) so a
+          growing composer overlays the grid instead of resizing the
+          PTY on every newline. */}
+      <div
+        ref={xtermHostRef}
+        // Geometry from the same CSS variables the text column and the
+        // bar use, so PTY sizing can't drift from what the DOM renders:
+        // the side insets mirror `.helm-block-output`'s padding (any
+        // wider and every full-width line soft-wraps), and the height
+        // stops above `.helm-bar`.
+        className={`absolute top-0 ${meta.alt ? 'z-10' : 'pointer-events-none opacity-0'}`}
+        style={{
+          left: 'var(--helm-pad-x)',
+          right: 'var(--helm-pad-x)',
+          height: nativeBar ? 'calc(100% - var(--helm-bar-h) - 2 * var(--helm-bar-margin))' : '100%',
+        }}
+      />
 
       {composerShown && (
         <Composer
@@ -569,6 +613,15 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
           onModeChange={onModeChange}
           onSend={onSend}
           onRaw={(bytes) => void screen.sendInput(hostId, sessionId, bytes)}
+          onFileSearch={async (query) => {
+            const result = await commands.sessionFileSearch(hostId, sessionId, query, 20)
+            if (result.status === 'error') throw new Error(result.error)
+            return result.data
+          }}
+          onAgentCommands={async () => {
+            const result = await commands.sessionAgentCommands(hostId, sessionId)
+            return result.status === 'ok' ? result.data : []
+          }}
           onPathComplete={async (path, directoriesOnly) => {
             const result = await commands.sessionPathComplete(
               hostId,
@@ -602,6 +655,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
         <SearchOverlay
           helm={helmTerm}
           container={scrollRef.current}
+          alt={meta.alt}
           onClose={() => setSearchOpen(false)}
         />
       )}

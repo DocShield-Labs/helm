@@ -27,15 +27,29 @@ function compile(query: string, opts: DomFindOptions): RegExp | null {
   }
 }
 
-/** All matches of `query` inside `root`'s block output, document order. */
+/** Matches of `query` inside `root`'s block output, document order.
+ *
+ * Collected NEWEST-first and capped: in a session that has scrolled a
+ * lot, a short query matches everywhere, and painting thousands of
+ * highlight ranges across a `content-visibility` document stalls the
+ * main thread for seconds. The newest `MAX_MATCHES` are the ones a
+ * terminal search wants anyway (stepping starts from the bottom).
+ * Sub-`MIN_QUERY` queries skip the DOM entirely — every single letter
+ * would hit the cap and the highlights would be pure noise. */
 export function findInBlocks(root: HTMLElement, query: string, opts: DomFindOptions): Range[] {
+  if (query.length < MIN_QUERY) return []
   const re = compile(query, opts)
   if (!re) return []
+  // Bodies newest-first so the cap keeps the matches a terminal search
+  // wants (stepping starts from the bottom); each body walks forward —
+  // no node buffering — and its matches are appended newest-first, then
+  // the whole list flips back to document order.
+  const bodies = root.querySelectorAll<HTMLElement>('.helm-block-output, .helm-block-header')
   const out: Range[] = []
-  // Walk only block bodies and headers — everything under them is a
-  // candidate, so no per-node ancestor checks.
-  for (const body of root.querySelectorAll<HTMLElement>('.helm-block-output, .helm-block-header')) {
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT)
+  const inBody: Range[] = []
+  for (let i = bodies.length - 1; i >= 0 && out.length < MAX_MATCHES; i--) {
+    inBody.length = 0
+    const walker = document.createTreeWalker(bodies[i], NodeFilter.SHOW_TEXT)
     let node: Node | null
     while ((node = walker.nextNode())) {
       const text = node.textContent ?? ''
@@ -49,27 +63,52 @@ export function findInBlocks(root: HTMLElement, query: string, opts: DomFindOpti
         const r = document.createRange()
         r.setStart(node, m.index)
         r.setEnd(node, m.index + m[0].length)
-        out.push(r)
-        if (out.length >= MAX_MATCHES) return out
+        inBody.push(r)
       }
     }
+    for (let j = inBody.length - 1; j >= 0 && out.length < MAX_MATCHES; j--) {
+      out.push(inBody[j])
+    }
   }
-  return out
+  return out.reverse()
 }
 
-/** Cap so a pathological query can't allocate unbounded Ranges. */
-export const MAX_MATCHES = 2000
+/** Highlight-range cap — newest matches win; see `findInBlocks`. */
+export const MAX_MATCHES = 500
+
+/** Queries shorter than this skip the DOM search. */
+export const MIN_QUERY = 2
+
+// One persistent Highlight per name, registered once and MUTATED —
+// never replaced or deleted. WebKit's repaint invalidation tracks
+// mutations of a registered Highlight; wholesale `set`/`delete` of the
+// registry entry can leave the old ranges' pixels painted (the stale
+// yellow active-match that survived closing the search bar).
+let allMatches: Highlight | null = null
+let activeMatch: Highlight | null = null
+
+function ensureRegistered(): boolean {
+  if (!highlightsSupported()) return false
+  if (!allMatches) {
+    allMatches = new Highlight()
+    activeMatch = new Highlight()
+    CSS.highlights.set(HIGHLIGHT_ALL, allMatches)
+    CSS.highlights.set(HIGHLIGHT_ACTIVE, activeMatch)
+  }
+  return true
+}
 
 export function applyHighlights(ranges: Range[], activeIndex: number): void {
-  if (!highlightsSupported()) return
-  CSS.highlights.set(HIGHLIGHT_ALL, new Highlight(...ranges))
-  const active = activeIndex >= 0 && activeIndex < ranges.length ? [ranges[activeIndex]] : []
-  CSS.highlights.set(HIGHLIGHT_ACTIVE, new Highlight(...active))
+  if (!ensureRegistered()) return
+  allMatches!.clear()
+  for (const r of ranges) allMatches!.add(r)
+  activeMatch!.clear()
+  if (activeIndex >= 0 && activeIndex < ranges.length) activeMatch!.add(ranges[activeIndex])
 }
 
 export function clearHighlights(): void {
-  CSS.highlights?.delete(HIGHLIGHT_ALL)
-  CSS.highlights?.delete(HIGHLIGHT_ACTIVE)
+  allMatches?.clear()
+  activeMatch?.clear()
 }
 
 export function scrollRangeIntoView(r: Range): void {

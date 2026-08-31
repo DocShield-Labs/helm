@@ -13,10 +13,19 @@
 //!     the model itself, straight to the PTY, so no client ever sees a
 //!     query or answers one twice.
 //!
-//! alacritty keeps its own scrollback ring; we drain it into `history`
-//! after every feed so the absolute line numbering is ours and reflow
-//! on resize never rewrites history rows (a row is immutable once it
-//! has scrolled out — exactly what a client needs to cache it).
+//! alacritty keeps its own scrollback ring; rows that scroll into it
+//! are exported into `history` after every feed, but stay in the ring
+//! (trimmed to a small tail) so a rows-grow can pull them back onto the
+//! grid the way every normal terminal restores scrollback. Without
+//! that, a grow leaves the top of the screen blank, SIGWINCH makes the
+//! application repaint content the model already exported, and the
+//! repaint lands at NEW line numbers — a permanent duplicate (measured:
+//! examples/replay.rs). Restored rows keep their original absolute
+//! lines: `top_line` moves back down and history is un-exported to
+//! match, so a line is never claimed by history and the grid at once.
+//! History rows are immutable except for exactly those reclaimed
+//! lines, which are re-exported (possibly modified) when they scroll
+//! out again — clients upsert by absolute line.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
@@ -46,12 +55,18 @@ use crate::session::READ_BUF_LEN;
 /// agent output. Phase 2 moves the tail to disk.
 pub const MAX_HISTORY_ROWS: usize = 100_000;
 
-/// alacritty's own scrollback ring. We drain it after every feed, so it
-/// only has to hold what one feed can scroll out: at most one line per
-/// byte of a PTY read. If it ever saturated, alacritty would evict rows
-/// silently and our absolute line numbers would drift, so the margin is
-/// generous and `drain_history` asserts it.
+/// alacritty's own scrollback ring cap. The ring is trimmed to
+/// `RING_KEEP` after every export, so between drains it only has to
+/// hold that tail plus what one feed can scroll out: at most one line
+/// per byte of a PTY read. If it ever saturated, alacritty would evict
+/// rows silently and our absolute line numbers would drift, so the
+/// margin is generous and `drain_history` asserts it.
 const MODEL_SCROLLBACK: usize = 4 * READ_BUF_LEN;
+
+/// Rows left in alacritty's ring after an export — the tail a rows-grow
+/// can restore. Larger than any real screen height; every row in it is
+/// already exported, so trimming loses nothing.
+const RING_KEEP: usize = 512;
 
 /// The PTY writer, shared between the session (client input) and the
 /// model (query answers).
@@ -168,6 +183,11 @@ pub struct SessionScreen {
     /// Rows in `[pending_first, top_line)` scrolled out since clients
     /// were last told.
     pending_first: u64,
+    /// Ring rows already exported to `history` — the drain baseline.
+    ring_rows: usize,
+    /// A resize happened while the alt screen hid the primary grid; the
+    /// ring change is reconciled at the next non-alt drain.
+    alt_resized: bool,
     max_history: usize,
     /// What clients were last told the grid looks like: a hash per row
     /// (alacritty re-damages the cursor's row on every read, and marks
@@ -213,6 +233,8 @@ impl SessionScreen {
             history_start: 0,
             top_line: 0,
             pending_first: 0,
+            ring_rows: 0,
+            alt_resized: false,
             max_history,
             sent_hashes: Vec::new(),
             sent_cols: 0,
@@ -256,33 +278,89 @@ impl SessionScreen {
         self.term
             .resize(TermSize::new(cols as usize, rows as usize));
         self.size.store(pack(cols, rows), Ordering::Relaxed);
-        // Shrinking pushes the top rows into alacritty's scrollback.
-        self.drain_history();
+        if self.alt_screen() {
+            // `grid()` is the alt grid here; the primary's ring moved
+            // invisibly. Reconciled at the next non-alt drain.
+            self.alt_resized = true;
+            return;
+        }
+        // Shrinking pushes top rows into the ring (export); growing
+        // pulls rows back out of it onto the grid (restore).
+        self.reconcile_ring(true);
     }
 
-    /// Move whatever alacritty scrolled out into our history.
+    /// Reconcile the ring after a feed: export what scrolled out.
     fn drain_history(&mut self) {
         // The alt grid has no scrollback and the primary is parked
         // while a TUI holds the screen: nothing can have scrolled out.
+        // (A resize during alt is flagged and reconciled on exit.)
         if self.alt_screen() {
             return;
         }
-        let n = self.term.grid().history_size();
-        if n == 0 {
-            return;
+        let restore = std::mem::take(&mut self.alt_resized);
+        self.reconcile_ring(restore);
+    }
+
+    /// Bring `history`/`top_line` in line with alacritty's ring.
+    ///
+    /// The ring grew: rows scrolled out (a feed, or a shrink) — export
+    /// the new tail, leaving it in the ring for a later grow.
+    ///
+    /// The ring shrank and `may_restore` (a resize did it): a rows-grow
+    /// pulled rows back onto the grid, LIFO, exactly the newest exported
+    /// rows — un-export them so their lines are the grid's again.
+    ///
+    /// The ring shrank in a feed (`may_restore` false): the application
+    /// cleared its scrollback (ED3/RIS), which empties the ring without
+    /// moving grid row 0. Everything wiped was already exported; rows
+    /// scrolled after the clear in the same feed are the whole ring now,
+    /// so the baseline resets to zero and they export normally. (Rows
+    /// that scrolled *before* the clear in the same feed are lost and
+    /// `top_line` does not advance for them — the same blind spot the
+    /// clear-every-drain model had.)
+    fn reconcile_ring(&mut self, may_restore: bool) {
+        let ring = self.term.grid().history_size();
+        if ring < self.ring_rows {
+            if may_restore {
+                let restored = (self.ring_rows - ring).min(self.history.len());
+                self.top_line -= restored as u64;
+                let keep = self.history.len() - restored;
+                self.history.truncate(keep);
+                self.pending_first = self.pending_first.min(self.top_line);
+                self.ring_rows = ring;
+                return;
+            }
+            self.ring_rows = 0;
         }
-        debug_assert!(
-            n < MODEL_SCROLLBACK,
-            "alacritty scrollback saturated: lines would drift"
-        );
-        for i in (1..=n).rev() {
-            self.history.push_back(self.grid_row(-(i as i32)));
+        let scrolled = ring - self.ring_rows;
+        if scrolled > 0 {
+            debug_assert!(
+                ring < MODEL_SCROLLBACK,
+                "alacritty scrollback saturated: lines would drift"
+            );
+            for i in (1..=scrolled).rev() {
+                self.history.push_back(self.grid_row(-(i as i32)));
+            }
+            self.top_line += scrolled as u64;
+            while self.history.len() > self.max_history {
+                self.history.pop_front();
+                self.history_start += 1;
+            }
         }
-        self.term.grid_mut().clear_history();
-        self.top_line += n as u64;
-        while self.history.len() > self.max_history {
-            self.history.pop_front();
-            self.history_start += 1;
+        self.ring_rows = ring;
+        self.trim_ring();
+    }
+
+    /// Trim the ring to `RING_KEEP`: everything in it is exported, so
+    /// only the tail a grow could want back needs to stay. The grid API
+    /// has no plain truncate — `update_history` shrinks stored rows AND
+    /// lowers the ring's cap, so the cap is restored right after; the
+    /// cap is what keeps one huge feed from silently evicting rows.
+    fn trim_ring(&mut self) {
+        if self.ring_rows > RING_KEEP {
+            self.term.grid_mut().update_history(RING_KEEP);
+            self.term.grid_mut().update_history(MODEL_SCROLLBACK);
+            self.ring_rows = RING_KEEP;
         }
     }
 
@@ -331,10 +409,13 @@ impl SessionScreen {
         let cols = self.term.columns();
         let nrows = self.term.screen_lines();
 
-        let scroll = (self.top_line - self.sent_top_line) as usize;
+        // A grow-restore moves `top_line` BACK (rows return to the grid);
+        // that is never a scroll, always a full repaint — expressed here
+        // as the absence of a forward scroll.
+        let forward = self.top_line.checked_sub(self.sent_top_line);
         let same_shape = self.sent_hashes.len() == nrows && self.sent_cols == cols;
         let alt_flip = (self.sent_modes ^ modes) & modes::ALT_SCREEN != 0;
-        if !same_shape || alt_flip || scroll >= nrows {
+        if !same_shape || alt_flip || forward.is_none_or(|s| s >= nrows as u64) {
             let screen = self.snapshot();
             self.sent_hashes = screen.lines.iter().map(row_hash).collect();
             self.sent_cols = cols;
@@ -343,6 +424,7 @@ impl SessionScreen {
             self.sent_modes = modes;
             return Update::Full(screen);
         }
+        let scroll = forward.unwrap_or(0) as usize;
         if scroll > 0 {
             self.sent_hashes.drain(..scroll);
             self.sent_hashes.resize(nrows, self.empty_hash);
@@ -790,6 +872,155 @@ mod tests {
         assert_eq!(texts(&s.history_page(0, u64::MAX).1), vec!["a", "b"]);
         assert_eq!(texts(&s.snapshot().lines), vec!["c", "d"]);
         assert!(matches!(s.take_update(), Update::Full(_)));
+    }
+
+    /// The invariant nothing may break: a line is owned by history XOR
+    /// the grid, and the bookkeeping all agrees.
+    fn assert_consistent(s: &SessionScreen) {
+        assert_eq!(
+            s.top_line(),
+            s.history_start() + s.history.len() as u64,
+            "history span must end exactly at top_line"
+        );
+    }
+
+    #[test]
+    fn grow_restores_rows_at_their_original_lines() {
+        let (mut s, _) = screen(20, 4);
+        for i in 0..10 {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        assert_eq!(s.top_line(), 7);
+        let _ = s.take_update();
+        // Grow by 4 rows: the 4 newest history rows come back to the
+        // grid at their original absolute lines — top_line moves BACK.
+        s.resize(20, 8);
+        assert_eq!(s.top_line(), 3);
+        assert_consistent(&s);
+        assert_eq!(texts(&s.history_page(0, u64::MAX).1), vec!["l0", "l1", "l2"]);
+        assert_eq!(
+            texts(&s.snapshot().lines),
+            vec!["l3", "l4", "l5", "l6", "l7", "l8", "l9", ""]
+        );
+        // No line is claimed twice, and the client gets a full repaint.
+        assert!(matches!(s.take_update(), Update::Full(_)));
+    }
+
+    #[test]
+    fn rescroll_after_restore_reexports_by_line() {
+        let (mut s, _) = screen(20, 4);
+        for i in 0..10 {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        let (first, rows) = s.take_pending_history();
+        assert_eq!((first, rows.len()), (0, 7)); // clients told l0..l6
+        s.resize(20, 8); // restore l3..l6
+        assert_eq!(s.top_line(), 3);
+        // Scroll again: the restored lines leave the grid a second time
+        // and are re-exported from line 3 — an upsert for the client.
+        for i in 10..16 {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        assert_consistent(&s);
+        let (first, rows) = s.take_pending_history();
+        assert_eq!(first, 3);
+        assert_eq!(texts(&rows)[..4], ["l3", "l4", "l5", "l6"]);
+        // And history itself holds each line exactly once.
+        let (from, page) = s.history_page(0, u64::MAX);
+        assert_eq!(from, 0);
+        let expect: Vec<String> = (0..(s.top_line() as usize)).map(|i| format!("l{i}")).collect();
+        assert_eq!(texts(&page), expect);
+    }
+
+    #[test]
+    fn shrink_then_grow_round_trips_without_duplication() {
+        let (mut s, _) = screen(20, 6);
+        for i in 0..8 {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        let before: Vec<String> = {
+            let (_, page) = s.history_page(0, u64::MAX);
+            let mut v = texts(&page);
+            v.extend(texts(&s.snapshot().lines));
+            v
+        };
+        s.resize(20, 3); // push
+        assert_consistent(&s);
+        s.resize(20, 6); // pull the same rows back
+        assert_consistent(&s);
+        let after: Vec<String> = {
+            let (_, page) = s.history_page(0, u64::MAX);
+            let mut v = texts(&page);
+            v.extend(texts(&s.snapshot().lines));
+            v
+        };
+        assert_eq!(before, after, "a resize round trip must not duplicate or lose rows");
+    }
+
+    #[test]
+    fn ed3_clears_ring_without_moving_lines() {
+        let (mut s, _) = screen(20, 4);
+        for i in 0..10 {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        assert_eq!(s.top_line(), 7);
+        // The application wipes its scrollback: grid row 0 doesn't move,
+        // exported history is ours and survives.
+        s.advance(b"\x1b[3J");
+        assert_eq!(s.top_line(), 7);
+        assert_consistent(&s);
+        assert_eq!(s.history_page(0, u64::MAX).1.len(), 7);
+        // A grow now has nothing to restore (the ring is empty) — the
+        // grid grows blank, and lines still don't drift.
+        s.resize(20, 6);
+        assert_eq!(s.top_line(), 7);
+        assert_consistent(&s);
+        // Scrolling afterwards exports from the right line.
+        for i in 10..18 {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        assert_consistent(&s);
+        let (_, page) = s.history_page(7, u64::MAX);
+        assert_eq!(texts(&page)[0], "l7");
+    }
+
+    #[test]
+    fn resize_during_alt_reconciles_on_exit() {
+        let (mut s, _) = screen(20, 4);
+        for i in 0..10 {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        assert_eq!(s.top_line(), 7);
+        s.advance(b"\x1b[?1049h"); // enter alt
+        s.resize(20, 8); // grow while the TUI owns the screen
+        s.advance(b"\x1b[?1049l"); // exit alt
+        s.advance(b"");
+        // drain on the exit feed reconciles: rows restored to the grid.
+        s.advance(b"x");
+        assert_eq!(s.top_line(), 3);
+        assert_consistent(&s);
+        let (_, page) = s.history_page(0, u64::MAX);
+        assert_eq!(texts(&page), vec!["l0", "l1", "l2"]);
+    }
+
+    #[test]
+    fn ring_trim_never_moves_lines() {
+        let (mut s, _) = screen(20, 4);
+        // Scroll far past RING_KEEP so the ring gets trimmed repeatedly.
+        for i in 0..(RING_KEEP + 300) {
+            s.advance(format!("l{i}\r\n").as_bytes());
+        }
+        let expected_top = (RING_KEEP + 300 + 1 - 4) as u64;
+        assert_eq!(s.top_line(), expected_top);
+        assert_consistent(&s);
+        // A grow can still restore up to the kept tail, at true lines.
+        s.resize(20, 8);
+        assert_eq!(s.top_line(), expected_top - 4);
+        assert_consistent(&s);
+        // Line N holds "lN" by construction; the newest history row is
+        // the line just below the restored grid top.
+        let (_, page) = s.history_page(s.top_line() - 1, u64::MAX);
+        assert_eq!(texts(&page), vec![format!("l{}", s.top_line() - 1)]);
     }
 
     #[test]
