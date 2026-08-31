@@ -44,6 +44,7 @@ import type { HostId } from '@bindings'
 import { commands } from '@lib/ipc'
 import { attachTerminal, getTheme, type HelmTerminal } from '@lib/terminal'
 import { domAdvancePx } from '@lib/terminal/cellHeight'
+import { registerSessionDiag } from '@lib/diag'
 import { useStore } from '@lib/store'
 import * as blocks from '@lib/session/blocks'
 import {
@@ -243,6 +244,30 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
       rowsToText(screen.rowsBetween(screen.getSessionScreen(hostId, sessionId), bodyFrom, liveTo)),
     )
 
+  // Render-scope state for the diagnostics probe (registered in the
+  // mount effect below): refreshed every render so a dump reads the
+  // values the view is actually laying out with, not mount-time ones.
+  const diagStateRef = useRef<Record<string, unknown>>({})
+  diagStateRef.current = {
+    kind: ps.kind,
+    phase: ps.phase,
+    mode,
+    ready,
+    is_visible: isVisible,
+    composer_shown: composerShown,
+    native_bar: nativeBar,
+    show_live: showLive,
+    alt_screen: meta.alt,
+    top_line: meta.topLine,
+    used_rows: meta.usedRows,
+    agent_used_rows: meta.agentUsedRows,
+    history_start: meta.historyStart,
+    loaded_from: meta.loadedFrom,
+    body_from: bodyFrom,
+    live_to: liveTo,
+    window_floor: windowFloor,
+  }
+
   // ---- xterm lifecycle + first paint ----
   useEffect(() => {
     const host = xtermHostRef.current
@@ -253,6 +278,79 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     const { term, dispose } = attached
     termRef.current = attached
     setHelmTerm(attached)
+    // Full geometry snapshot for ⌘K Copy diagnostics: the PTY's size on
+    // all three sides (xterm's belief, the client screen mirror, the
+    // daemon via the Rust half), the container boxes the fit derives
+    // from, and a content-free shape of the grid tail — enough to
+    // localize any sizing bug to its link in the chain from one paste.
+    const unregisterDiag = registerSessionDiag(`${hostId}::${sessionId}`, () => {
+      const s = screen.getSessionScreen(hostId, sessionId)
+      const sc = scrollRef.current
+      const root = rootRef.current
+      const xh = xtermHostRef.current
+      const px = (n: number) => Math.round(n * 10) / 10
+      const rect = (el: HTMLElement | null) => {
+        if (!el) return null
+        const r = el.getBoundingClientRect()
+        return { width: px(r.width), height: px(r.height) }
+      }
+      let proposed: { cols: number; rows: number } | null = null
+      try {
+        const d = attached.fit.proposeDimensions()
+        if (d) proposed = { cols: d.cols, rows: d.rows }
+      } catch {
+        /* not laid out */
+      }
+      // xterm's real rendered cell height — the number the row count is
+      // derived from. When it disagrees with --helm-line-px, the DOM
+      // document and the PTY disagree about how tall the pane is.
+      const xtermScreen = xh?.querySelector('.xterm-screen') as HTMLElement | null
+      const screenRect = xtermScreen?.getBoundingClientRect()
+      const cellPx =
+        screenRect && term.rows > 0 && screenRect.height > 0
+          ? Math.round((screenRect.height / term.rows) * 100) / 100
+          : null
+      return {
+        ...diagStateRef.current,
+        xterm: {
+          cols: term.cols,
+          rows: term.rows,
+          line_height_option: term.options.lineHeight ?? 1,
+          cell_px: cellPx,
+          proposed,
+        },
+        mirror: {
+          loaded: s.loaded,
+          cols: s.cols,
+          rows: s.rows,
+          top_line: s.topLine,
+          grid_len: s.grid.length,
+          cursor: { row: s.cursor.row, col: s.cursor.col, visible: s.cursor.visible },
+        },
+        pane: rect(root),
+        xterm_host: rect(xh),
+        scroll: sc
+          ? {
+              client_width: sc.clientWidth,
+              client_height: sc.clientHeight,
+              scroll_height: sc.scrollHeight,
+              scroll_top: Math.round(sc.scrollTop),
+              scrollbar_px: sc.offsetWidth - sc.clientWidth,
+              at_bottom: atBottomRef.current,
+            }
+          : null,
+        composer_height:
+          (root?.querySelector('.helm-composer') as HTMLElement | null)?.getBoundingClientRect()
+            .height ?? null,
+        // The grid tail's shape without its content: where blank rows
+        // and the TUI's bottom chrome sit relative to the used extent.
+        grid_tail: s.grid.slice(-40).map((r) => ({
+          len: r.spans.reduce((n, sp) => n + sp.text.length, 0),
+          blank: !r.spans.some((sp) => /\S/.test(sp.text)),
+          wrapped: r.wrapped,
+        })),
+      }
+    })
     const painter = attachPainter(term, hostId, sessionId, () => visibleRef.current)
     painterRef.current = painter
 
@@ -298,6 +396,7 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     return () => {
       ac.abort()
       window.clearTimeout(resizeTimer)
+      unregisterDiag()
       painter.dispose()
       inputDisp.dispose()
       resizeDisp.dispose()
@@ -348,6 +447,30 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   useEffect(() => {
     if (ready && isVisible) scheduleFit()
   }, [ready, nativeBar, isVisible, scheduleFit])
+
+  // Reconcile against the daemon's authoritative PTY size, which flows
+  // back on every tree event. fitNow's guard compares proposed dims
+  // against xterm's own belief — so a single lost `sessionResize`
+  // (fire-and-forget, and easy to drop across a reconnect or a daemon
+  // swap) leaves the daemon at one size and xterm at another forever,
+  // with the TUI drawing into the wrong geometry. The delay + re-check
+  // keeps this quiet while a drag streams tree updates; at rest it
+  // fires once, the next tree event confirms, and it goes silent.
+  const daemonCols = session?.cols
+  const daemonRows = session?.rows
+  useEffect(() => {
+    if (!ready || !isVisible || daemonCols === undefined || daemonRows === undefined) return
+    const t = termRef.current
+    if (!t || (daemonCols === t.term.cols && daemonRows === t.term.rows)) return
+    const timer = window.setTimeout(() => {
+      const now = termRef.current
+      const s = useStore.getState().sessions.get(hostId)?.sessions.get(sessionId)
+      if (!now || !s) return
+      if (s.cols === now.term.cols && s.rows === now.term.rows) return
+      void commands.sessionResize(hostId, sessionId, now.term.cols, now.term.rows)
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [ready, isVisible, daemonCols, daemonRows, hostId, sessionId])
 
   // ---- paging: the sentinel widens the render window over rows the
   // client already holds (cheap, synchronous), and only once the window

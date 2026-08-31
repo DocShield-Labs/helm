@@ -10,6 +10,8 @@ export function treeToSessions(tree: SessionTree): Session[] {
     id: session.id,
     name: session.name,
     command: session.command ?? '',
+    cols: session.cols,
+    rows: session.rows,
     cwd: session.cwd ?? '',
     branch: session.branch ?? '',
     root: session.root ?? '',

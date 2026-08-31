@@ -1,9 +1,13 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
+import { installErrorCapture } from '@lib/diag'
 import { commands } from '@lib/ipc'
 import { useStore } from '@lib/store'
 import './index.css'
+
+// Errors feed the ⌘K Copy diagnostics dump; capture from the first tick.
+installErrorCapture()
 
 // Expose the typed commands surface on `window` so devtools pastes can
 // drive Tauri without enabling `withGlobalTauri`. Cheap; harmless in prod.

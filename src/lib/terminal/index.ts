@@ -316,6 +316,19 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
   // Re-measure (cache only) on host resize — font-size or DPR changes.
   const ro = new ResizeObserver(() => measureCellSize())
   ro.observe(host)
+  // Webfonts landing AFTER the correction passes change the font's
+  // natural height, silently invalidating the lineHeight we solved
+  // for — the cell drifts off `--helm-line-px`, the PTY gets more (or
+  // fewer) rows than the DOM renders in the same pixels, and a TUI's
+  // bottom-anchored chrome draws past the pane. The advance cache
+  // already resets on fonts.ready (cellHeight.ts); re-arm the height
+  // correction on the same signal.
+  let disposed = false
+  void document.fonts?.ready.then(() => {
+    if (disposed) return
+    corrections = 0
+    correctLineHeight()
+  })
   // Start the lineHeight correction only once xterm has actually
   // rendered: fit()/syncScrollArea read `renderer.dimensions`, which is
   // undefined until the first paint (throws otherwise), and the screen
@@ -337,6 +350,7 @@ export function attachTerminal(host: HTMLElement, opts: AttachOptions = {}): Hel
       term.options.theme = xtermThemeFor(theme)
     },
     dispose: () => {
+      disposed = true
       attached.delete(helm)
       ro.disconnect()
       firstRender?.dispose()

@@ -20,6 +20,8 @@ describe('treeToSessions', () => {
       id: '3',
       name: 'shell',
       command: 'zsh',
+      cols: 80,
+      rows: 24,
       cwd: '/repo',
       branch: 'main',
       root: '/repo',
