@@ -166,8 +166,11 @@ pub type SharedHostEntry = Arc<Mutex<HostEntry>>;
 
 pub struct AppState {
     /// All known hosts. Localhost is always present; remote hosts are
-    /// loaded/saved via `hosts.json`.
-    pub hosts: DashMap<HostId, SharedHostEntry>,
+    /// loaded/saved via `hosts.json`; retired daemon generations are
+    /// discovered on connect and removed when they empty out. Arc so
+    /// long-lived connection tasks can register/remove retired entries
+    /// without holding `State`.
+    pub hosts: Arc<DashMap<HostId, SharedHostEntry>>,
 
     /// Stable id for the always-present localhost entry.
     pub local_host_id: HostId,
@@ -248,7 +251,7 @@ impl Default for AppState {
             hosts.insert(host.id, Arc::new(Mutex::new(HostEntry::new(host))));
         }
         Self {
-            hosts,
+            hosts: Arc::new(hosts),
             local_host_id: local_id,
             event_tx: Mutex::new(None),
             pending_host_key_prompts: Arc::new(DashMap::new()),

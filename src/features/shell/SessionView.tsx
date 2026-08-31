@@ -154,10 +154,22 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
   const fitNow = useCallback(() => {
     const t = termRef.current
     const host = xtermHostRef.current
-    if (!t || !host || !visibleRef.current) return
+    const sc = scrollRef.current
+    if (!t || !host || !sc || !visibleRef.current) return
     const dimensions = t.fit.proposeDimensions()
     if (!dimensions) return
-    const cols = Math.max(2, Math.floor(host.clientWidth / domAdvancePx()))
+    // Width comes from the SCROLL CONTAINER's content box, not the
+    // overlay: when content grows past one screen, a space-taking
+    // scrollbar (mouse plugged in, or "always show") narrows the rows'
+    // text area while the overlay — absolutely positioned outside the
+    // scroll container — keeps full width. Measured there, cols land a
+    // couple too wide and every full-width line soft-wraps the moment
+    // the scrollbar appears. clientWidth excludes the scrollbar, and
+    // the observer refits when it comes and goes.
+    const padX =
+      parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--helm-pad-x')) || 16
+    const width = sc.clientWidth - 2 * padX
+    const cols = Math.max(2, Math.floor(width / domAdvancePx()))
     const rows = dimensions.rows
     if (cols === t.term.cols && rows === t.term.rows) return
     painterRef.current?.resizeAndRepaint(() => {

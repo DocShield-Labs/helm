@@ -22,6 +22,58 @@ pub fn default_socket_path() -> PathBuf {
         .join("helmd.sock")
 }
 
+/// Where this daemon currently listens. Shared with every client
+/// handler so the RETIRE extension can rename the socket in place —
+/// a bound unix socket is a filesystem entry, so renaming it moves
+/// where *new* clients connect while the listener and every live
+/// connection carry on.
+pub struct ServeCtx {
+    socket: std::sync::Mutex<PathBuf>,
+}
+
+impl ServeCtx {
+    fn new(socket: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            socket: std::sync::Mutex::new(socket),
+        })
+    }
+
+    fn current_socket(&self) -> PathBuf {
+        self.socket.lock().unwrap().clone()
+    }
+
+    /// Move the socket aside for retirement and return where it now
+    /// lives. Idempotent — a second retire returns the same path.
+    fn retire_socket(&self) -> std::io::Result<PathBuf> {
+        let mut current = self.socket.lock().unwrap();
+        if is_retired_socket(&current) {
+            return Ok(current.clone());
+        }
+        let retired = retired_socket_path(&current, std::process::id());
+        std::fs::rename(&*current, &retired)?;
+        *current = retired.clone();
+        Ok(retired)
+    }
+}
+
+/// `~/.helm/helmd.sock` → `~/.helm/helmd-retired-<pid>.sock`. Keyed
+/// off the socket's own stem so a dev daemon (`helmd-dev.sock`)
+/// retires into its own namespace and discovery never crosses over.
+pub fn retired_socket_path(socket: &Path, pid: u32) -> PathBuf {
+    let stem = socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("helmd");
+    socket.with_file_name(format!("{stem}-retired-{pid}.sock"))
+}
+
+fn is_retired_socket(socket: &Path) -> bool {
+    socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.contains("-retired-"))
+}
+
 /// Run the daemon on `socket_path` until `Shutdown` (or forever).
 pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -39,6 +91,7 @@ pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
     let listener = UnixListener::bind(socket_path)?;
     tracing::info!(socket = %socket_path.display(), version = DAEMON_VERSION, "helmd listening");
 
+    let ctx = ServeCtx::new(socket_path.to_path_buf());
     let (daemon, events_rx) = Daemon::new();
     tokio::spawn(daemon.clone().run(events_rx));
 
@@ -48,19 +101,28 @@ pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
             accepted = listener.accept() => {
                 let (stream, _addr) = accepted?;
                 let daemon = daemon.clone();
+                let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(daemon, stream).await {
+                    if let Err(e) = handle_client(daemon, ctx, stream).await {
                         tracing::debug!("client ended: {e}");
                     }
                 });
             }
         }
     }
-    tracing::info!(socket = %socket_path.display(), "helmd stopped");
+    // A retired daemon exits here when its last session ends; leaving
+    // the renamed socket behind would make discovery chase a ghost.
+    let socket = ctx.current_socket();
+    let _ = std::fs::remove_file(&socket);
+    tracing::info!(socket = %socket.display(), "helmd stopped");
     Ok(())
 }
 
-async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> anyhow::Result<()> {
+async fn handle_client(
+    daemon: Arc<Daemon>,
+    ctx: Arc<ServeCtx>,
+    stream: UnixStream,
+) -> anyhow::Result<()> {
     let (mut read_half, mut write_half) = stream.into_split();
 
     let (tx, mut rx) = unbounded_channel::<DaemonMsg>();
@@ -94,7 +156,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> anyhow::Resul
         decoder.feed(&buf[..n]);
         loop {
             match decoder.next::<ClientMsg>() {
-                Ok(Some(msg)) => dispatch(&daemon, client_id, &tx, msg),
+                Ok(Some(msg)) => dispatch(&daemon, &ctx, client_id, &tx, msg),
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!("client {client_id}: corrupt stream: {e}");
@@ -114,6 +176,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> anyhow::Resul
 /// Handle one message.
 fn dispatch(
     daemon: &Arc<Daemon>,
+    ctx: &Arc<ServeCtx>,
     client_id: ClientId,
     tx: &tokio::sync::mpsc::UnboundedSender<DaemonMsg>,
     msg: ClientMsg,
@@ -150,6 +213,7 @@ fn dispatch(
                         helm_proto::extensions::DRAIN.into(),
                         helm_proto::extensions::AGENT_COMMANDS.into(),
                         helm_proto::extensions::FILE_SEARCH.into(),
+                        helm_proto::extensions::RETIRE.into(),
                     ],
                 });
             }
@@ -279,6 +343,27 @@ fn dispatch(
                     name,
                     payload: Vec::new(),
                 });
+            } else if name == helm_proto::extensions::RETIRE && payload.is_empty() {
+                match ctx.retire_socket() {
+                    Ok(retired) => {
+                        tracing::info!(
+                            socket = %retired.display(),
+                            "retired: serving existing sessions until they end"
+                        );
+                        let reply = helm_proto::extensions::RetireReply {
+                            socket: retired.to_string_lossy().into_owned(),
+                        };
+                        let _ = tx.send(DaemonMsg::Extension {
+                            req_id,
+                            name,
+                            payload: serde_json::to_vec(&reply).unwrap_or_default(),
+                        });
+                        // After the reply so an already-empty daemon's
+                        // immediate exit doesn't race the ack off the wire.
+                        daemon.begin_drain();
+                    }
+                    Err(e) => err(req_id, "retire", format!("rename socket: {e}")),
+                }
             } else if name == helm_proto::extensions::AGENT_COMMANDS {
                 use helm_proto::extensions::AgentCommandsRequest;
                 let session = match serde_json::from_slice::<AgentCommandsRequest>(&payload) {
@@ -366,11 +451,20 @@ fn wants_capabilities(client_name: &str) -> bool {
 /// spawning `helmd serve` first if nothing is listening. This is the
 /// whole remote transport: helm runs it over an SSH exec channel and
 /// speaks the same frames it would over a local socket.
-pub fn stdio_bridge(socket_path: &Path) -> anyhow::Result<()> {
+///
+/// `attach_only` connects without ever spawning — used to reach a
+/// retired daemon, where spawning a fresh daemon on its socket would
+/// be exactly wrong. The bridge is a byte pipe, so this (new) binary
+/// happily fronts an older daemon speaking its own frames.
+pub fn stdio_bridge(socket_path: &Path, attach_only: bool) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
-    let exe = std::env::current_exe()?;
-    let stream = helm_proto::connect_or_spawn_socket(socket_path, &exe)?;
+    let stream = if attach_only {
+        std::os::unix::net::UnixStream::connect(socket_path)?
+    } else {
+        let exe = std::env::current_exe()?;
+        helm_proto::connect_or_spawn_socket(socket_path, &exe)?
+    };
     let mut sock_read = stream.try_clone()?;
     let mut sock_write = stream;
 
@@ -415,14 +509,20 @@ pub fn stdio_bridge(socket_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn test_ctx() -> Arc<ServeCtx> {
+        ServeCtx::new(std::env::temp_dir().join("helmd-test.sock"))
+    }
+
     #[test]
     fn capabilities_are_only_sent_to_clients_that_opt_in() {
         let (daemon, _events) = Daemon::new();
+        let ctx = test_ctx();
 
         let (legacy_tx, mut legacy_rx) = unbounded_channel();
         let legacy_id = daemon.add_client(legacy_tx.clone());
         dispatch(
             &daemon,
+            &ctx,
             legacy_id,
             &legacy_tx,
             ClientMsg::Hello {
@@ -440,6 +540,7 @@ mod tests {
         let current_id = daemon.add_client(current_tx.clone());
         dispatch(
             &daemon,
+            &ctx,
             current_id,
             &current_tx,
             ClientMsg::Hello {
@@ -468,6 +569,7 @@ mod tests {
         let client_id = daemon.add_client(tx.clone());
         dispatch(
             &daemon,
+            &test_ctx(),
             client_id,
             &tx,
             ClientMsg::Extension {
@@ -487,5 +589,66 @@ mod tests {
             .new_session(None, None, None)
             .unwrap_err()
             .contains("draining"));
+    }
+
+    #[test]
+    fn retire_renames_the_socket_drains_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("helmd.sock");
+        // Stand-in for the bound socket's filesystem entry — rename
+        // semantics are what's under test, not the listener.
+        std::fs::write(&sock, b"").unwrap();
+        let ctx = ServeCtx::new(sock.clone());
+        let (daemon, _events) = Daemon::new();
+        let (tx, mut rx) = unbounded_channel();
+        let client_id = daemon.add_client(tx.clone());
+
+        let retire = |req_id: u64| ClientMsg::Extension {
+            req_id: Some(req_id),
+            name: helm_proto::extensions::RETIRE.into(),
+            payload: Vec::new(),
+        };
+        dispatch(&daemon, &ctx, client_id, &tx, retire(3));
+        let reply = rx.try_recv().unwrap();
+        let DaemonMsg::Extension {
+            req_id: Some(3),
+            payload,
+            ..
+        } = reply
+        else {
+            panic!("unexpected reply: {reply:?}");
+        };
+        let parsed: helm_proto::extensions::RetireReply =
+            serde_json::from_slice(&payload).unwrap();
+        assert!(parsed.socket.contains("helmd-retired-"));
+        assert!(!sock.exists());
+        assert!(PathBuf::from(&parsed.socket).exists());
+        assert!(daemon
+            .new_session(None, None, None)
+            .unwrap_err()
+            .contains("draining"));
+
+        // Retiring again reports the same socket instead of stacking
+        // another rename.
+        dispatch(&daemon, &ctx, client_id, &tx, retire(4));
+        let DaemonMsg::Extension {
+            req_id: Some(4),
+            payload,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected an extension reply");
+        };
+        let again: helm_proto::extensions::RetireReply =
+            serde_json::from_slice(&payload).unwrap();
+        assert_eq!(again.socket, parsed.socket);
+    }
+
+    #[test]
+    fn retired_socket_names_follow_their_stem() {
+        let retired = retired_socket_path(Path::new("/x/.helm/helmd-dev.sock"), 42);
+        assert_eq!(retired, PathBuf::from("/x/.helm/helmd-dev-retired-42.sock"));
+        assert!(is_retired_socket(&retired));
+        assert!(!is_retired_socket(Path::new("/x/.helm/helmd.sock")));
     }
 }

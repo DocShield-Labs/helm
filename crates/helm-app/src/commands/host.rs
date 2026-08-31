@@ -1,15 +1,11 @@
 //! Host registry, lifecycle, and SSH-config helpers. Plus the Phase 0
 //! sanity-ping command.
 
-use async_trait::async_trait;
-use helm_domain::{Host, HostEvent, HostId, HostKeyDecision, HostKeyPromptKind, HostStatus};
-use helm_ssh::HostKeyPrompter;
+use helm_domain::{Host, HostEvent, HostId, HostKeyDecision, HostStatus};
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::State;
-use tokio::sync::{mpsc, oneshot};
 
 use crate::commands::emit_event;
 use crate::notifications;
@@ -164,6 +160,7 @@ pub async fn host_delete(state: State<'_, AppState>, host_id: HostId) -> Result<
         });
     }
 
+    remove_retired_children(&state, host_id).await;
     persist_hosts(&state).await?;
     Ok(())
 }
@@ -250,6 +247,10 @@ async fn persist_hosts(state: &State<'_, AppState>) -> Result<(), String> {
             continue;
         }
         let guard = entry.value().lock().await;
+        // Retired generations are runtime discoveries, not saved hosts.
+        if guard.host.retired.is_some() {
+            continue;
+        }
         to_save.push(guard.host.clone());
     }
     crate::persistence::save_hosts(&to_save)
@@ -330,15 +331,15 @@ pub(crate) async fn connect_host_impl(
     let entry = state
         .entry(host_id)
         .ok_or_else(|| "unknown host".to_string())?;
-    let event_tx = state.event_tx.lock().await.clone();
-    let prompter: Arc<dyn HostKeyPrompter> = Arc::new(AppHostKeyPrompter {
-        host_id,
-        event_tx: event_tx.clone(),
-        pending: state.pending_host_key_prompts.clone(),
-    });
-    let network_online = state.inner().network_online.clone();
-    let wake_signal = state.inner().wake_signal.clone();
-    let notif_ctx = state.notifications_ctx();
+    let deps = crate::connection::ConnectDeps {
+        hosts: state.hosts.clone(),
+        pending_prompts: state.pending_host_key_prompts.clone(),
+        event_tx: state.event_tx.lock().await.clone(),
+        network_online: state.inner().network_online.clone(),
+        wake_signal: state.inner().wake_signal.clone(),
+        notif_ctx: state.notifications_ctx(),
+    };
+    let prompter = crate::connection::prompter_for(host_id, &deps);
 
     // Cancel any prior supervisor (live or in-backoff) so we don't have
     // two reconnect ladders racing for the same host. Reset the
@@ -351,16 +352,7 @@ pub(crate) async fn connect_host_impl(
         guard.voluntary_disconnect = false;
     }
 
-    crate::connection::do_connect(
-        entry,
-        host_id,
-        event_tx,
-        prompter,
-        network_online,
-        wake_signal,
-        notif_ctx,
-    )
-    .await
+    crate::connection::do_connect(entry, host_id, prompter, deps).await
 }
 
 #[tauri::command]
@@ -391,7 +383,43 @@ pub async fn host_disconnect(state: State<'_, AppState>, host_id: HostId) -> Res
         },
     );
     notifications::dismiss_for_host(&notif_ctx, &event_tx, host_id);
+    remove_retired_children(&state, host_id).await;
     Ok(())
+}
+
+/// Retired generations follow their parent's transport lifecycle: when
+/// the parent is disconnected or deleted, their entries are torn down
+/// and removed. The retired daemons themselves keep running — the next
+/// connect to the parent re-discovers whichever still hold sessions.
+async fn remove_retired_children(state: &State<'_, AppState>, parent: HostId) {
+    let entries: Vec<(HostId, crate::state::SharedHostEntry)> = state
+        .hosts
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+    let event_tx = state.event_tx.lock().await.clone();
+    let notif_ctx = state.notifications_ctx();
+    for (id, entry) in entries {
+        let is_child = {
+            let guard = entry.lock().await;
+            guard.host.retired.as_ref().map(|r| r.parent) == Some(parent)
+        };
+        if !is_child {
+            continue;
+        }
+        state.hosts.remove(&id);
+        notifications::dismiss_for_host(&notif_ctx, &event_tx, id);
+        emit_event(&event_tx, HostEvent::HostRemoved { host_id: id });
+        // Detached teardown, same reasoning as host_delete's.
+        tokio::spawn(async move {
+            let mut guard = entry.lock().await;
+            guard.voluntary_disconnect = true;
+            if let Some(handle) = guard.supervisor.take() {
+                handle.abort();
+            }
+            guard.shutdown_session();
+        });
+    }
 }
 
 /// Frontend's response to a `HostKeyPrompt` event. Looks up the matching
@@ -412,47 +440,3 @@ pub async fn host_key_prompt_response(
     }
 }
 
-/// Bridges helm-ssh's host-key callback to the frontend event channel.
-/// One per connect attempt; lives as long as the SSH `Client` (i.e. the
-/// duration of the SSH session). Holds an `Arc` reference into the app's
-/// pending-prompts DashMap so `host_key_prompt_response` can find the
-/// matching oneshot.
-struct AppHostKeyPrompter {
-    host_id: HostId,
-    event_tx: Option<mpsc::UnboundedSender<HostEvent>>,
-    pending: Arc<dashmap::DashMap<HostId, oneshot::Sender<HostKeyDecision>>>,
-}
-
-#[async_trait]
-impl HostKeyPrompter for AppHostKeyPrompter {
-    async fn prompt(
-        &self,
-        hostname: &str,
-        port: u16,
-        algorithm: &str,
-        fingerprint: &str,
-        kind: HostKeyPromptKind,
-    ) -> HostKeyDecision {
-        let (tx, rx) = oneshot::channel();
-        // If a stale entry exists from a prior aborted attempt, drop it
-        // so the new prompt is the one the response command picks up.
-        self.pending.insert(self.host_id, tx);
-        emit_event(
-            &self.event_tx,
-            HostEvent::HostKeyPrompt {
-                host_id: self.host_id,
-                hostname: hostname.to_string(),
-                port,
-                algorithm: algorithm.to_string(),
-                fingerprint: fingerprint.to_string(),
-                prompt: kind,
-            },
-        );
-        match rx.await {
-            Ok(decision) => decision,
-            // Receiver dropped — frontend channel closed mid-prompt
-            // (webview reload, app shutdown). Default to refusing.
-            Err(_) => HostKeyDecision::Reject,
-        }
-    }
-}

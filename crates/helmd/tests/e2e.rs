@@ -407,6 +407,133 @@ fn long_output_pages_through_history() {
     let _ = std::fs::remove_file(&socket);
 }
 
+/// The zero-kill upgrade contract: RETIRE renames the socket under a
+/// live session; the session keeps serving over the renamed socket;
+/// the freed primary path is immediately bindable by a fresh daemon;
+/// new sessions are refused; and once the last session ends the
+/// retired daemon exits and unlinks its socket.
+#[test]
+fn retire_moves_the_socket_under_a_live_session() {
+    let (socket, mut c, mut seen) = start_daemon("retire");
+
+    c.send(&ClientMsg::NewSession {
+        req_id: 2,
+        name: Some("survivor".into()),
+        cwd: None,
+        command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
+    });
+    let session_id = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Created { req_id: 2, session } => Some(*session),
+        _ => None,
+    });
+
+    // Retire: the reply names the renamed socket; the primary path is
+    // freed in the same motion.
+    c.send(&ClientMsg::Extension {
+        req_id: Some(3),
+        name: helm_proto::extensions::RETIRE.into(),
+        payload: Vec::new(),
+    });
+    let retired: helm_proto::extensions::RetireReply = c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Extension {
+            req_id: Some(3),
+            payload,
+            ..
+        } => Some(serde_json::from_slice(payload).unwrap()),
+        _ => None,
+    });
+    let retired_path = PathBuf::from(&retired.socket);
+    assert!(retired.socket.contains("-retired-"), "{}", retired.socket);
+    assert!(!socket.exists(), "primary socket path was not freed");
+    assert!(retired_path.exists(), "renamed socket is missing");
+
+    // The connection that asked is still alive...
+    c.send(&ClientMsg::Ping { req_id: 4 });
+    c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Pong { req_id: 4 } => Some(()),
+        _ => None,
+    });
+    // ...but new sessions are refused.
+    c.send(&ClientMsg::NewSession {
+        req_id: 5,
+        name: None,
+        cwd: None,
+        command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()]),
+    });
+    c.recv_until(5, &mut seen, |m| match m {
+        DaemonMsg::Error {
+            req_id: Some(5),
+            message,
+            ..
+        } => {
+            assert!(message.contains("draining"), "{message}");
+            Some(())
+        }
+        _ => None,
+    });
+
+    // A fresh client reattaches over the renamed socket and finds the
+    // surviving session in the handshake snapshot.
+    let mut c2 = TestClient::connect(&retired_path);
+    let mut seen2 = Vec::new();
+    c2.send(&ClientMsg::Hello {
+        protocol_version: helm_proto::PROTOCOL_VERSION,
+        client_name: "e2e-retire-reattach".into(),
+    });
+    c2.recv_until(5, &mut seen2, |m| match m {
+        DaemonMsg::HelloAck { state, .. } => {
+            assert!(
+                state.sessions.iter().any(|s| s.id == session_id),
+                "surviving session missing from retired daemon: {state:?}"
+            );
+            Some(())
+        }
+        _ => None,
+    });
+
+    // The freed primary path takes a brand-new daemon — the coexist
+    // moment: two generations, one machine, zero kills.
+    {
+        let socket = socket.clone();
+        std::thread::spawn(move || {
+            let _ = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(helmd::server::serve(&socket));
+        });
+    }
+    let mut fresh = TestClient::connect(&socket);
+    let mut seen3 = Vec::new();
+    fresh.send(&ClientMsg::Hello {
+        protocol_version: helm_proto::PROTOCOL_VERSION,
+        client_name: "e2e-retire-fresh".into(),
+    });
+    fresh.recv_until(5, &mut seen3, |m| match m {
+        DaemonMsg::HelloAck { state, .. } => {
+            assert!(state.sessions.is_empty(), "new daemon inherited sessions?");
+            Some(())
+        }
+        _ => None,
+    });
+
+    // Ending the last session retires the retired: it exits and
+    // unlinks its socket so discovery never chases a ghost.
+    c.send(&ClientMsg::KillSession {
+        session: session_id,
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while retired_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "retired daemon never removed its socket"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = std::fs::remove_file(&socket);
+}
+
 /// A session's environment comes from the fixed base in `helmd::env`, not
 /// from whatever the daemon inherited — here, this test process, which
 /// we dress up as a tmux-inside-iTerm launcher.

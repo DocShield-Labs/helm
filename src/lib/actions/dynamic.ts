@@ -131,6 +131,8 @@ export function hostsAsActions(): SubModeResult {
   // bucket are computed in the same pass so each row's group header
   // can carry an accurate `count` without a second walk.
   const sorted = [...state.hosts.values()]
+    // Retired daemon generations aren't hosts you switch to.
+    .filter((h) => !h.retired)
     .map((h) => {
       const status = state.statuses.get(h.id)
       return { host: h, display: displayedHostStatus(h, status) }

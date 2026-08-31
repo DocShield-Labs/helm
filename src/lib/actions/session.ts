@@ -41,20 +41,30 @@ function reportOpenError(hostId: HostId, message: string): void {
 
 export async function openSession(targetHostId?: HostId): Promise<void> {
   const initial = useStore.getState()
-  const hostId = targetHostId ?? initial.activeHostId
+  const requested = targetHostId ?? initial.activeHostId
+  // A retired daemon generation never takes new sessions — a ⌘T while
+  // one of its sessions is focused opens on the current daemon instead.
+  const parent = requested ? initial.hosts.get(requested)?.retired?.parent : undefined
+  const hostId = parent ?? requested
   if (!canOpenSession(initial, hostId)) {
     if (hostId) reportOpenError(hostId, 'Connect to this host before opening a session.')
     return
   }
-  const cwd = hostId === initial.activeHostId ? inheritedCwd(initial.sessions.get(hostId)) : null
-  if (targetHostId && targetHostId !== initial.activeHostId) initial.setActiveHost(targetHostId)
+  // Inherit the focused session's cwd when opening "here" — including
+  // when "here" is a retired generation and the new session lands on
+  // the current daemon.
+  const openingHere = requested === initial.activeHostId
+  const cwd =
+    openingHere && requested ? inheritedCwd(initial.sessions.get(requested)) : null
+  if (!openingHere) initial.setActiveHost(hostId)
   try {
     const result = await commands.sessionNew(hostId, null, cwd, null)
     if (result.status !== 'ok') {
       reportOpenError(hostId, `Couldn't open session: ${result.error}`)
       return
     }
-    if (useStore.getState().activeHostId === hostId) {
+    const now = useStore.getState().activeHostId
+    if (now === hostId || now === requested) {
       selectSession(hostId, result.data.session_id)
     }
   } catch (error) {

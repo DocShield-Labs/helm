@@ -48,6 +48,14 @@ impl HostId {
         // the workspace into the `macros` feature for this one call.
         Self(Uuid::from_u128(1))
     }
+
+    /// Deterministic id for a retired daemon generation of `parent`,
+    /// keyed by its socket path. Discovery from any code path (fresh
+    /// retirement, app relaunch, reconnect) derives the same id, so
+    /// entries dedupe on the map key alone.
+    pub fn retired(parent: HostId, socket: &str) -> Self {
+        Self(Uuid::new_v5(&parent.0, socket.as_bytes()))
+    }
 }
 
 // ---------- session events (helmd → frontend, cross the IPC boundary) ----------
@@ -437,6 +445,21 @@ pub enum AuthMethod {
     Password, // actual secret is in Keychain, never crosses the boundary
 }
 
+/// A daemon generation that has been retired in place: it keeps
+/// serving its existing sessions over a renamed socket until they end,
+/// while the current daemon owns the well-known socket and all new
+/// sessions. Hosts carrying this are ephemeral — discovered on
+/// connect, removed when the retired daemon empties out and exits,
+/// never persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct RetiredDaemon {
+    /// The host whose daemon this is an old generation of. Sessions
+    /// render under the parent in the UI.
+    pub parent: HostId,
+    /// Absolute socket path on the daemon's machine.
+    pub socket: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Host {
     pub id: HostId,
@@ -447,6 +470,10 @@ pub struct Host {
     pub auth: AuthMethod,
     pub jump_host: Option<HostId>,
     pub startup_commands: Vec<String>,
+    /// `Some` marks this entry as a retired daemon generation of
+    /// another host. Defaulted so older `hosts.json` files still parse.
+    #[serde(default)]
+    pub retired: Option<RetiredDaemon>,
 }
 
 impl Host {
@@ -461,6 +488,7 @@ impl Host {
             auth: AuthMethod::Agent,
             jump_host: None,
             startup_commands: vec![],
+            retired: None,
         }
     }
 }

@@ -50,8 +50,11 @@ fn main() -> anyhow::Result<()> {
         }
         Some("stdio") => {
             // No stdout logging — stdout IS the protocol stream.
+            // `--attach` connects without spawning — used to reach a
+            // retired daemon on its renamed socket.
             let socket = socket_arg(&args);
-            helmd::server::stdio_bridge(&socket)
+            let attach_only = args.iter().any(|a| a == "--attach");
+            helmd::server::stdio_bridge(&socket, attach_only)
         }
         _ => {
             eprintln!("usage: helmd serve|stdio|shutdown [--socket PATH] | helmd --version");
