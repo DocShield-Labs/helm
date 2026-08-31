@@ -249,6 +249,14 @@ button:not(:disabled),
 .helm-completion-option > .truncate {
   min-width: 0;
 }
+/* Paths are the payload: a label wider than the (window-capped) menu
+   wraps onto more lines rather than truncating. */
+.helm-completion-label {
+  min-width: 0;
+  flex: 1;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .helm-completion-option-selected {
   background: var(--accent-muted);
 }

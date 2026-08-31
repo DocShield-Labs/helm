@@ -185,8 +185,12 @@ export function Composer({
         Math.abs(start.top - end.top) < 1 && start.left >= textareaRect.left
           ? start
           : end
+      // Fit the widest full label, growing to the window edge if a
+      // path needs it; a path longer than even that wraps in its row
+      // (see .helm-completion-label) — full paths are the point, never
+      // truncation.
       const longest = widestLabel(completion.items, window.getComputedStyle(textarea).fontFamily)
-      const width = Math.min(Math.max(240, Math.ceil(longest + 116)), 560, window.innerWidth - 16)
+      const width = Math.min(Math.max(240, Math.ceil(longest + 116)), window.innerWidth - 16)
       const left = Math.min(Math.max(8, anchor.left), window.innerWidth - width - 8)
       const above = Math.max(0, anchor.top - 12)
       const below = Math.max(0, window.innerHeight - anchor.bottom - 12)
@@ -490,9 +494,7 @@ export function Composer({
                 completion.accept(index)
               }}
             >
-              <span className="truncate" title={item.label}>
-                {item.label}
-              </span>
+              <span className="helm-completion-label">{item.label}</span>
               {item.detail !== '' && (
                 <span className="helm-completion-kind truncate" title={item.detail}>
                   {item.detail}
