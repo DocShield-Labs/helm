@@ -627,20 +627,108 @@ async fn authenticate(
     Ok(handle)
 }
 
+/// Where the agent socket to try came from, for logs and error messages.
+const AGENT_SOURCE_ENV: &str = "SSH_AUTH_SOCK";
+const AGENT_SOURCE_CONFIG: &str = "IdentityAgent (~/.ssh/config)";
+
+/// Agent sockets to try, in OpenSSH's effective order: the `SSH_AUTH_SOCK`
+/// environment variable, then the `IdentityAgent` directive from
+/// `~/.ssh/config`.
+///
+/// The fallback matters on macOS GUI launches: launchd hands the app the
+/// system agent's socket (often holding nothing) and `launchctl setenv`
+/// cannot redirect it — while the user's ssh_config, which every terminal's
+/// `ssh` honors, names the agent they actually use.
+fn agent_candidates() -> Vec<(&'static str, PathBuf)> {
+    let mut candidates: Vec<(&'static str, PathBuf)> = Vec::new();
+    if let Some(v) = std::env::var(AGENT_SOURCE_ENV).ok().filter(|v| !v.is_empty()) {
+        candidates.push((AGENT_SOURCE_ENV, PathBuf::from(v)));
+    }
+    if let Some(path) = identity_agent_from_ssh_config() {
+        if !candidates.iter().any(|(_, p)| *p == path) {
+            candidates.push((AGENT_SOURCE_CONFIG, path));
+        }
+    }
+    candidates
+}
+
+/// First `IdentityAgent` that applies from `~/.ssh/config`, read with
+/// the same parser helm-app already uses (`ssh2-config`): Include files,
+/// quoting, and Host-block merging all behave like OpenSSH. Queried for
+/// a name no real Host pattern matches, so the result is the global
+/// default — top-level directives plus `Host *` — which is how agents
+/// like Secretive and 1Password document their setup.
+fn identity_agent_from_ssh_config() -> Option<PathBuf> {
+    use ssh2_config::{ParseRule, SshConfig};
+    let cfg = SshConfig::parse_default_file(
+        ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+    )
+    .ok()?;
+    let params = cfg.query("helm.identity-agent.default");
+    let raw = params.unsupported_fields.get("identityagent")?.first()?.clone();
+    expand_identity_agent(&raw)
+}
+
+/// `~`/`%d` expansion for an `IdentityAgent` value. `none` disables the
+/// agent; `SSH_AUTH_SOCK` defers to the environment, already tried first.
+fn expand_identity_agent(raw: &str) -> Option<PathBuf> {
+    let value = raw.trim().trim_matches('"');
+    if value.eq_ignore_ascii_case("none") || value == "SSH_AUTH_SOCK" {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    let expanded = value.replace("%d", &home.to_string_lossy());
+    Some(match expanded.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(expanded),
+    })
+}
+
 /// Try every identity the agent offers, in order, until one authenticates.
 /// Mirrors what OpenSSH's `ssh` does when `IdentitiesOnly=no`.
+///
+/// Candidate agents are tried until one holds at least one identity; that
+/// agent is then committed to. A server *rejecting* its keys never falls
+/// through to the next agent — that would be credential-shopping, silently
+/// authenticating as an identity the user didn't choose.
 async fn auth_with_agent(handle: &mut Handle<Client>, user: String) -> Result<bool, SshError> {
-    let agent = AgentClient::connect_env()
-        .await
-        .map_err(|e| SshError::Agent(format!("connect: {e}")))?;
-    let mut agent = agent.dynamic();
-    let identities = agent
-        .request_identities()
-        .await
-        .map_err(|e| SshError::Agent(format!("list identities: {e}")))?;
-    if identities.is_empty() {
-        return Err(SshError::Agent("no identities loaded".into()));
+    let candidates = agent_candidates();
+    if candidates.is_empty() {
+        return Err(SshError::Agent(
+            "no agent socket: SSH_AUTH_SOCK is unset and ~/.ssh/config names no IdentityAgent"
+                .into(),
+        ));
     }
+    let mut tried = Vec::new();
+    let mut chosen = None;
+    for (source, path) in candidates {
+        let mut agent = match AgentClient::connect_uds(&path).await {
+            Ok(agent) => agent.dynamic(),
+            Err(e) => {
+                tried.push(format!("{source} {}: {e}", path.display()));
+                continue;
+            }
+        };
+        match agent.request_identities().await {
+            Ok(identities) if identities.is_empty() => {
+                tried.push(format!("{source} {}: agent holds no identities", path.display()));
+            }
+            Ok(identities) => {
+                debug!("ssh agent: using {source} ({})", path.display());
+                chosen = Some((agent, identities));
+                break;
+            }
+            Err(e) => {
+                tried.push(format!("{source} {}: list identities: {e}", path.display()));
+            }
+        }
+    }
+    let Some((mut agent, identities)) = chosen else {
+        return Err(SshError::Agent(format!(
+            "no usable agent; tried {}",
+            tried.join("; ")
+        )));
+    };
     for pubkey in identities {
         let (returned, result) = handle
             .authenticate_future(user.clone(), pubkey, agent)
@@ -746,5 +834,38 @@ impl client::Handler for Client {
                 Ok(true)
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::expand_identity_agent;
+
+    #[test]
+    fn tilde_and_percent_d_expand_to_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            expand_identity_agent("~/x/agent.sock").unwrap(),
+            home.join("x/agent.sock")
+        );
+        assert_eq!(
+            expand_identity_agent("\"%d/y/agent.sock\"").unwrap(),
+            home.join("y/agent.sock")
+        );
+    }
+
+    #[test]
+    fn none_disables_and_env_sentinel_defers() {
+        assert_eq!(expand_identity_agent("none"), None);
+        assert_eq!(expand_identity_agent("SSH_AUTH_SOCK"), None);
+    }
+
+    #[test]
+    fn absolute_paths_pass_through() {
+        assert_eq!(
+            expand_identity_agent("/run/agent.sock").unwrap(),
+            std::path::PathBuf::from("/run/agent.sock")
+        );
     }
 }
