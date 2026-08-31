@@ -3,10 +3,38 @@
  * host/session/palette: sidebar, undo, etc.
  */
 
+import { commands } from '@lib/ipc'
 import { useStore } from '@lib/store'
 import type { Action } from './types'
 
 export const chromeActions: Action[] = [
+  {
+    id: 'chrome.copy-diagnostics',
+    kind: 'action',
+    label: 'Copy diagnostics',
+    icon: '⚕',
+    run: () => {
+      void (async () => {
+        const push = useStore.getState().pushToast
+        try {
+          const res = await commands.diagnostics()
+          if (res.status !== 'ok') throw new Error(res.error)
+          await navigator.clipboard.writeText(res.data)
+          push({
+            id: 'diagnostics',
+            message: 'Diagnostics copied — paste into a bug report.',
+            durationMs: 5_000,
+          })
+        } catch (error) {
+          push({
+            id: 'diagnostics',
+            message: `Couldn't gather diagnostics: ${String(error)}`,
+            durationMs: 8_000,
+          })
+        }
+      })()
+    },
+  },
   {
     id: 'chrome.toggle-sidebar',
     kind: 'action',

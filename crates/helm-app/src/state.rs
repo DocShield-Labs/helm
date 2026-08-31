@@ -41,6 +41,10 @@ pub struct SessionHandle {
     /// when a waiter is registered.
     pub pending: Arc<DashMap<u64, oneshot::Sender<helm_proto::DaemonMsg>>>,
     pub capabilities: Arc<parking_lot::RwLock<DaemonCapabilities>>,
+    /// What the daemon reported in its HelloAck — kept for diagnostics
+    /// (version skew between app and daemon is the classic
+    /// "features silently missing" cause).
+    pub daemon_version: String,
     next_req: AtomicU64,
 }
 
@@ -51,6 +55,7 @@ impl SessionHandle {
         tree: Arc<parking_lot::Mutex<helm_proto::TreeSnapshot>>,
         pending: Arc<DashMap<u64, oneshot::Sender<helm_proto::DaemonMsg>>>,
         capabilities: Arc<parking_lot::RwLock<DaemonCapabilities>>,
+        daemon_version: String,
     ) -> Self {
         Self {
             client,
@@ -58,6 +63,7 @@ impl SessionHandle {
             tree,
             pending,
             capabilities,
+            daemon_version,
             next_req: AtomicU64::new(1),
         }
     }

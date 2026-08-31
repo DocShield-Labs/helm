@@ -292,6 +292,7 @@ async fn install_session(
         tree,
         pending_reqs,
         capabilities,
+        daemon_version,
     ));
 
     // We've shown the offline notifications; let the daemon drop them.
@@ -1079,7 +1080,7 @@ async fn discover_retired_daemons(host: Host, parent_entry: SharedHostEntry, dep
     }
 }
 
-fn local_retired_sockets() -> Vec<String> {
+pub(crate) fn local_retired_sockets() -> Vec<String> {
     use std::os::unix::fs::FileTypeExt;
     let primary = helmd_socket_path();
     let stem = primary
