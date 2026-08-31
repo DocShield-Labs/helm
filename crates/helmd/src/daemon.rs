@@ -379,10 +379,17 @@ impl Daemon {
     /// Resize the PTY and the model; the resulting full damage reaches
     /// clients on the next flush.
     pub fn resize(&self, session: SessionId, cols: u16, rows: u16) -> Result<(), String> {
-        self.session(session)?
+        let changed = self
+            .session(session)?
             .resize(cols, rows)
             .map_err(|e| e.to_string())?;
         let _ = self.events_tx.send(SessionEvent::Dirty { session });
+        // Keep the tree truthful: cols/rows ride the snapshot, and
+        // clients (diagnostics, the app's size reconciliation) treat it
+        // as the daemon's authoritative geometry.
+        if changed {
+            broadcast_tree(&self.core.lock());
+        }
         Ok(())
     }
 
@@ -619,6 +626,8 @@ impl Daemon {
                         alt_screen: on,
                     },
                 );
+                // alt_screen rides the tree snapshot too — keep it true.
+                broadcast_tree(&core);
             }
             IngestEvent::Bell => {
                 drop(core);

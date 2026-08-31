@@ -192,10 +192,17 @@ export function SessionView({ hostId, sessionId, isVisible = true }: SessionView
     })
   }, [fitNow])
   useEffect(() => () => cancelAnimationFrame(fitRafRef.current), [])
-  const composerShown = ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent')
-  /** Agent session in Terminal mode: typing lands in the TUI; keep the
-   * mode control reachable. */
-  const nativeBar = ps.kind === 'agent' && mode === 'terminal'
+  /** An agent driving the alternate screen (claude's new TUI) is a
+   * full-surface application like vim: the xterm covers the pane, and
+   * the TUI draws its own input at the bottom. Overlaying our composer
+   * there would sit it exactly on top of the agent's input box — so
+   * alt forces the terminal presentation regardless of the mode
+   * toggle, and the composer returns when the agent leaves alt. */
+  const altTui = ps.phase === 'alt'
+  const composerShown = ps.phase === 'prompt' || (ps.kind === 'agent' && mode === 'agent' && !altTui)
+  /** Agent session in Terminal mode (or on the alt screen): typing
+   * lands in the TUI; keep the mode control reachable. */
+  const nativeBar = ps.kind === 'agent' && (mode === 'terminal' || altTui)
 
   const history = useMemo(() => {
     const out: string[] = []

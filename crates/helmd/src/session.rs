@@ -206,7 +206,9 @@ impl Session {
     /// answers every SIGWINCH with a repaint — which, for one that
     /// redraws by re-emitting its tail (Claude Code), scrolls a duplicate
     /// of the old frame into history.
-    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+    /// Returns whether the size actually changed, so the daemon can
+    /// broadcast a fresh tree only for real changes.
+    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<bool> {
         // Clamp before comparing, so the no-op guard sees the same
         // numbers every consumer below uses.
         let cols = cols.max(2);
@@ -214,7 +216,7 @@ impl Session {
         {
             let meta = self.meta.lock();
             if meta.cols == cols && meta.rows == rows {
-                return Ok(());
+                return Ok(false);
             }
         }
         // Hold the model lock across the ioctl. TIOCSWINSZ delivers
@@ -233,7 +235,7 @@ impl Session {
         let mut meta = self.meta.lock();
         meta.cols = cols;
         meta.rows = rows;
-        Ok(())
+        Ok(true)
     }
 
     pub fn kill(&self) {
