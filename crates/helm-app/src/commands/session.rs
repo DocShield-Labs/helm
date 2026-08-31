@@ -6,7 +6,8 @@
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use helm_domain::{
-    BlockInfo, HistoryPage, HostId, PathCompletion, PathCompletionResult, PathEntryKind,
+    AgentCommandInfo, BlockInfo, HistoryPage, HostId, PathCompletion, PathCompletionResult,
+    PathEntryKind,
     ScreenInfo, SearchHit, SessionTree,
 };
 use helm_proto::{DaemonMsg, SearchScope, SessionId};
@@ -279,19 +280,106 @@ pub async fn session_path_complete(
             candidates,
             truncated,
             ..
-        } => Ok(PathCompletionResult {
-            candidates: candidates
+        } => Ok(to_completion_result(candidates, truncated)),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+fn to_completion_result(
+    candidates: Vec<helm_proto::PathCompletion>,
+    truncated: bool,
+) -> PathCompletionResult {
+    PathCompletionResult {
+        candidates: candidates
+            .into_iter()
+            .map(|candidate| PathCompletion {
+                value: candidate.value,
+                kind: match candidate.kind {
+                    helm_proto::PathEntryKind::File => PathEntryKind::File,
+                    helm_proto::PathEntryKind::Directory => PathEntryKind::Directory,
+                },
+            })
+            .collect(),
+        truncated,
+    }
+}
+
+/// Slash commands the agent in this session accepts — built-ins plus
+/// the user's and project's command/skill definitions, enumerated by
+/// the daemon on the host where the agent runs.
+#[tauri::command]
+#[specta::specta]
+pub async fn session_agent_commands(
+    state: State<'_, AppState>,
+    host_id: HostId,
+    session_id: String,
+) -> Result<Vec<AgentCommandInfo>, String> {
+    let session = session_for(&state, host_id).await?;
+    let session_id = session_id.parse::<SessionId>()?;
+    let payload = serde_json::to_vec(&helm_proto::extensions::AgentCommandsRequest {
+        session: session_id,
+    })
+    .map_err(|e| e.to_string())?;
+    match session
+        .request(|id| {
+            session.client.extension(
+                Some(id),
+                helm_proto::extensions::AGENT_COMMANDS.into(),
+                payload,
+            )
+        })
+        .await?
+    {
+        DaemonMsg::Extension { payload, .. } => {
+            let commands: Vec<helm_proto::AgentCommand> =
+                serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+            Ok(commands
                 .into_iter()
-                .map(|candidate| PathCompletion {
-                    value: candidate.value,
-                    kind: match candidate.kind {
-                        helm_proto::PathEntryKind::File => PathEntryKind::File,
-                        helm_proto::PathEntryKind::Directory => PathEntryKind::Directory,
-                    },
+                .map(|c| AgentCommandInfo {
+                    name: c.name,
+                    description: c.description,
                 })
-                .collect(),
+                .collect())
+        }
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+/// Fuzzy recursive file search from the session's cwd (`@file`
+/// autocomplete once a query exists) — the daemon walks the tree with
+/// `.gitignore` respected and ranks matches.
+#[tauri::command]
+#[specta::specta]
+pub async fn session_file_search(
+    state: State<'_, AppState>,
+    host_id: HostId,
+    session_id: String,
+    query: String,
+    max_results: u32,
+) -> Result<PathCompletionResult, String> {
+    let session = session_for(&state, host_id).await?;
+    let session_id = session_id.parse::<SessionId>()?;
+    let payload = serde_json::to_vec(&helm_proto::extensions::FileSearchRequest {
+        session: session_id,
+        query,
+        max_results,
+    })
+    .map_err(|e| e.to_string())?;
+    match session
+        .request(|id| {
+            session.client.extension(
+                Some(id),
+                helm_proto::extensions::FILE_SEARCH.into(),
+                payload,
+            )
+        })
+        .await?
+    {
+        DaemonMsg::PathCompletions {
+            candidates,
             truncated,
-        }),
+            ..
+        } => Ok(to_completion_result(candidates, truncated)),
         other => Err(format!("unexpected reply: {other:?}")),
     }
 }

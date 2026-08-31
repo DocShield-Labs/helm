@@ -12,7 +12,9 @@
 //!              notifications, search, flush scheduling
 //!   server   — unix-socket accept loop + `helmd stdio` bridge
 
+pub mod agent_commands;
 pub mod completion;
+pub mod file_search;
 pub mod daemon;
 pub mod env;
 pub mod markers;

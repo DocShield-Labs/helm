@@ -146,7 +146,11 @@ fn dispatch(
             if wants_capabilities(&client_name) {
                 let _ = tx.send(DaemonMsg::Capabilities {
                     compatibility_baseline: helm_proto::COMPATIBILITY_BASELINE,
-                    extensions: vec![helm_proto::extensions::DRAIN.into()],
+                    extensions: vec![
+                        helm_proto::extensions::DRAIN.into(),
+                        helm_proto::extensions::AGENT_COMMANDS.into(),
+                        helm_proto::extensions::FILE_SEARCH.into(),
+                    ],
                 });
             }
         }
@@ -233,17 +237,9 @@ fn dispatch(
             directories_only,
             max_results,
         } => {
-            let permit = match daemon.completion_permit() {
-                Ok(permit) => permit,
-                Err(message) => {
-                    err(Some(req_id), "complete_path", message);
-                    return;
-                }
-            };
             let daemon = daemon.clone();
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
                 match daemon.complete_path(session, &path, directories_only, max_results) {
                     Ok((candidates, truncated)) => {
                         let _ = tx.send(DaemonMsg::PathCompletions {
@@ -282,6 +278,66 @@ fn dispatch(
                     req_id,
                     name,
                     payload: Vec::new(),
+                });
+            } else if name == helm_proto::extensions::AGENT_COMMANDS {
+                use helm_proto::extensions::AgentCommandsRequest;
+                let session = match serde_json::from_slice::<AgentCommandsRequest>(&payload) {
+                    Ok(req) => req.session,
+                    Err(e) => {
+                        err(req_id, "agent_commands", format!("bad payload: {e}"));
+                        return;
+                    }
+                };
+                let daemon = daemon.clone();
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let reply = daemon.agent_commands(session).and_then(|commands| {
+                        serde_json::to_vec(&commands).map_err(|e| e.to_string())
+                    });
+                    let _ = match reply {
+                        Ok(payload) => tx.send(DaemonMsg::Extension {
+                            req_id,
+                            name,
+                            payload,
+                        }),
+                        Err(message) => tx.send(DaemonMsg::Error {
+                            req_id,
+                            context: "agent_commands".into(),
+                            message,
+                        }),
+                    };
+                });
+            } else if name == helm_proto::extensions::FILE_SEARCH {
+                use helm_proto::extensions::FileSearchRequest;
+                let req = match serde_json::from_slice::<FileSearchRequest>(&payload) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        err(req_id, "file_search", format!("bad payload: {e}"));
+                        return;
+                    }
+                };
+                let Some(req_id) = req_id else {
+                    err(None, "file_search", "request id is required".into());
+                    return;
+                };
+                let daemon = daemon.clone();
+                let tx = tx.clone();
+                // Answered with the typed `PathCompletions` — correlation
+                // is by req_id, and reusing the shape keeps one schema.
+                tokio::task::spawn_blocking(move || {
+                    let _ = match daemon.file_search(req.session, &req.query, req.max_results) {
+                        Ok((candidates, truncated)) => tx.send(DaemonMsg::PathCompletions {
+                            req_id,
+                            session: req.session,
+                            candidates,
+                            truncated,
+                        }),
+                        Err(message) => tx.send(DaemonMsg::Error {
+                            req_id: Some(req_id),
+                            context: "file_search".into(),
+                            message,
+                        }),
+                    };
                 });
             } else {
                 err(

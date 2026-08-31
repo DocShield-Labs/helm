@@ -32,7 +32,7 @@ const PASSTHROUGH: Record<string, string> = {
 
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { createPortal } from 'react-dom'
-import type { PathCompletion, PathCompletionResult } from '@bindings'
+import type { AgentCommandInfo, PathCompletionResult } from '@bindings'
 import { homeRelative } from '@lib/path'
 import type { ComposerMode } from '@lib/session/composer'
 import type { SessionKind } from '@lib/session/sessionState'
@@ -43,8 +43,8 @@ import {
   pathCompletionLabel,
   pathCompletionContext,
   replacePathCompletion,
-  type PathCompletionContext,
 } from '@lib/session/pathCompletion'
+import { agentTrigger, applyAgentCompletion, filterAgentCommands, type AgentTrigger } from '@lib/session/agentCompletion'
 import { BranchIcon, FolderIcon } from '@features/sessions/icons'
 import { textareaCaretRect } from '@lib/textareaCaret'
 
@@ -62,17 +62,48 @@ export interface ComposerProps {
   /** Raw bytes for the session (control keys on an empty editor). */
   onRaw: (bytes: string) => void
   onPathComplete: (path: string, directoriesOnly: boolean) => Promise<PathCompletionResult>
+  /** Slash commands the agent accepts (Agent mode `/` autocomplete). */
+  onAgentCommands: () => Promise<AgentCommandInfo[]>
+  /** Fuzzy recursive file search from the session's cwd (`@query`). */
+  onFileSearch: (query: string) => Promise<PathCompletionResult>
   /** Bumps to pull focus (session became visible, mode re-opened). */
   focusKey: number
 }
 
 const MAX_ROWS = 8
 
+/** Shared measuring context for menu sizing — one canvas for the app,
+ * not one per keystroke while the agent menu tracks typing. */
+let measureCtx: CanvasRenderingContext2D | null = null
+function widestLabel(items: readonly { label: string }[], fontFamily: string): number {
+  measureCtx ??= document.createElement('canvas').getContext('2d')
+  if (measureCtx) measureCtx.font = `12px ${fontFamily}`
+  return items.reduce((width, item) => {
+    return Math.max(width, measureCtx?.measureText(item.label).width ?? item.label.length * 8)
+  }, 0)
+}
+
+/** One row of the completion popover. The menu's `accept` applies the
+ * row's `value`; menus are built with closures over the text they
+ * complete — safe because any edit cancels and rebuilds the menu. */
+interface CompletionItem {
+  key: string
+  label: string
+  detail: string
+  /** Hover tooltip (a command's description); label when empty. */
+  tooltip?: string
+  /** What `accept` inserts. */
+  value: string
+}
+
 interface CompletionMenu {
-  context: PathCompletionContext
-  candidates: PathCompletion[]
+  /** Completed token's span — popover anchor + caret guard. */
+  start: number
+  end: number
+  items: CompletionItem[]
   selected: number
   truncated: boolean
+  accept: (index: number) => void
 }
 
 interface CompletionMenuPosition {
@@ -94,6 +125,8 @@ export function Composer({
   onSend,
   onRaw,
   onPathComplete,
+  onAgentCommands,
+  onFileSearch,
   focusKey,
 }: ComposerProps) {
   const completionMenuId = useId()
@@ -105,6 +138,11 @@ export function Composer({
   const [completionPosition, setCompletionPosition] = useState<CompletionMenuPosition | null>(null)
   const completionRequestRef = useRef(0)
   const completionCaretRef = useRef<number | null>(null)
+  /** Agent slash commands: the PROMISE is cached, so keystrokes racing
+   * the first fetch share it instead of each firing a daemon scan. A
+   * failure (old daemon without the extension) caches as empty. */
+  const agentCommandsRef = useRef<Promise<AgentCommandInfo[]> | null>(null)
+  const fileDebounceRef = useRef(0)
   // History cursor: -1 = editing a fresh line; otherwise index into
   // `history` counted from the end. The fresh line is stashed so
   // ↓ past the newest entry restores it.
@@ -117,6 +155,7 @@ export function Composer({
   const cancelCompletion = useCallback(() => {
     completionRequestRef.current += 1
     completionCaretRef.current = null
+    window.clearTimeout(fileDebounceRef.current)
     setCompletion(null)
   }, [])
 
@@ -129,30 +168,24 @@ export function Composer({
       ?.scrollIntoView({ block: 'nearest' })
   }, [completion])
 
-  const completionContext = completion?.context
-  const completionCandidates = completion?.candidates
+  const completionStart = completion?.start
+  const completionEnd = completion?.end
+  const completionItems = completion?.items
   useLayoutEffect(() => {
     const textarea = taRef.current
-    if (!completionContext || !completionCandidates || !textarea) {
+    if (!completion || !textarea) {
       setCompletionPosition(null)
       return
     }
     const position = () => {
-      const start = textareaCaretRect(textarea, completionContext.start)
-      const end = textareaCaretRect(textarea, completionContext.end)
+      const start = textareaCaretRect(textarea, completion.start)
+      const end = textareaCaretRect(textarea, completion.end)
       const textareaRect = textarea.getBoundingClientRect()
       const anchor =
         Math.abs(start.top - end.top) < 1 && start.left >= textareaRect.left
           ? start
           : end
-      const measuringContext = document.createElement('canvas').getContext('2d')
-      if (measuringContext) {
-        measuringContext.font = `12px ${window.getComputedStyle(textarea).fontFamily}`
-      }
-      const longest = completionCandidates.reduce((width, candidate) => {
-        const label = pathCompletionLabel(candidate.value)
-        return Math.max(width, measuringContext?.measureText(label).width ?? label.length * 8)
-      }, 0)
+      const longest = widestLabel(completion.items, window.getComputedStyle(textarea).fontFamily)
       const width = Math.min(Math.max(240, Math.ceil(longest + 116)), 560, window.innerWidth - 16)
       const left = Math.min(Math.max(8, anchor.left), window.innerWidth - width - 8)
       const above = Math.max(0, anchor.top - 12)
@@ -170,7 +203,8 @@ export function Composer({
     position()
     window.addEventListener('resize', position)
     return () => window.removeEventListener('resize', position)
-  }, [completionCandidates, completionContext, text])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [completionItems, completionStart, completionEnd])
 
   // Grow with content up to MAX_ROWS, then scroll. Measuring means
   // collapsing the textarea to read its scrollHeight; the box is held
@@ -209,13 +243,7 @@ export function Composer({
     requestAnimationFrame(() => taRef.current?.setSelectionRange(caret, caret))
   }
 
-  const acceptCompletion = (candidate: PathCompletion) => {
-    if (!completion) return
-    const applied = applyPathCompletion(text, completion.context, candidate)
-    setDraft(applied.text, applied.caret)
-    cancelCompletion()
-  }
-
+  // ---- Terminal mode: Tab-driven shell path completion ----
   const requestCompletion = (ta: HTMLTextAreaElement) => {
     const context = pathCompletionContext(text, ta.selectionStart)
     if (!context) return
@@ -245,16 +273,104 @@ export function Composer({
           : { text: requestedText, caret: context.end, context }
         if (replaced.text !== requestedText) setDraft(replaced.text, replaced.caret)
         completionCaretRef.current = replaced.caret
+        const menuText = replaced.text
+        const menuContext = replaced.context
         setCompletion({
-          context: replaced.context,
-          candidates: result.candidates,
+          start: menuContext.start,
+          end: menuContext.end,
+          items: result.candidates.map((candidate) => ({
+            key: `${candidate.kind}:${candidate.value}`,
+            label: pathCompletionLabel(candidate.value),
+            detail: candidate.kind,
+            value: candidate.value,
+          })),
           selected: -1,
           truncated: result.truncated,
+          accept: (index) => {
+            const applied = applyPathCompletion(menuText, menuContext, result.candidates[index])
+            setDraft(applied.text, applied.caret)
+            cancelCompletion()
+          },
         })
       })
       .catch(() => {
         if (completionRequestRef.current === request) completionCaretRef.current = null
       })
+  }
+
+  // ---- Agent mode: auto-open @file and /command menus as you type ----
+  const openAgentMenu = (value: string, trigger: AgentTrigger) => {
+    const request = ++completionRequestRef.current
+    completionCaretRef.current = trigger.end
+    window.clearTimeout(fileDebounceRef.current)
+
+    const show = (items: CompletionItem[], truncated: boolean) => {
+      if (completionRequestRef.current !== request) return
+      if (items.length === 0) {
+        setCompletion(null)
+        return
+      }
+      setCompletion({
+        start: trigger.start,
+        end: trigger.end,
+        items,
+        selected: 0,
+        truncated,
+        accept: (index) => {
+          const applied = applyAgentCompletion(value, trigger, items[index].value)
+          setDraft(applied.text, applied.caret)
+          cancelCompletion()
+        },
+      })
+    }
+
+    if (trigger.kind === 'command') {
+      agentCommandsRef.current ??= onAgentCommands().catch(() => [])
+      void agentCommandsRef.current.then((all) => {
+        show(
+          filterAgentCommands(all, trigger.query, 30).map((c) => ({
+            key: `cmd:${c.name}`,
+            label: `/${c.name}`,
+            detail: '',
+            tooltip: c.description || undefined,
+            value: c.name,
+          })),
+          false,
+        )
+      })
+      return
+    }
+
+    // Files: debounced — every keystroke walks the daemon (possibly
+    // over SSH). A bare `@` lists the cwd (segment completion); any
+    // query goes to the fuzzy recursive search. Both producers append
+    // the trailing `/` to directory values themselves.
+    fileDebounceRef.current = window.setTimeout(() => {
+      const lookup =
+        trigger.query === '' ? onPathComplete('', false) : onFileSearch(trigger.query)
+      void lookup
+        .then((result) => {
+          show(
+            result.candidates.map((c) => ({
+              key: `${c.kind}:${c.value}`,
+              label: c.value,
+              detail: c.kind,
+              value: c.value,
+            })),
+            result.truncated,
+          )
+        })
+        .catch(() => {})
+    }, 80)
+  }
+
+  const refreshAgentMenu = (value: string, caret: number) => {
+    const trigger = agentTrigger(value, caret)
+    if (!trigger) {
+      cancelCompletion()
+      return
+    }
+    openAgentMenu(value, trigger)
   }
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -275,7 +391,7 @@ export function Composer({
         if (completion.selected < 0) {
           send()
         } else {
-          acceptCompletion(completion.candidates[completion.selected])
+          completion.accept(completion.selected)
         }
         return
       }
@@ -285,8 +401,8 @@ export function Composer({
         setCompletion((current) => current && ({
           ...current,
           selected: current.selected < 0
-            ? direction > 0 ? 0 : current.candidates.length - 1
-            : (current.selected + direction + current.candidates.length) % current.candidates.length,
+            ? direction > 0 ? 0 : current.items.length - 1
+            : (current.selected + direction + current.items.length) % current.items.length,
         }))
         return
       }
@@ -360,9 +476,9 @@ export function Composer({
           role="listbox"
           style={completionPosition}
         >
-          {completion.candidates.map((candidate, index) => (
+          {completion.items.map((item, index) => (
             <button
-              key={`${candidate.kind}:${candidate.value}`}
+              key={item.key}
               id={`${completionMenuId}-option-${index}`}
               type="button"
               role="option"
@@ -371,15 +487,24 @@ export function Composer({
               className={`helm-completion-option ${index === completion.selected ? 'helm-completion-option-selected' : ''}`}
               onMouseDown={(event) => {
                 event.preventDefault()
-                acceptCompletion(candidate)
+                completion.accept(index)
               }}
             >
-              <span className="truncate" title={candidate.value}>
-                {pathCompletionLabel(candidate.value)}
+              <span className="truncate" title={item.label}>
+                {item.label}
               </span>
-              <span className="helm-completion-kind">{candidate.kind}</span>
+              {item.detail !== '' && (
+                <span className="helm-completion-kind truncate" title={item.detail}>
+                  {item.detail}
+                </span>
+              )}
             </button>
           ))}
+          {completion.selected >= 0 && completion.items[completion.selected]?.tooltip && (
+            <div className="helm-completion-status">
+              {completion.items[completion.selected].tooltip}
+            </div>
+          )}
           {completion.truncated && (
             <div className="helm-completion-status">More matches not shown</div>
           )}
@@ -409,19 +534,20 @@ export function Composer({
         autoCapitalize={mode === 'agent' ? 'sentences' : 'off'}
         autoCorrect={mode === 'agent' ? 'on' : 'off'}
         autoComplete={mode === 'agent' ? 'on' : 'off'}
-        aria-autocomplete={mode === 'terminal' ? 'list' : undefined}
+        aria-autocomplete="list"
         aria-controls={completion ? completionMenuId : undefined}
         aria-activedescendant={
           completion && completion.selected >= 0
             ? `${completionMenuId}-option-${completion.selected}`
             : undefined
         }
-        aria-expanded={mode === 'terminal' ? completion !== null : undefined}
+        aria-expanded={completion !== null}
         placeholder={placeholder}
         onChange={(e) => {
           setText(e.target.value)
           histRef.current = initialHistoryCursor()
-          cancelCompletion()
+          if (mode === 'agent') refreshAgentMenu(e.target.value, e.target.selectionStart)
+          else cancelCompletion()
         }}
         onSelect={(event) => {
           const textarea = event.currentTarget

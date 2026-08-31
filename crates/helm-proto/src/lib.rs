@@ -43,6 +43,35 @@ pub mod extensions {
     /// Stop accepting new sessions and exit after the final existing
     /// session ends. The empty payload is reserved for future options.
     pub const DRAIN: &str = "helm.daemon.drain.v1";
+
+    /// Slash commands an agent accepts in a session's project, for
+    /// composer autocomplete. Request payload: [`AgentCommandsRequest`]
+    /// as JSON; reply payload: JSON `Vec<AgentCommand>`. Daemons
+    /// without the extension answer `Error` carrying the request id —
+    /// clients fall back to no menu.
+    pub const AGENT_COMMANDS: &str = "helm.session.agent_commands.v1";
+
+    /// Fuzzy recursive file search under a session's cwd (`@file`
+    /// autocomplete once a query exists). Request payload:
+    /// [`FileSearchRequest`] as JSON; answered with the typed
+    /// `DaemonMsg::PathCompletions` (correlation is by request id, so
+    /// the reply needs no envelope of its own).
+    pub const FILE_SEARCH: &str = "helm.session.file_search.v1";
+
+    /// Typed payloads for the JSON envelopes above. Both ends
+    /// (de)serialize these, so a schema is a type, not prose that
+    /// drifts.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct AgentCommandsRequest {
+        pub session: crate::SessionId,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct FileSearchRequest {
+        pub session: crate::SessionId,
+        pub query: String,
+        pub max_results: u32,
+    }
 }
 
 /// Upper bound on a single frame. History pages are capped well below
@@ -482,6 +511,18 @@ pub struct PathCompletion {
     /// Completed token value, without shell escaping.
     pub value: String,
     pub kind: PathEntryKind,
+}
+
+/// One slash command an agent accepts, for composer autocomplete —
+/// carried as JSON inside the `extensions::AGENT_COMMANDS` payload,
+/// never on the wire enums (their variant indices are frozen).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCommand {
+    /// Name without the leading slash.
+    pub name: String,
+    /// One-line description (frontmatter `description:`) — the menu
+    /// row's hover tooltip; may be empty.
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

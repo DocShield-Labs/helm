@@ -227,13 +227,10 @@ impl Daemon {
         if path.len() > 4096 {
             return Err("completion path is too long".into());
         }
-        let session = self
-            .core
-            .lock()
-            .sessions
-            .get(&session_id)
-            .cloned()
-            .ok_or_else(|| format!("no session {session_id}"))?;
+        // Bounded by construction: every blocking-FS operation holds a
+        // completion permit, so no dispatch arm can forget to ask.
+        let _permit = self.completion_permit()?;
+        let session = self.session(session_id)?;
         let home = dirs::home_dir();
         let cwd = session
             .meta
@@ -252,6 +249,46 @@ impl Daemon {
             directories_only,
             max_results,
         )
+    }
+
+    /// Slash commands available to an agent in this session's project —
+    /// enumerated here because the session may be on a remote host.
+    pub fn agent_commands(&self, session_id: SessionId) -> Result<Vec<helm_proto::AgentCommand>, String> {
+        let _permit = self.completion_permit()?;
+        let session = self.session(session_id)?;
+        let meta = session.meta.lock();
+        let project = meta.root.clone().or_else(|| meta.cwd.clone());
+        drop(meta);
+        Ok(crate::agent_commands::list(
+            project.as_deref().map(std::path::Path::new),
+        ))
+    }
+
+    /// Fuzzy recursive file search from the session's cwd. Bounded walk;
+    /// see `file_search.rs`.
+    pub fn file_search(
+        &self,
+        session_id: SessionId,
+        query: &str,
+        max_results: u32,
+    ) -> Result<(Vec<PathCompletion>, bool), String> {
+        if query.len() > 1024 {
+            return Err("file search query is too long".into());
+        }
+        let _permit = self.completion_permit()?;
+        let session = self.session(session_id)?;
+        let cwd = session
+            .meta
+            .lock()
+            .cwd
+            .clone()
+            .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+            .ok_or("session cwd is unavailable")?;
+        Ok(crate::file_search::file_search(
+            std::path::Path::new(&cwd),
+            query,
+            max_results.min(100) as usize,
+        ))
     }
 
     pub fn completion_permit(&self) -> Result<OwnedSemaphorePermit, String> {

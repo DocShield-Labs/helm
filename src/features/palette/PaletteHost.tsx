@@ -36,7 +36,7 @@ import { Palette } from '@ui'
 import { Row, Kbd } from './Row'
 import { SectionHeader } from './SectionHeader'
 import { Footer } from './Footer'
-import { fuzzyMatch } from './fuzzy'
+import { fuzzyMatch } from '@lib/fuzzy'
 import { getRecents, pushRecent, RECENTS_DISPLAY_LIMIT } from './recents'
 
 interface ScoredAction {
