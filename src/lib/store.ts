@@ -144,6 +144,15 @@ interface HelmState {
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
 
+  /** Host ids whose session list is folded away in the sidebar. The
+   * host's own header line stays put — and keeps reporting status —
+   * only its projects and session rows are hidden. Persisted via
+   * localStorage so the preference survives restarts. Session cycling
+   * (⌘[ / ⌘]) is deliberately unaffected: it only ever walks the
+   * active host's own sessions, never across hosts. */
+  collapsedHosts: Set<HostId>
+  toggleHostCollapsed: (id: HostId) => void
+
   /** Active terminal theme name. Drives both xterm's palette and the
    * `--terminal-*` CSS variables the session chrome reads. Persisted
    * via localStorage. */
@@ -394,6 +403,7 @@ const writeStringPref = (key: string, v: string) => {
 }
 
 const SIDEBAR_COLLAPSED_KEY = 'helm.sidebarCollapsed'
+const COLLAPSED_HOSTS_KEY = 'helm.collapsedHosts'
 const THEME_NAME_KEY = 'helm.themeName'
 const DEFAULT_AGENT_KEY = 'helm.defaultAgent'
 const CUSTOM_AGENT_TEMPLATE_KEY = 'helm.customAgentTemplate'
@@ -426,6 +436,21 @@ export const useStore = create<HelmState>((set) => ({
       const next = !s.sidebarCollapsed
       writeBoolPref(SIDEBAR_COLLAPSED_KEY, next)
       return { sidebarCollapsed: next }
+    }),
+
+  // Stored as a plain array of ids. Ids for hosts that no longer exist
+  // are harmless — they simply never match a rendered group — but
+  // `removeHost` prunes them anyway so the list can't grow unbounded
+  // across add/delete cycles.
+  collapsedHosts: new Set(
+    readJsonArray(COLLAPSED_HOSTS_KEY, (x): x is HostId => typeof x === 'string'),
+  ),
+  toggleHostCollapsed: (id) =>
+    set((s) => {
+      const next = new Set(s.collapsedHosts)
+      if (!next.delete(id)) next.add(id)
+      writeJson(COLLAPSED_HOSTS_KEY, [...next])
+      return { collapsedHosts: next }
     }),
 
   themeName: readStringPref(THEME_NAME_KEY, DEFAULT_THEME_NAME),
@@ -508,6 +533,16 @@ export const useStore = create<HelmState>((set) => ({
       }
       const nextSuggestions = s.toolSuggestions.filter((t) => t.hostId !== id)
 
+      // Only rebuilt when this host was actually collapsed, so the
+      // common delete doesn't hand every `collapsedHosts` subscriber a
+      // fresh Set identity to re-render on.
+      let nextCollapsed = s.collapsedHosts
+      if (nextCollapsed.has(id)) {
+        nextCollapsed = new Set(nextCollapsed)
+        nextCollapsed.delete(id)
+        writeJson(COLLAPSED_HOSTS_KEY, [...nextCollapsed])
+      }
+
       return {
         hosts: nextHosts,
         statuses: nextStatuses,
@@ -517,6 +552,7 @@ export const useStore = create<HelmState>((set) => ({
         notifications: nextNotifications,
         runningSessions: nextRunning,
         toolSuggestions: nextSuggestions,
+        collapsedHosts: nextCollapsed,
         activeHostId: s.activeHostId === id ? null : s.activeHostId,
       }
     }),
