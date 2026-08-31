@@ -1,6 +1,7 @@
 import type { HostId } from '@bindings'
 import { selectSession } from '@lib/host'
 import { commands } from '@lib/ipc'
+import { groupRows } from '@lib/session/sidebarGroups'
 import { sortById, useStore, type HostSessions, type Session } from '@lib/store'
 import type { Action } from './types'
 
@@ -66,7 +67,11 @@ export function neighbourSessionId(
   currentId: string | null,
   direction: 1 | -1,
 ): string | undefined {
-  const sessions = sortById(hostSessions.sessions.values())
+  // Step in the order the sidebar DISPLAYS — creation order regrouped by
+  // project — not raw creation order. The two diverge whenever projects
+  // interleave (or a cd moves a session between groups), and stepping the
+  // raw order then visibly jumps around the list.
+  const sessions = groupRows(sortById(hostSessions.sessions.values())).flatMap((g) => g.rows)
   if (sessions.length < 2 || !currentId) return undefined
   const index = sessions.findIndex((session) => session.id === currentId)
   if (index < 0) return undefined

@@ -40,3 +40,15 @@ pub fn open_url(url: String) -> Result<(), String> {
 
     cmd.map(|_| ()).map_err(|e| e.to_string())
 }
+
+/// Dev-only frontend performance telemetry: the webview aggregates its
+/// main-thread timings (src/lib/perf.ts) and ships them here so they
+/// land in the dev process stdout, where tooling can read them without
+/// attaching an inspector to the WKWebView. Cheap and inert in release
+/// builds — the frontend only sends in dev.
+#[tauri::command]
+#[specta::specta]
+pub fn perf_report(report: String) -> Result<(), String> {
+    tracing::info!(target: "helm_perf", "{report}");
+    Ok(())
+}

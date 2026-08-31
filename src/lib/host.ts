@@ -13,6 +13,7 @@
 
 import { Channel } from '@tauri-apps/api/core'
 import { commands } from '@lib/ipc'
+import { timed } from '@lib/perf'
 import { useStore } from '@lib/store'
 import { treeToSessions } from '@lib/session/tree'
 import * as screen from '@lib/session/screen'
@@ -125,13 +126,15 @@ function handleSessionEvent(hostId: HostId, ev: SessionEvent): void {
   const store = useStore.getState()
   switch (ev.kind) {
     case 'screen':
-      screen.applyScreen(hostId, ev.session_id, ev.screen)
+      timed('ingest:screen', () => screen.applyScreen(hostId, ev.session_id, ev.screen))
       return
     case 'screen_diff':
-      screen.applyDiff(hostId, ev.session_id, ev.top_line, ev.scroll, ev.rows, ev.cursor, ev.modes)
+      timed('ingest:diff', () =>
+        screen.applyDiff(hostId, ev.session_id, ev.top_line, ev.scroll, ev.rows, ev.cursor, ev.modes),
+      )
       return
     case 'history_append':
-      screen.applyHistoryAppend(hostId, ev.session_id, ev.first_line, ev.rows)
+      timed('ingest:history', () => screen.applyHistoryAppend(hostId, ev.session_id, ev.first_line, ev.rows))
       return
     case 'block': {
       const b = ev.block

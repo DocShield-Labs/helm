@@ -135,10 +135,13 @@ export function SessionRow({
               e.stopPropagation()
             }}
             onClick={(e) => e.stopPropagation()}
-            // Same face, size and box as the title it replaces — an
-            // input inherits the default sans otherwise, which reads as
-            // the text changing font mid-rename.
-            className="-mx-1 h-4 min-w-0 flex-1 rounded-sm bg-[var(--stroke-default)] px-1 py-0 font-mono text-[12px] leading-4 text-text-primary outline-none"
+            // Same face, size, line-height and box as the title span it
+            // replaces — no background, no fixed height, no padding — so
+            // entering edit mode moves nothing, not even by a pixel. The
+            // row's `user-select: none` inherits into the input and stops
+            // WebKit from painting the text-selection highlight, so it is
+            // explicitly re-enabled here.
+            className="min-w-0 flex-1 select-text bg-transparent p-0 font-mono text-[12px] text-text-primary outline-none"
           />
         ) : (
           <span className={`min-w-0 flex-1 truncate pr-5 font-mono text-[12px] ${titleColor}`}>{title}</span>
@@ -154,7 +157,9 @@ export function SessionRow({
             e.stopPropagation()
             onKill()
           }}
-          className="absolute right-2 top-1/2 flex size-5 shrink-0 -translate-y-1/2 items-center justify-center rounded text-text-tertiary opacity-0 hover:bg-[var(--stroke-default)] hover:text-text-primary group-hover:opacity-100"
+          // With an unread dot in the corner, hover slides the ×
+          // one slot left so the two never stack.
+          className={`absolute top-1/2 flex size-5 shrink-0 -translate-y-1/2 items-center justify-center rounded text-text-tertiary opacity-0 hover:bg-[var(--stroke-default)] hover:text-text-primary group-hover:opacity-100 ${unread && !editing ? 'right-7' : 'right-2'}`}
         >
           <XIcon size={12} />
         </button>

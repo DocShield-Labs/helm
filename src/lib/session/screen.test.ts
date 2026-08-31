@@ -155,6 +155,20 @@ describe('rows as logical lines', () => {
     // Joining never mutates the source rows.
     expect(rows[0][1].spans.length).toBe(1)
   })
+
+  test('rowLens records each physical row, mapping a cursor to its offset', () => {
+    const rows: Array<[number, RowInfo]> = [
+      [0, r('abcd', true)],
+      [1, r('ef')],
+      [2, r('g')],
+    ]
+    const lines = joinWrapped(rows)
+    expect(lines.map((l) => l.rowLens)).toEqual([[4, 2], [1]])
+    // A cursor at physical line 1 col 1 is char 5 of the joined line.
+    const l = lines[0]
+    const offset = l.rowLens.slice(0, 1 - l.line).reduce((a, b) => a + b, 0) + 1
+    expect(offset).toBe(5)
+  })
 })
 
 describe('RowsView', () => {
