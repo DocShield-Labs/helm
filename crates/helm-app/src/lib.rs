@@ -104,6 +104,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::system::reveal_in_finder,
             commands::system::open_url,
             commands::system::perf_report,
+            commands::system::diagnostics,
         ])
 }
 

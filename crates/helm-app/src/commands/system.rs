@@ -41,6 +41,67 @@ pub fn open_url(url: String) -> Result<(), String> {
     cmd.map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// One-shot diagnostic snapshot, pretty JSON, for pasting into a bug
+/// report: app/protocol versions, and per host the connected daemon's
+/// version, negotiated extensions, and session geometry. Built for the
+/// classic failure shape — an updated app quietly attached to an older
+/// daemon, so extension-backed features (slash commands, fuzzy file
+/// search, in-place retirement) come back empty.
+#[tauri::command]
+#[specta::specta]
+pub async fn diagnostics(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<String, String> {
+    let entries: Vec<_> = state.hosts.iter().map(|e| e.value().clone()).collect();
+    let mut hosts = Vec::new();
+    for entry in entries {
+        let guard = entry.lock().await;
+        let host = &guard.host;
+        let mut report = serde_json::json!({
+            "name": host.name,
+            "kind": if host.port == 0 { "local" } else { "remote" },
+            "status": format!("{:?}", guard.status),
+            "retired_generation_socket": host.retired.as_ref().map(|r| r.socket.clone()),
+        });
+        if let Some(session) = &guard.session {
+            report["daemon_version"] = session.daemon_version.clone().into();
+            {
+                let caps = session.capabilities.read();
+                report["daemon_compat_baseline"] = caps.compatibility_baseline.into();
+                let mut extensions: Vec<String> = caps.extensions.iter().cloned().collect();
+                extensions.sort();
+                report["daemon_extensions"] = extensions.into();
+            }
+            let tree = session.tree.lock();
+            report["sessions"] = tree
+                .sessions
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id.to_string(),
+                        "name": s.name,
+                        "cols": s.cols,
+                        "rows": s.rows,
+                        "alt_screen": s.alt_screen,
+                        "command": s.command,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
+        hosts.push(report);
+    }
+    let report = serde_json::json!({
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": helm_proto::PROTOCOL_VERSION,
+        "compatibility_baseline": helm_proto::COMPATIBILITY_BASELINE,
+        "socket_override": std::env::var("HELM_SOCKET").ok(),
+        "retired_sockets_on_disk": crate::connection::local_retired_sockets(),
+        "hosts": hosts,
+    });
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
 /// Dev-only frontend performance telemetry: the webview aggregates its
 /// main-thread timings (src/lib/perf.ts) and ships them here so they
 /// land in the dev process stdout, where tooling can read them without
