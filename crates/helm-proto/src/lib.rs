@@ -58,6 +58,24 @@ pub mod extensions {
     /// the reply needs no envelope of its own).
     pub const FILE_SEARCH: &str = "helm.session.file_search.v1";
 
+    /// Retire the daemon in place so a newer binary can take over its
+    /// socket without killing anything: the daemon renames its socket
+    /// to `<stem>-retired-<pid>.sock` (the listener and every live
+    /// connection survive a rename), stops accepting new sessions, and
+    /// exits once the last existing session ends. Existing sessions
+    /// keep running untouched — clients reattach over the renamed
+    /// socket. Empty request payload; reply payload: [`RetireReply`]
+    /// as JSON. Idempotent: retiring a retired daemon returns the same
+    /// socket. Daemons without the extension answer `Error` — clients
+    /// fall back to waiting for the daemon to empty out.
+    pub const RETIRE: &str = "helm.daemon.retire.v1";
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    pub struct RetireReply {
+        /// Where the retired daemon now listens.
+        pub socket: String,
+    }
+
     /// Typed payloads for the JSON envelopes above. Both ends
     /// (de)serialize these, so a schema is a type, not prose that
     /// drifts.

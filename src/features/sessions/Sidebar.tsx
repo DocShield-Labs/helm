@@ -46,7 +46,9 @@ export function Sidebar({ onAddHost, onEditHost, onDeleteHost }: SidebarProps) {
   const [inboxOpen, setInboxOpen] = useState(false)
 
   const sortedHosts = useMemo(() => {
-    const list = [...hosts.values()]
+    // Retired daemon generations never get their own group — their
+    // sessions render inside the parent host's group below.
+    const list = [...hosts.values()].filter((h) => !h.retired)
     list.sort((a, b) => {
       if ((a.port === 0) !== (b.port === 0)) return a.port === 0 ? -1 : 1
       return a.name.localeCompare(b.name)
@@ -149,7 +151,8 @@ interface HostGroupProps {
 }
 
 function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps) {
-  const hs = useStore((s) => s.sessions.get(host.id))
+  const allHosts = useStore((s) => s.hosts)
+  const sessionsByHost = useStore((s) => s.sessions)
   const status = useStore((s) => s.statuses.get(host.id) ?? 'disconnected')
   const activeHostId = useStore((s) => s.activeHostId)
   const notifications = useStore((s) => s.notifications)
@@ -160,18 +163,35 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
 
   const displayed = displayedHostStatus(host, status)
   const connected = displayed === 'connected'
-  const isActiveHost = activeHostId === host.id
 
-  const isSelectedRow = (r: Row) => isActiveHost && hs?.activeSessionId === r.session.id
+  const isSelectedRow = (r: Row) =>
+    activeHostId === r.hostId && sessionsByHost.get(r.hostId)?.activeSessionId === r.session.id
+
+  // The group shows this host's sessions plus those of its retired
+  // daemon generations (older generations first — they hold the older
+  // sessions). Rows carry their own host id so selection, rename, and
+  // kill route to the daemon that actually owns the session.
+  const members = useMemo(() => {
+    const retired = [...allHosts.values()]
+      .filter((h) => h.retired?.parent === host.id)
+      .sort((a, b) => (a.retired?.socket ?? '').localeCompare(b.retired?.socket ?? ''))
+    return [...retired, host]
+  }, [allHosts, host])
 
   const rows = useMemo(
-    () => buildRows(host.id, hs, runningSessions, customAgentTemplate),
-    [host.id, hs, runningSessions, customAgentTemplate, blockLoadRevision],
+    () =>
+      members.flatMap((m) =>
+        buildRows(m.id, sessionsByHost.get(m.id), runningSessions, customAgentTemplate),
+      ),
+    [members, sessionsByHost, runningSessions, customAgentTemplate, blockLoadRevision],
   )
-  const unreadSessionIds = useMemo(
-    () => notificationSessionIds(notifications, host.id),
-    [notifications, host.id],
-  )
+  const unreadSessionIds = useMemo(() => {
+    const set = new Set<string>()
+    for (const m of members) {
+      for (const sid of notificationSessionIds(notifications, m.id)) set.add(`${m.id}::${sid}`)
+    }
+    return set
+  }, [notifications, members])
   const groups = useMemo(() => {
     const all = groupRows(rows)
     if (!filter) return all
@@ -315,11 +335,11 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
               detail={r.detail}
               dir={r.dir}
               branch={r.branch}
-              unread={unreadSessionIds.has(r.session.id)}
+              unread={unreadSessionIds.has(`${r.hostId}::${r.session.id}`)}
               selected={isSelectedRow(r)}
-              onClick={() => selectSession(host.id, r.session.id)}
-              onRename={(name) => void commands.sessionRename(host.id, r.session.id, name)}
-              onKill={() => killSession(host.id, r.session)}
+              onClick={() => selectSession(r.hostId, r.session.id)}
+              onRename={(name) => void commands.sessionRename(r.hostId, r.session.id, name)}
+              onKill={() => killSession(r.hostId, r.session)}
             />
           ))}
         </div>
@@ -334,6 +354,9 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
 
 interface Row {
   key: string
+  /** The host entry that owns the session — the parent host, or one of
+   * its retired daemon generations. */
+  hostId: HostId
   session: Session
   kind: SessionKind
   running: boolean
@@ -386,7 +409,8 @@ function buildRows(
       const title = renamed ? session.name : detail
 
       out.push({
-        key: session.id,
+        key: `${hostId}::${session.id}`,
+        hostId,
         session,
         kind,
         // An agent session is always live; a shell is running when a command
