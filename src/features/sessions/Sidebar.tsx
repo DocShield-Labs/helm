@@ -158,6 +158,8 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
   const notifications = useStore((s) => s.notifications)
   const runningSessions = useStore((s) => s.runningSessions)
   const customAgentTemplate = useStore((s) => s.customAgentTemplate)
+  const hostCollapsed = useStore((s) => s.collapsedHosts.has(host.id))
+  const toggleHostCollapsed = useStore((s) => s.toggleHostCollapsed)
   const blockLoadRevision = useHostBlockLoadRevision(host.id)
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
 
@@ -204,6 +206,11 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
       }))
       .filter((g) => g.rows.length > 0)
   }, [rows, filter])
+
+  // Collapsing folds the sessions away, but a search has to be able to
+  // find them — typing in the filter box expands every group that has a
+  // match, without disturbing the stored preference.
+  const showRows = !hostCollapsed || filter !== ''
 
   const statusText =
     displayed === 'connected'
@@ -270,8 +277,9 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
       {/* With a single host there's nothing to distinguish, so the line
           is pure noise — the projects below are the real structure. It
           comes back the moment a second host exists, or if this one has
-          something to report (connecting, offline, an error). */}
-      {(!soleHost || statusText) && (
+          something to report (connecting, offline, an error) — or if
+          it's collapsed, since the line is then the only way back. */}
+      {(!soleHost || statusText || hostCollapsed) && (
         <div
           role="button"
           onClick={() => {
@@ -289,8 +297,38 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
             size={12}
             className={`shrink-0 ${hostTone}`}
           />
-          <span className={`truncate text-[11px] font-medium ${hostTone}`}>{host.name}</span>
+          <span className={`min-w-0 truncate text-[11px] font-medium ${hostTone}`}>{host.name}</span>
+          {/* Disclosure sits right after the name, pointing down when the
+              host is open and right when it's folded. Quiet by default —
+              it reports state, it isn't asking to be clicked — and it
+              stops the click from reaching the row, which selects and
+              connects the host. */}
+          <button
+            type="button"
+            aria-label={`${hostCollapsed ? 'Expand' : 'Collapse'} ${host.name}`}
+            aria-expanded={!hostCollapsed}
+            title={hostCollapsed ? 'Expand' : 'Collapse'}
+            onClick={(e) => {
+              e.stopPropagation()
+              toggleHostCollapsed(host.id)
+            }}
+            className="flex size-4 shrink-0 items-center justify-center rounded text-text-disabled hover:bg-[var(--stroke-default)] hover:text-text-primary"
+          >
+            <ChevronDownIcon
+              size={11}
+              className={`transition-transform ${hostCollapsed ? '-rotate-90' : ''}`}
+            />
+          </button>
           <span className="flex-1" />
+          {/* Folded away, a host's unread session dots go with it — so the
+              header carries one on their behalf. */}
+          {!showRows && unreadSessionIds.size > 0 && (
+            <span
+              className="size-2 shrink-0 rounded-full bg-accent"
+              aria-label={`${unreadSessionIds.size} unread`}
+              title={`${unreadSessionIds.size} unread`}
+            />
+          )}
           {statusText && (
             <span className={`text-[10px] ${displayed === 'error' ? 'text-status-error' : 'text-text-disabled'}`}>
               {statusText}
@@ -311,7 +349,7 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
           </button>
         </div>
       )}
-      {groups.map((g, i) => (
+      {showRows && groups.map((g, i) => (
         <div key={g.key || '\0unknown'} className={`flex flex-col gap-1 ${i > 0 ? 'pt-2' : ''}`}>
           {g.label && (
             // The project header: just the folder path, as quiet as the
@@ -344,7 +382,7 @@ function HostGroup({ host, filter, soleHost, onEdit, onDelete }: HostGroupProps)
           ))}
         </div>
       ))}
-      {connected && rows.length === 0 && (
+      {showRows && connected && rows.length === 0 && (
         <div className="px-2 py-1.5 text-[11px] text-text-disabled">no sessions · ⌘T</div>
       )}
       {menu && <ContextMenu open x={menu.x} y={menu.y} items={items} onClose={() => setMenu(null)} />}

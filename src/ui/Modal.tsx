@@ -3,11 +3,16 @@
  *
  * Body scrolls when content overflows; header + footer stay pinned. The
  * card itself caps at the viewport height with breathing room so it
- * never bleeds into the OS chrome on a small window. Esc closes the
- * modal — the listener is gated on `open` so multiple stacked modals
- * (rare, but a modal can open over the palette in some flows)
- * each get their own handler and only the topmost is registered when
- * the others are closed.
+ * never bleeds into the OS chrome on a small window. `overflow-hidden`
+ * is load-bearing, not decoration: `border-radius` clips an element's
+ * own background but not its descendants', so without it the footer's
+ * opaque `bg-sidebar` paints square corners straight over the card's
+ * rounded bottom. (The header gets away with a bare `border-b`.)
+ *
+ * Esc closes the modal — the listener is gated on `open` so multiple
+ * stacked modals (rare, but a modal can open over the palette in some
+ * flows) each get their own handler and only the topmost is registered
+ * when the others are closed.
  */
 
 import { useEffect } from 'react'
@@ -46,7 +51,7 @@ export function Modal({ open, title, onClose, children, footer, width = 560 }: M
         aria-modal
         aria-label={title}
         style={{ width, maxHeight: 'calc(100vh - 64px)', boxShadow: 'var(--elevation-3)' }}
-        className="flex flex-col rounded-xl border border-white/10 bg-elevated"
+        className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-elevated"
       >
         <header className="flex h-15 shrink-0 items-center gap-2 border-b border-white/[0.06] pl-6 pr-4">
           <h2 className="flex-1 text-[16px] font-semibold tracking-tight text-text-primary">
