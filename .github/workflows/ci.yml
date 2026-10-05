@@ -11,10 +11,10 @@ on:
   pull_request:
     paths-ignore: ['**.md']
 
-# PR runs on the same branch cancel each other; pushes get a unique group so they never queue or cancel.
+# Runs for the same PR cancel each other; pushes get a unique group so they never queue or cancel.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 jobs:
   test:
